@@ -1,0 +1,4389 @@
+# Game-object property ids in Anno117.exe (its 0x38-byte property rows) with their names, and PropertyType codes from the shipped Lua stubs (docs/phx-decode.md, Game-object data); the generator is not in this repo.
+# Merged: ids are hashes that collide across classes, so an id a later exe names differently keeps the name it had (0x20bd1a05 is the text output's DisplayedSize, not Html); ids a later exe drops stay.
+# Tab-separated, sorted by id.
+# id	name	kind
+#   kind: PropertyType code (0 bool, 1 int, 3 float, 4 string...); empty for objects and unknown types.
+0x15d9cb83	UnitTypeDataBase	
+0x20009d4b	GroupHeaderText	
+0x20017f48	AnchorPosition	
+0x2001e6c7	AlreadyAdded	0
+0x20020b85	MetaID	
+0x20029071	GranaryData	
+0x20029916	KontorData	
+0x20037fd1	GamePadBtnListBase	
+0x200500c3	ListData01Base	
+0x2005f9ec	IconandTitle	
+0x20073ec5	SplendourBuffsBase	
+0x2007f339	GamepadAction	
+0x200a055f	IsButtonPromptVisible	0
+0x200a06b5	SplendourProgressBar	
+0x200a0f54	StorageSorting	
+0x200a1ebe	SpecialistSelectionPopup	
+0x200ada5c	OnScreenProgressBase	
+0x200b0cb3	AdvancedRemapping	0
+0x200b3209	IsPreviewSave	0
+0x200b817e	HealthBar	3
+0x200d4333	PlayerInfo	
+0x200f0dd1	ChoicesBase	
+0x2010db0a	RefOID	
+0x2012894c	Button	
+0x20143f30	Infocorner	
+0x201552df	RewardCardFocusedIndex	1
+0x2016806a	Rarity	
+0x2017e32f	OnScreenData	
+0x2017f33e	IconsPanelListBase	
+0x2018ced7	OMBase	
+0x20195ff2	SecondAndThirdPartyData	
+0x2019b241	Filters	
+0x201a2837	IsVisible	0
+0x201a4ba4	ShowActionTutorial	0
+0x201aaa94	ConnectedBuildingStatus	
+0x201ab292	BtnCloudSave	
+0x201ab3e2	BtnStyle	
+0x201abea4	ShipInfoTipData	
+0x201acb5c	ContentBase	
+0x201cacac	Profile	
+0x201d2ca3	IsInRange	0
+0x201d4416	InfotipContext	
+0x201db957	Profile	
+0x201e19df	IsChecked	0
+0x20200ea5	SceneAnimation	
+0x20209ab8	InfoCornerEntryPoint	
+0x20215dfa	IsVisible	0
+0x20233722	OMActiveTrade	
+0x202582e9	RSVertical	
+0x2025d332	PrestigeDescriptionData	
+0x2026fdee	GamePadAction	
+0x2027237c	PopupData	
+0x20276d15	TraitsIconInfoBase	
+0x20281ae3	Scale	3
+0x2028d7a2	NestedEntriesBase	
+0x2029b728	Context	
+0x202a00fc	SellSlotFocusedIndex	1
+0x202be187	SectorProjectData	
+0x202c3735	TotalAmountData	
+0x20322f96	ArrayMPSlotsBase	
+0x2032e6f1	BannersBase	
+0x2033f140	OnOtherTradeRoute	0
+0x20374174	MouseEnterToDelete	0
+0x203939b9	BuildSettingsData	
+0x203a1dda	FirstVisibleIndex	1
+0x203bf2aa	MetaMenuDataBase	
+0x203d9df5	IsVisible	0
+0x203e1e8b	TLCWrapperData	
+0x203f093e	InfocornerPopup	
+0x2040b0a4	Infotips	
+0x2040b937	GhostPosition	
+0x204407da	AttributeID	1
+0x204451b6	IsDLCStatusVisible	0
+0x204479a5	IsNew	0
+0x2046e453	Popup2	
+0x2047679a	IsVisible	0
+0x2048fbfd	Seats	
+0x204b2653	IsGoodLoaded	0
+0x204bf3aa	EmptyIsland	0
+0x204c4022	SetRewardsBase	
+0x204c65a7	CurrentSliderValue	3
+0x204d5257	ShowGrid	0
+0x204d90fe	BtnDelete_MK	
+0x204f203b	ZIndex	1
+0x204fa35b	IsFromTitleScreen	0
+0x20503d54	InfoTip	
+0x20517da9	Overflow_Y	
+0x20527011	Context	
+0x20546f9e	Tabs	
+0x20556747	EventArrayBase	
+0x2055c887	MaximumCharacterCount	1
+0x2056736a	SingleInfoSection	
+0x20573427	SelectionIndex	1
+0x205a8919	PlayerRegion	
+0x205aa3af	ProvinceData	
+0x205b19b0	Infotip	1
+0x205d757a	IsWarning	0
+0x205d7895	PowerReasons_Right	
+0x205dbe1b	Rotation	3
+0x2061d790	BtnAction	
+0x20621457	ProgressAmount	3
+0x20624c38	IslandState	0
+0x20625362	AcceptBtnInfoTipData	
+0x2062e45a	SceneAnimationData	
+0x206467c5	IsCurrent	0
+0x20660778	IsToChange	0
+0x206734b2	DescriptionText	4
+0x20673d2c	MapPosition	
+0x206875f0	BagdeDataBase	
+0x2068ef0b	PortraitData	
+0x2069912f	IsJumpToVisible	0
+0x206b33a6	CurrentBelief	1
+0x206cea0e	IsEditable	0
+0x206dcb0a	BtnLoaderDataBase	
+0x2071b932	CDLCPreviewModel	
+0x20730073	GameObjectChildBase	
+0x20739775	RivalDifficultyText	
+0x20741278	OMDefensiveBuildingData	
+0x20741ee5	PrestigeBtn	
+0x2075da7a	NotificationSoundGUID	1
+0x2076dd99	DataBase	
+0x20790256	ItemsPage	
+0x207926b1	OMBaseData	
+0x207cf03a	FriendsListData	
+0x207d177c	ProvinceBase	
+0x207d39ef	SceneData	
+0x207d6963	PhaseData	
+0x207e23b4	WorldMapHasQuest	0
+0x207ecd5a	OMMonumentScene	
+0x207f841b	InfotipData	
+0x2081942b	Position	3
+0x2081fae7	Requirements	
+0x20825c1b	ProvinceTabs	
+0x2082636b	ArrayPattern2Base	
+0x20838080	SceneData	
+0x2083d0a4	AlphabeticSorting	
+0x20846896	OverviewData	
+0x20869170	SeparatorIsVisible	0
+0x2086d361	TabData	
+0x2087802c	FilterRouteInfoTip	
+0x2088528b	HealthValue	3
+0x20892877	BtnData2	
+0x2089803f	CharacterNotificationArchiveBase	
+0x208a8074	AssignmentBtn	
+0x208ad954	IsVisible	0
+0x208b3c0f	SceneAnimation	
+0x208bc6fd	KontorMarkerBase	
+0x208ebbb9	IsVisible	0
+0x208edf97	FocusedIndex	1
+0x209122b0	PreviewModel	4
+0x20915b04	IsMapFiltered	0
+0x2091f45a	FriendsListBase	
+0x20922452	ID_9	0
+0x20924004	IsVisible	0
+0x2092bde3	BtnConfig	
+0x20937aae	TogglesListDataBase	
+0x20957455	HideQuest	0
+0x2095e32d	StationID	1
+0x20964f2c	EffectsButtonArrayDataBase	
+0x20973ba6	VariableGameSpeedData	
+0x20978f78	InfocornerEntryPoint	
+0x2099b903	IsSelected	0
+0x209d47cb	InviteBtn	
+0x20a0e74b	LocalOverview	
+0x20a1c210	IncidentColor	
+0x20a282c6	ArrayDataBase	
+0x20a2885f	IsExpanded	0
+0x20a41b36	InfoTipData	
+0x20a4289c	SceneAnimation	
+0x20a5de20	GlobalIncidentDataBase	
+0x20a71da1	ScaleY	3
+0x20a737b9	QuestProvince	
+0x20a75bd6	RegionalBenefitsBase	
+0x20a78d91	HasWarning	0
+0x20a891bf	Transition	
+0x20a9354e	Infotip	1
+0x20a964fb	Color	
+0x20a9db16	SceneAnimation	
+0x20aa564e	TextDisableReason	
+0x20aa6a25	InfoTip	
+0x20ac5978	ID	1
+0x20ac64d4	InteractionData	
+0x20ae8acd	IsWarning	0
+0x20aff416	ObjectiveType	
+0x20b0e02b	CurrentPhaseCount	1
+0x20b0e1e4	BuildInfoVisible	0
+0x20b13599	JumpToBtn	
+0x20b18ecd	Frame	0
+0x20b196cf	WaterConsumptionData	
+0x20b288d6	GroupTitle	
+0x20b34249	IsFocused	0
+0x20b356bf	PressDemoOutroScene	
+0x20b3cf8c	IsCloudSave	0
+0x20b3f546	ModuleConstructionPercentage	3
+0x20b3fd1a	BottomHeight	1
+0x20b40a51	IsDLC	0
+0x20b491ca	ContentBtnBase	
+0x20b50fef	SceneData	
+0x20b5b98d	Opacity	3
+0x20b74f3e	Description	4
+0x20b87f33	DeityWheelArrayBase	
+0x20b8cfd6	GamepadButtonFeedback	
+0x20ba16cf	BtnStates	
+0x20bb33b1	Application	
+0x20bb4c7d	Rank	
+0x20bc3a5e	CosmeticName	
+0x20bd1a05	DisplayedSize	
+0x20bd315d	ProductGuid	1
+0x20bda6d8	GameStatType	
+0x20bdca6a	ConnectorState	
+0x20be0ca5	SlotIcon	4
+0x20be4d08	TargetParticipantGUID	1
+0x20be595c	IsEmpty	0
+0x20bf93a4	IsCompleted	0
+0x20c0678f	RefGUID	1
+0x20c142a4	ProductionTypeIcon	4
+0x20c2e2b6	SceneData	
+0x20c3aab6	Infotip_Progress_For_Console	
+0x20c3c4c1	isExtended	0
+0x20c44084	CreateConfigStampBtnDtata	
+0x20c60e45	InfocornerEntryPoint	
+0x20c61b85	QuestGiverData	
+0x20c6ac9c	BtnData1	
+0x20c72b09	PanelData	
+0x20c80570	MapPositionMode	
+0x20c8084b	TraderData	
+0x20ca1d50	PaymentActionCardsBase	
+0x20cb4a60	ProfileData	
+0x20cbbbe9	ProductGUID	1
+0x20cbfe0c	Type	
+0x20cd00bf	UpgradeOptionsData	
+0x20cefc5f	SortingButtonData	
+0x20cfaff3	PreviewModel	4
+0x20cfc22c	ShipInventoryData	
+0x20cfd4ad	EntriesBase	
+0x20d48314	Visible	0
+0x20d5767a	InteractionData	
+0x20d61a27	SplendourReward	
+0x20d74a9f	IsSublineHidden	0
+0x20d85acb	IsEnable	0
+0x20d8a603	MarkerListOutsideMapBase	
+0x20d9bb5b	IsCurrentSelection	0
+0x20da623d	CurrentDifficulty	1
+0x20dbb70e	ContentPrice	
+0x20dc6fff	CancelBtn	
+0x20dc7149	WonderThreshold	1
+0x20dcdfb9	Type	
+0x20df5534	WarningNotificationArchive	
+0x20e042bc	HasSeparator	0
+0x20e047c1	Indentation	0
+0x20e16460	IsWarning	0
+0x20e1fe3b	RadialButtonsBase	
+0x20e51252	TotalVisibleItemCount	1
+0x20e57d21	IsVisible	0
+0x20e5a029	Difficulty	1
+0x20e6a592	ProvinceName	4
+0x20e706fe	Index	1
+0x20e9f749	BackButton	
+0x20e9f863	RenderID	1
+0x20eaa933	OptionalGoodSelectionPopup	
+0x20ecc370	IsEquipped	0
+0x20edb565	SubGroupLabelData	
+0x20ee6746	IsUsedInRouteGroup	0
+0x20f344d3	Context	
+0x20f55d18	RequestFocus	
+0x20f71c58	IsEntireStack	0
+0x20f72844	Popup2Position	
+0x20f9932b	YPosition	3
+0x20fb6b1e	ConsumtionBarData	
+0x20fc00b3	IsPinnedMode	0
+0x20fc1a83	Specialist	
+0x20fd4f85	Description	4
+0x20fe003e	IsBtnPromptVisible	0
+0x21002e6e	SceneAnimation	
+0x21003b75	InfoCornerEntryPoint	
+0x21055f08	NotificationType	
+0x2105d24c	SortingButtonData	
+0x2106207c	ArrayNotesBase	
+0x21067e56	Position	3
+0x210700b0	GameSetupActionButton	
+0x210701aa	SubHeadline	4
+0x21075548	IsEnabled	0
+0x21076609	ScreenPos	
+0x210922a7	Size	
+0x21098e23	AutoCombat	
+0x21099c84	IsSaving	0
+0x210a72b4	OMSlotBuildingData	
+0x210aa5a1	BreakdownTabs	
+0x210b23b9	QuestbookEntryContent	
+0x210c021e	IsBgVisible	0
+0x210cc371	HealthValue	3
+0x210e4d29	BtnInteraction	
+0x210ecf65	Pivot	
+0x2112c0f1	Context	
+0x2113096b	IsGroupOpen	0
+0x2113425c	ContextData	
+0x2113a48b	ShowUI	0
+0x21158ecc	InfoPanel	
+0x2116a834	RewardCardsBase	
+0x2116abbf	GroupIndex	1
+0x2116c0dd	NumOfVisibleItems	1
+0x2117a3cd	ErrorState	
+0x2118d383	TechItemTypePosition	
+0x2118f780	BarterGoodAmount	
+0x21191e18	ProvincePopup	
+0x21194698	SceneData	
+0x21194c3c	ButtonData	
+0x211a36fd	ComparisonTabData	
+0x211a6632	StateIsDesert	0
+0x211b0d9f	GameModeTitle	
+0x211b970a	Rotation	3
+0x211be403	Island_Name	4
+0x211c2fe9	UiScaleFactor	3
+0x211c4764	SceneFocus	
+0x211da3f9	IsVisible	0
+0x211f1897	IsEnabled	0
+0x211f45e0	YBtn	
+0x2120924c	Value	4
+0x21227f27	IsVisible	0
+0x212577fd	Subline	4
+0x2125f18f	AlarmedType	
+0x2127651d	Mood	
+0x212a8455	Splendour	
+0x212ada1b	SelectedDeityName	
+0x212f7589	Value	4
+0x212fb960	MainTabs	
+0x2131f713	Enabled	0
+0x213249a3	QueueFocusIndex	1
+0x21343975	Description	4
+0x21357e3d	TalkingHeads	
+0x21361f66	ArrayProductivityEffectBase	
+0x213639e2	GoodImageID	4
+0x2139b748	Popup2EmptyData	
+0x213ac06b	GameSetupActionButton	
+0x213bcdbe	UnitsButton	
+0x213d5e46	FocusIndex	1
+0x213d9c90	ArrayDataBase	
+0x213ea843	Height	3
+0x213fddb8	GamepadPresetsPopupData	
+0x21407654	FirstOverviewData	
+0x2141d609	GlobalPosition	
+0x214349af	AdvancedOptionIsChecked	0
+0x2143e1ce	SelectedIndex	1
+0x2144ceec	BuffEffect	
+0x214545e8	IslandTitle	
+0x214586af	Index	1
+0x2145d4b4	GlobalPosition	
+0x21463329	GoodSlot	
+0x21485763	OutcomeText	
+0x214a6c81	BtnData	
+0x214a819e	BtnRightIsActive	0
+0x214ce325	CurrentRotation	3
+0x214d1190	InfoTipData	
+0x214d86b6	IsEventBlocked	0
+0x214e7575	RefGuid	1
+0x215095a9	AllIslands	
+0x21545204	State	4
+0x2154871f	ProfileData	
+0x21553efa	QuestEntryID	
+0x215592b7	IsVisible	0
+0x2155dc01	MilitiaTab	
+0x2158867f	Header	4
+0x215c6f30	SecondaryButtonData	
+0x215d0580	IsVisible	0
+0x215d2d86	IsFocused	0
+0x215dee5a	IsFocused	0
+0x215e5203	ThirdPlayerColor	
+0x215eceee	ArePiratesVisible	0
+0x21623d40	IconDataBase	
+0x2162859a	SavegameOverview	
+0x21639027	OMMonumentEventScene	
+0x2163aa64	PhaseData	
+0x216404ac	IsIndicatorVisible	0
+0x2164f132	GoodSocketIsVisible	0
+0x2164f187	AreaID	1
+0x21652d49	RequestFocus	
+0x2165866a	TraderInventory	
+0x2165bca9	ToolTipIcon	4
+0x2166f89e	IslandRenameIsEnabled	0
+0x21675432	IsRouteTargetToggleVisible	0
+0x2167a875	BuildingStatsBase	
+0x2168d36e	BannerTitle	
+0x2168f7b6	Infotip	1
+0x216965be	NicheListBase	
+0x2169e57c	Warning	
+0x2169f201	IsAnyOpponentSelected	0
+0x216a99a6	IsNew	0
+0x216b4ffb	Icon_InUSe	4
+0x216c8cb2	SelectedTabID	1
+0x216e6ac5	IsWarningVisible	0
+0x216ef06c	IsRegionalIconVisible	0
+0x21706392	JumpToUnlock	
+0x217150f2	Progress1	3
+0x217157f5	IsFull	0
+0x2171ecc3	OutgoingBuffListBase	
+0x21728fca	RacerState	
+0x2174f4e3	IsVisible	0
+0x217619cc	IslandBtn	
+0x217c43e1	EventProgress	3
+0x217c8af8	SceneAnimation	
+0x217daacf	QuestHintsBase	
+0x217e2bef	ShipsButton	
+0x217ef549	DataBase	
+0x217f3c36	ArrayContentButtonsBase	
+0x2180cfb7	UnlockHint	
+0x21812ff8	SceneAnimation	
+0x21831399	ShipInventory	
+0x21839d9b	InfoTipGUID	1
+0x2184ec91	IsNew	0
+0x218544c5	StampBtn	
+0x21856eed	IsReligionVisible	0
+0x2187b917	IsButtonPromptVisible	0
+0x218adabb	SectorProjectData	
+0x218adb62	TextLabelID	
+0x218b3473	Tabs	
+0x218bc7fe	Position	3
+0x218c2731	AdditionalConfigsBase	
+0x218d324d	DontShowAgainCheckbox	
+0x218e871b	ProvinceData	
+0x218fb910	StateInfoTip	
+0x219095ce	ValueBase	
+0x219161b6	HasShipRamp	0
+0x21925fbd	InfotipData	
+0x2192beec	HeadlineData	
+0x21941ecf	CreditsTextBase	
+0x2194a067	ProgressValue	3
+0x21954635	WorldSpaceOffset	
+0x2196bd27	OMNarrativeRuinsChoiceData	
+0x2199760b	ComboboxData	
+0x219b4dda	BtnsListDataBase	
+0x219b672a	InfoTipData	
+0x219c09fb	SettingDropdownListData	
+0x219c9db2	Origin	
+0x219cf712	IsVisible	0
+0x219d14d1	ConfirmBtn	
+0x219e4cdf	ContributionsBase	
+0x219f6607	EffectsPageData	
+0x219f90c5	IslandData	
+0x21a018c5	InfoTip	
+0x21a0424e	IsWarning	0
+0x21a079e0	OutputData	
+0x21a12413	Infotip	1
+0x21a15eb9	RequiredSplendour	
+0x21a25273	IsSelected	0
+0x21a2c532	IsLocked	0
+0x21a30e3b	SceneAnimation	
+0x21a3ad07	InfoTipData	
+0x21a542b8	ArrayDataBase	
+0x21a56e12	Context	
+0x21a75815	AreaID	1
+0x21aae500	TextInput	
+0x21acfbad	PlayerRacer	
+0x21ad4d91	RequestFocus	
+0x21ad71c7	InputWidth	3
+0x21af65d6	Province	4
+0x21af803e	ToBeDeleted_TLCName	
+0x21b0165a	SceneContainerData	
+0x21b16998	DLCactivationData	
+0x21b1e589	ShortcutTextStyle	
+0x21b280aa	SecondaryPlayerColor	
+0x21b28f44	Infotip	1
+0x21b3579c	Infotip	1
+0x21b4a435	MonumentInfotip	
+0x21b4b1ae	IsVisible	0
+0x21b5ff9c	AlphabeticSortingButtonData	
+0x21b66c90	QuestEntryType	
+0x21b78c88	BackgroundImage	4
+0x21b7f96a	Name	4
+0x21ba02da	BuildUnitButton	
+0x21ba5d7f	QuestItemsBase	
+0x21ba6dbd	IsRedeeemCodeDisabled	0
+0x21bae96c	IsVisible	0
+0x21bb4286	OMBaseHeight	3
+0x21bcca50	Comparison	
+0x21bdb07d	IsVisible	0
+0x21be2681	Name	4
+0x21be3e3f	Index	1
+0x21bf0f72	HasWarning	0
+0x21c24d93	Visible	0
+0x21c2f5a5	BalanceBase	
+0x21c4c891	Progress	3
+0x21c7d81a	RelativeMousePosition	
+0x21c86498	IsDisabled	0
+0x21c8cdae	ActionButton	
+0x21c94564	PopupType	
+0x21c9ebe8	IsPanelOpen	0
+0x21ca1299	CosmeticToolData	
+0x21ca6a0d	Interaction	
+0x21ca8ab0	ActivateCoopBtn	
+0x21cb32c6	InfoTipData	
+0x21cce02e	SceneAnimation	
+0x21cd73fc	Amount	4
+0x21cd7c6b	ItemSelectionPopup	
+0x21cd9aaa	IsBusy	0
+0x21ce1776	InteractionData	
+0x21ce3b57	WarningText	4
+0x21d0a590	RacerType	
+0x21d1e338	DominanceThreshold	1
+0x21d24975	IsChecked	0
+0x21d351f0	InfoTipAlignment	
+0x21d4f7dd	Infotip	1
+0x21d50376	SceneData	
+0x21d536b2	IsGoodOverflowing	0
+0x21d546ff	NotificationPopup	
+0x21d5f9c6	CharacterTutorialGuid	1
+0x21d8cae5	SecondaryButton	
+0x21d96262	ButtonData	
+0x21da8c0c	PrimaryPlayerColor	
+0x21dc2424	ChangeSettingPopupIsVisible	0
+0x21dc8558	WaitToUnloadButtonData	
+0x21dd0120	CoopSlotsBase	
+0x21dd2067	GameSpeedState	
+0x21ddf2fe	BuildingsButtonDataBase	
+0x21de344e	IsVisible	0
+0x21dfd1f2	Button	
+0x21e0ba0b	Position	3
+0x21e2a3b1	ObjectivesData	
+0x21e41530	ExpiredNotes	
+0x21e42cf9	Tabs	
+0x21e45fe9	BreakdownData	
+0x21e56a47	AbsoluteContribution	1
+0x21e60ab0	PinBtn	
+0x21e8d80e	NoSlotText	
+0x21eaf2a4	SublineData	
+0x21eb9376	IsEditable	0
+0x21ed7db0	OMBaseData	
+0x21ee536a	GroupsBuildingsBtnsData	
+0x21efb041	QuestEntryListBase	
+0x21f00505	StampEditPopup	
+0x21f11e18	AccordionButtonData	
+0x21f1ec9d	SceneAnimation	
+0x21f2c14a	MouseEnterSoundGUID	1
+0x21f3742e	Progress	3
+0x21f7d661	GroupSettingBtnDataBase	
+0x21f8c0a5	BackgroundColor	
+0x21f90d4f	Overview	
+0x21f9d9c1	IconText	
+0x21fc066b	Index	1
+0x21fcaafe	IsEmpty	0
+0x2200baaa	BackgroundType	
+0x220114c7	DeityIcon	4
+0x22035c23	RequestFocus	
+0x220461b2	DebugButton	
+0x2205988a	OffsetPosition	
+0x22065497	IsControllerPreviewVisible	0
+0x2206596d	GameSetupNavigationScene	
+0x2206b715	RotationAngle	3
+0x2207d410	BtnStyle	
+0x22083c03	DPadVertical	
+0x22084170	ShipandCargoData	
+0x22099c05	BtnStyle	
+0x220b21a0	RegionalChoiceCardBase	
+0x220e4af6	CargoSlotHintDataBase	
+0x220e9247	SelectedIndex	1
+0x220ec0f8	DeleteBtnInfoTipData	
+0x220f5de8	ButtonData	
+0x22105ebf	IsDraggable	0
+0x2210837e	IsUbisoftConnectReward	0
+0x2210d415	Position	3
+0x2210eabd	Profile	
+0x2211e326	IsHumanPlayer	0
+0x22125d59	MultiplayerPlayerProfileLevel	1
+0x2212d67f	Warning	
+0x221347c8	IsSelected	0
+0x2213f72c	participantGUID	1
+0x2215a165	LayoutArrayBase	
+0x22164fec	CategoryBtn	
+0x22179893	ProvinceName	4
+0x22184c20	CollectionArrayDataBase	
+0x221894c2	Opacity	3
+0x2219591a	JumpTo	
+0x2219cee4	TabsData	
+0x2219e144	IsAvatar	0
+0x221ad354	RuinData	
+0x221bcbed	RewardPreview	
+0x221c9bfc	IsInvalidDrop	0
+0x221d1611	IconText	
+0x221e534a	ButtonPromptArrayBase	
+0x22223c0f	SelectedGovernorTitleRatingArrayBase	
+0x2222df94	TechCategoryType	
+0x2224d2c7	SecondIslandTutorialVisible	0
+0x22254e35	Infotip	1
+0x22256d26	IconText	
+0x2225b17d	Opacity	3
+0x2226e0e8	Headline	4
+0x2227c2e7	GoodsRewardHeadline	
+0x222827e0	DifficultyRatingBase	
+0x22283d8a	Type	
+0x2228705d	ContinueBtn	
+0x222b03eb	TeamLead	
+0x222b5c6b	StationID	1
+0x222c1db4	Card_DataBase	
+0x222e1f0f	SuperMajorityPercent	3
+0x2231581e	AdditionalEntry	
+0x2232787d	BackgroundType	
+0x223359a3	IsVisible	0
+0x223840b9	FocusedIndex	1
+0x2239de22	OMBase	
+0x223a57f0	IsGranaryVisible	0
+0x223b53ef	Top	
+0x223b58dd	SecondColumnValue	4
+0x223bb2f5	Infotip	1
+0x223cbf38	Infotip	1
+0x223dba85	CategoryBarState	
+0x223df451	HoverState	0
+0x223ef5cd	Position	3
+0x223f95fc	ShowButtonPrompts	0
+0x223fb79d	SettingDropdownList	
+0x224124d1	EntryType	
+0x22417af4	ContextArrayBase	
+0x2241c152	ConfirmButton	
+0x22441312	TextColor	
+0x22453c5c	GameSetupActionButton	
+0x22465b5b	IsWarningVisible	0
+0x224687b8	Layout	
+0x2246cf34	SizeDescription	
+0x2247274b	Season	
+0x224751ae	IsMaxTier	0
+0x2247cebb	Icon	4
+0x224b08f8	Percent	3
+0x224bd20c	IsHighlighted	0
+0x224be510	SceneData	
+0x224d40ff	Index	1
+0x225083bf	State	4
+0x225100e2	Position	3
+0x2251d5fb	DisplayTime	1
+0x22524c33	MapSize	
+0x22553b3d	IsFocused	0
+0x22567fbb	ProvinceData	
+0x2257170f	RightWidth	1
+0x22578d13	TutorialHighlight	3
+0x22579296	StaticHelp	
+0x225af6ae	Infotip	1
+0x225cf32a	FestivalTitle	
+0x225d0a37	QuicktoolsArrayBase	
+0x22603d9e	IsHorizontal	0
+0x22610c59	IsVisible	0
+0x22626ac6	ArrayByProductsBase	
+0x22663ec8	QueueAmount	1
+0x22683568	Rotation	3
+0x22687bb3	Intensity	
+0x226b1d56	Emperor_Left	
+0x226b4193	InfoLabel	
+0x226b7f6f	ColorizeBrightness	3
+0x226c012e	WarningState	
+0x226cc939	OMBaseData	
+0x226d48a1	ArrayRankingBase	
+0x22723791	IsGroupsVisible	0
+0x22725ebe	RegionTabsData	
+0x2272e5c5	IsEventCompleted	0
+0x2272ed6c	OMBaseData	
+0x22734f7c	HippodromeCompleted	
+0x22746869	Progress	3
+0x2274f0e9	IslandOwnerInfo	
+0x227513da	GranaryData	
+0x2275abee	AutomateToggle	
+0x22760329	ProductionChainBtnsData	
+0x22770654	IsSelected	0
+0x22771f60	StorageCapacity	3
+0x22784911	IsCurrentAvailable	0
+0x2279002c	IsHovered	0
+0x2279a14c	CommandActionBtn	
+0x227f403c	ResourceData	
+0x227f789c	EntryData	
+0x227f9d7f	RequiredPrestigeIsWarningVisible	0
+0x2280573c	MapLinesBase	
+0x2282b792	TimerValue	3
+0x2282ebb5	LS	
+0x22839239	InvalidInput	0
+0x22843dce	Color	
+0x22845001	Headline	4
+0x2284bf6c	Index	1
+0x22853e03	FactionsChartBase	
+0x2285cddf	Infotip	1
+0x2286157f	Left	
+0x22879468	QuestEntryID	
+0x22883326	Index	1
+0x2288d1c7	Infotip	1
+0x2288f986	QuestObjectiveEntryData	
+0x2289243e	HasOptions	0
+0x228a8dd8	BreakdownIsVisible	0
+0x228b2f87	SecondaryText	
+0x228b7b3a	ProfileIndex	1
+0x228c1364	UnitStatsBarBase	
+0x228c5411	ProductionOverTimeData	
+0x228d202e	FilterGoodsData	
+0x228e7f4c	IsRepeatable	0
+0x228edc75	IslandList	
+0x229021aa	TradeRouteType	
+0x22929a0c	Cost	4
+0x2295389b	ParticipantInfoTip	
+0x22957689	IsVisible	0
+0x22959f26	IslandListData	
+0x2295b530	IsNew	0
+0x2295f240	NegativeReasons	
+0x22970827	FreeAreaData	
+0x2297c2b4	IsInactive	0
+0x229835ec	UnitsBase	
+0x2299461e	BenefitListBase	
+0x229c0065	CreateModuleBtn	
+0x229c329f	IsRunningGame	0
+0x229c75e7	InfoTitle	
+0x229ca4ce	TakeoverMessage	
+0x229cdeac	SellingPriceSorting	
+0x229d0c1c	FocusedIndex	1
+0x229d3fe7	TextLabelID	
+0x229db5f4	IsEnter	0
+0x229f5126	State	4
+0x22a080b9	IsLeftDividerVisible	0
+0x22a2b8ab	Infotip	1
+0x22a4e1b6	IsLandUnitInShip	0
+0x22a57b4a	Balance	
+0x22a6afd6	RightPortraitData	
+0x22a7213c	IsConnectedToSystem	0
+0x22a97200	FocusedIndex	1
+0x22aa02d4	IsOwned	0
+0x22ac05b0	IsFocused	0
+0x22ac1fb9	ShipUnitTypeBase	
+0x22ad570d	IsMissingDevotion	0
+0x22aebe67	Context	
+0x22b0f12b	OptionsDataBase	
+0x22b147c6	Offset	
+0x22b3083f	Rank	
+0x22b37b64	SceneData	
+0x22b5661b	PrimaryButtonPrompt	
+0x22b784bd	ConstructionMenuBuildModeModuleData	
+0x22b7e7cb	Tabs	
+0x22b9cf29	ButtonData	
+0x22bac160	Popup2BuildingsGroupDataBase	
+0x22bb5c7f	HasMods	0
+0x22bb9e65	SectionsBase	
+0x22bc2106	NotificationSoundGUID	1
+0x22bce1e1	SceneData	
+0x22bde91d	State	4
+0x22bec45e	OnlinePlayerData	
+0x22c09535	GameOverScene	
+0x22c12837	IsWanrning	0
+0x22c1e022	SceneOverlayAlpha	3
+0x22c1eca1	ResourceName	4
+0x22c20e41	BreakdownIsVisible	0
+0x22c2b9e0	Value	4
+0x22c3a52d	IsCurrentPlayer	0
+0x22c3b7dc	HasWarning	0
+0x22c3cde6	IslandPanel	
+0x22c46178	PreviewModel	4
+0x22c51039	RequestFocus	
+0x22c54190	ResourceCoverage	
+0x22c68cd1	SetProgressValue	3
+0x22c7ed10	RelativeContribution	3
+0x22c93593	FocusPrio	1
+0x22c9ff0f	InfoTipData	
+0x22ca2250	Teamlead	
+0x22ca60f4	InfoCorner	
+0x22ca998f	Icon	4
+0x22cb8c7e	GameModeSecondaryTitle	
+0x22cc17db	StampEditPopup	
+0x22cd6ae2	SlotsListDataBase	
+0x22cec22a	IsSpecialState	0
+0x22cec290	OMAqueductData	
+0x22d02fe4	SubHeader	
+0x22d0338e	GlobalData	
+0x22d0832f	ActionButton	
+0x22d0a107	LocalPlayerColor	
+0x22d19fbb	MinimumSlider	
+0x22d5111a	BreakdownIsVisible	0
+0x22d52d40	EntryData	
+0x22d7fd21	Text	4
+0x22d85756	Alignment	
+0x22d90b8d	Description	4
+0x22d9b33f	ConstructionButton	
+0x22da1734	Popup	
+0x22da2ac7	OptionButtonArrayBase	
+0x22daa039	InfotipData	
+0x22daa225	InfoPanel	
+0x22daa819	Left_StatusAttributesBase	
+0x22db2eab	OutputWidth	3
+0x22db5865	TakeoverProgressBase	
+0x22dc47bb	OffersGridDataBase	
+0x22dc5f47	OMMonumentEvent	
+0x22dc6591	RequestFocus	
+0x22dc80ef	CategoryInfoTip	
+0x22dcd1c4	HasTimer	0
+0x22de2424	WarningData	
+0x22de4e41	BuySlotFocusedIndex	1
+0x22dfb53c	CheatsListBase	
+0x22e06090	Size	
+0x22e0e64d	InteractionData	
+0x22e211e4	AvailableGoodDataBase	
+0x22e5156e	IsVisible	0
+0x22e71c1c	TimerValue	3
+0x22e76964	IsFocused	0
+0x22ea25f8	UnlockRequirement	
+0x22eb01bc	TechTreeProgress	3
+0x22eb343b	OptionalNeedsBase	
+0x22ec3dd5	CheckboxMetallic	
+0x22ecb43f	IsVisible	0
+0x22ecbac0	FocusedAutoSaveGamesIndex	1
+0x22ed4d84	SceneData	
+0x22ed78bb	NoMatchingSlots	0
+0x22ee74fd	BuiltBuildingIcon	4
+0x22ee7f39	IsHintReason	0
+0x22ee9bc8	ParticipantControl	
+0x22f1d8f9	Icon	4
+0x22f2c66c	SingleBuildingBtnData	
+0x22f35977	Position	3
+0x22f40c07	IsRequired	0
+0x22f43817	MaxSliderValue	3
+0x22f45db1	ZOrder	1
+0x22f484c1	SlotType	
+0x22f951d1	AmountOfEntries	1
+0x23003343	BtnRightIsActive	0
+0x230081ef	ProductGuid	1
+0x23016ec9	RouteID	1
+0x230385c7	CardBtnData	
+0x23063612	HasTitle	0
+0x2306cba6	CurrentStockSorting	
+0x23083473	RacerArrayBase	
+0x2309a699	TransitionObject	
+0x230a6373	IsPopupVisible	0
+0x230a6949	Data	
+0x230af75e	DiplomacyState	
+0x230c127c	IsVillaState	0
+0x230daca1	NotValidType	0
+0x230f127d	TradeShipSelect	
+0x231729db	AddListSpacing	0
+0x231780fe	Contrast	3
+0x2317c857	PreviewSubText	
+0x23182add	TutorialData	
+0x23188c8e	IsMetaMenu	0
+0x2318abfe	IsVisible	0
+0x23196acc	NeedValue	1
+0x231a6281	LandUnitsData	
+0x231c75cc	Color	
+0x231c7942	IsVisible	0
+0x231cbcdf	IsPaginationVisible	0
+0x231d056f	IsCurrentPlayer	0
+0x231d7bf4	Text	4
+0x231da751	IsHost	0
+0x231dcfe2	ProfileDataBase	
+0x231f2051	ShrinePermitAmount	1
+0x2320006c	ClaimButton	
+0x23206f1d	InfoTip	
+0x232133f2	InfoTipData	
+0x2321ce40	CreateRouteInfoTip	
+0x232255ab	CooldownProgress	3
+0x23228a04	OMBaseData	
+0x23235876	MaximumZoomScale	3
+0x23249a4b	ContentGroupName	
+0x2325d54e	TabsData	
+0x23263c3e	CosmeticsBase	
+0x2327be2b	States	
+0x2328a0dc	DescriptionHeadline	
+0x232915d3	SceneData	
+0x23294156	TLCMarkerScene	
+0x23295bd0	OMBase	
+0x232c7a0d	Interaction	
+0x232e3fec	ScaleFactor	3
+0x232f611d	Position	3
+0x2330487b	DebugData	
+0x2331013f	FilterData	
+0x2334823f	Origin	
+0x2335b196	IsMultiplayer	0
+0x233629ea	IsProjectEntryVisible	0
+0x23368426	BuildingDetailsData	
+0x2336d07f	SceneAnimation	
+0x23370b51	IsImageVisible	0
+0x23386371	RB	
+0x233a8539	ControllerInputData	
+0x233c50e8	Infotip	1
+0x233d1f26	LapsBase	
+0x233e6d31	TakeoverProgressBase	
+0x2340bb83	AnimationData	
+0x2340cbf6	Context	
+0x234301f8	MouseEnterSoundGUID	1
+0x23436ff9	RerollBtn	
+0x2344c781	IsPositive	0
+0x2345408f	TutorialData	
+0x23455bf8	IsProgressbarVisible	0
+0x2345b347	InoPanelData	
+0x23462504	RequestFocus	
+0x234b4325	DominantPatronBackground	4
+0x234c6133	TextLabelID	
+0x234d13d0	Layout	
+0x234d185d	ProvinceName	4
+0x234d19cc	IsPanelVisible	0
+0x234d43b1	IsEmpty	0
+0x234d8cfa	Device	
+0x234e8408	Supporter	
+0x23511c61	TextInputData	
+0x2354ee4f	ClaimButtonData	
+0x23550cd2	ShopCardsBase	
+0x2356839a	ExpiredAmount	1
+0x23574198	Infotip	1
+0x2357ede5	IsVisible	0
+0x23582796	Index	1
+0x235837ae	IsEmpty	0
+0x23589ff9	ActionButtonsBase	
+0x2359d2af	Position	3
+0x235a0735	IsInactive	0
+0x235c3d31	BottomPreview	
+0x235e1ca9	IsSecondaryBtnVisible	0
+0x235ea686	IslandOptionPopupData	
+0x2360a5ec	PlayerData	
+0x2360f28c	ButtonInfoData	
+0x2361a023	StorageBreakdownSorting	
+0x23620b34	Text	4
+0x23630798	SubHeader	
+0x2363c905	SceneEvents	
+0x2364b915	FameAmount	1
+0x23650fd1	AssignmentPopup	
+0x23681964	BtnsBase	
+0x2368cdab	IsTrackable	0
+0x23698528	SearchInput	
+0x236a9afb	CurrentProgressValue	
+0x236b02c6	ConsumtionSortingData	
+0x236b424c	GlobalPosition	
+0x236c1535	IsHost	0
+0x236c658d	FocusedIndex	1
+0x236c8317	BtnArrayDataBase	
+0x236d09f6	EntryName	
+0x236e3010	Infotip	1
+0x236e8c0f	IsFundingInfoGerman	0
+0x236f5dbc	Y_Position	3
+0x236f9df2	RivalEditBtn	
+0x23707a22	DifficultySelectionScene	
+0x2370d8ac	Name	4
+0x23714b4c	IsSelected	0
+0x23715e71	IsVisible	0
+0x2371c2ca	SectorProjectTimerData	
+0x2371fe44	IsNewBadgeVisible	0
+0x23722fab	SortingButtonData	
+0x2372b48e	SecondaryBtn	
+0x2372fb0a	IsPlayer	0
+0x23732f16	ToggleCloudIsEnabled	0
+0x23738cca	IsVisible	0
+0x237564fa	HideQuestBtnData	
+0x237629be	IsVisible	0
+0x23768aa5	FunctionalityState	
+0x2377d099	Opacity	3
+0x2379e772	SignDeclarationButton	
+0x237aba1e	ResetShip	
+0x237b91ca	TextStyle	
+0x237c5fdf	BtnStates	
+0x237c634d	IsFocused	0
+0x237dcb70	IsEmptySector	0
+0x237f281d	IndicatorListBase	
+0x237f56aa	SecondPlatform	
+0x2382ab3e	DescriptionText	4
+0x2382af39	SubMenuData	
+0x2382b0c2	BuffCount	3
+0x238384d1	RotationEnum	
+0x2387f836	NoteFiltersCombobox	
+0x2388ec03	CompositionData	
+0x2389e814	ProvinceButton	
+0x238b0d9d	PlayerInformationData	
+0x238b29c3	GlobalPosition	
+0x238c602d	SelectedGovernorOverallDifficulty	
+0x238dcf3e	AdditionalElements	
+0x238de41d	InfoCornerEntryPoint	
+0x238f0c52	SlotType	
+0x23905b46	IsWarningVisible	0
+0x2391edcf	Infotip	1
+0x2391fa99	HasJumpTo	0
+0x2392d2b3	SceneData	
+0x23930ce4	RewardsBase	
+0x23933fa5	IsVisible	0
+0x2393cfcd	RewardType	
+0x239424cc	IsUploading	0
+0x2395403f	Position	3
+0x2395d99c	ProvinceName	4
+0x23966e86	Index	1
+0x2396995b	Color	
+0x2396e8be	HasJumpTo	0
+0x2396fb93	GenericMarkerData	
+0x239a07fa	PowerReasons_Left	
+0x239a43c7	SetRewardFamePoints	
+0x239a71da	ButtonData	
+0x239a9fe5	Reward	
+0x239d7c9d	Index	1
+0x239e932c	RenamableHeadline	
+0x23a0864d	LeftWidth	1
+0x23a1fb5d	MarkerType	
+0x23a34705	TierProgress	3
+0x23a55fc9	AddModification	
+0x23a59a18	IsJumpToActive	0
+0x23a5ae38	IsRiverCurrentVisible	0
+0x23a655a5	MuteBtn	
+0x23a6eebd	ProductivityValue	4
+0x23a92bce	ActivatedByDeity	0
+0x23aa499f	BtnLeftIsActive	0
+0x23ace5e4	RemoveModification	
+0x23adfe65	IsColored	0
+0x23ae1418	SceneAnimation	
+0x23ae42af	IsEnabled	0
+0x23af34ea	InfotipData	
+0x23b135a8	SpecialistsBase	
+0x23b2238f	FramePadding	
+0x23b59702	SelectedDeityIndex	1
+0x23b62a87	RacerState	
+0x23b70de7	CampaignIcon	4
+0x23b7a34e	QuestbookArchiveTab	
+0x23b7deca	IsMultiplayer	0
+0x23b823e8	Size	
+0x23b9fabe	IsTrackable	0
+0x23baa45c	IsHovered	0
+0x23bae4b7	IsCardFocused	0
+0x23bb293b	IsVisible	0
+0x23bd3f51	OffscreenRotation	3
+0x23bea46a	IsEmptySlot	0
+0x23bf3433	VillaMarkerBase	
+0x23c085a1	Position	3
+0x23c0c84b	SceneData	
+0x23c199ee	EffectTray	
+0x23c25aff	AdvancedOptionIsChecked	0
+0x23c291de	NotificationSoundGUID	1
+0x23c40454	DLCID	1
+0x23c40890	SelectedGoodName	
+0x23c57d6b	SoundsComboBox	
+0x23c6da0b	BtnInteraction	
+0x23c770f1	WorldSpaceOffset	
+0x23c79fed	Page	
+0x23c7e664	KnowledgeAmount_InfoTipGUID	1
+0x23c81e6b	OMLighthouseData	
+0x23c8738b	HasJumpToFunction	0
+0x23c9752a	DataArrayBase	
+0x23cb4405	ContextFocusedIndex	1
+0x23ce3198	IsVisible	0
+0x23ce4779	HasClaimable	0
+0x23cf7f23	CurrentFilterText	
+0x23cfdf07	BtnPreviewData	
+0x23d0e450	IsVisible	0
+0x23d0eac6	IsEditable	0
+0x23d359ea	SceneFocus	
+0x23d4d5a4	FirstEffectName	
+0x23d5475b	FavoriteData	
+0x23d58bae	Context	
+0x23d683e3	Type	
+0x23d6e48d	Infotip	1
+0x23d9583d	ArrayColorsBase	
+0x23daea55	TotalConsumption	1
+0x23ddda4b	Start	
+0x23de2486	Status	
+0x23ded0fd	Environment	0
+0x23df627e	BackgroundType	
+0x23df9da2	Alignment_Y	
+0x23dfe7c4	IsMouseEnter	0
+0x23e07949	LineAngle	3
+0x23e0b6d5	IsShip	0
+0x23e0fb6e	ToggleThree	
+0x23e1a753	RemovePinCurrentDropActive	0
+0x23e29479	QuestChoiceBtn	
+0x23e2d286	RemappingIsActive	0
+0x23e3e82a	AcceptTextOnLostFocus	0
+0x23e46806	BarterSlotFocusedIndex	1
+0x23e46f5d	EmperorDifficultyBase	
+0x23e5cae0	DeityName	4
+0x23e74dd6	OrnamentsData	
+0x23e75765	ModulesSlotsBase	
+0x23e79e4a	ItemSource	
+0x23e8f730	GlobalBuffsDataBase	
+0x23e93976	IsResolving	0
+0x23ebb540	SceneData	
+0x23ebca2e	GamePadBtnListBase	
+0x23ec8aed	ShowError	0
+0x23ec98d1	IsDisabled	0
+0x23ed32c7	IsSelected	0
+0x23ee542d	SceneData	
+0x23ee58d3	State	4
+0x23ef1c4f	GeneralNotificationArchiveBase	
+0x23ef5998	Infotip	1
+0x23f1688f	QuestEntryID	
+0x23f1cc48	Ruinsdescription	
+0x23f1d2c1	AdditionalElements	
+0x23f22802	AlphabeticSortingData	
+0x23f37d84	ObjectivesListData	
+0x23f3a138	TabsData	
+0x23f43126	IsFocused	0
+0x23f43548	Button	
+0x23f4a149	MonumentState	
+0x23f54a39	ProfileMarkerBase	
+0x23f6c43b	CameraScale	
+0x23f6e035	SpecialStateInfoTip	
+0x23f780e5	IsVisible	0
+0x23f7bbeb	IsVisible	0
+0x23fd2ef8	ActionReasonTotal	
+0x23fe83bc	ProductivitySortingData	
+0x23fef404	SceneAnimationObject	
+0x23ff3b48	DifficultiesBreakdownBase	
+0x23ffb9cb	SceneData	
+0x240053a1	IsSaveManager	0
+0x24037d23	IconText	
+0x24038ecf	InfoTipData	
+0x2404a901	MajorNotificationData	
+0x2405579e	CountdownText	
+0x24079e8e	BoostedAttributeBase	
+0x240812fb	ActionBtnData	
+0x2409207e	UnlockState	
+0x240ab9a9	SceneData	
+0x240c0210	HasNoDevotion	0
+0x240ccc7f	ConfirmButton_IsEnabled	0
+0x240d8cec	RewardData	
+0x240f48d0	OMBase	
+0x241051e8	InfoCornerPopup	
+0x24106ea7	BottomAchievementIndex	1
+0x2411967d	ArrayEditIconButtonBase	
+0x241399db	RightIconStyle	
+0x24141992	Defender	
+0x24149a51	DLCIconListDataBase	
+0x2415c8e6	AnimatedCursorIconPath	4
+0x24173f5d	AvailableActionsListBase	
+0x241799d9	SceneTransition	
+0x24182ccc	IsSelected	0
+0x24185dae	WarningConfirmBtn	
+0x2418ba65	SceneAnimation	
+0x241b6ec3	ArrayStarsBase	
+0x241b77a7	IsVassalized	0
+0x241c8102	IsVisible	0
+0x241dca4d	SceneFocus	
+0x241e2780	GamePadBtnActionlistBase	
+0x241f2119	MapSize	
+0x242027c2	StatesInfo	
+0x24203f69	IsNew	0
+0x24207b3c	IsEnabled	0
+0x24224911	BtnLayout	
+0x242355cf	AreaOffset	
+0x24239fe5	ENBtnIsSelected	0
+0x2425c6aa	SceneFocus	
+0x242652b9	CurrentValue	1
+0x242b2a1a	PopupSize	
+0x242b9329	ToBeDeleted_Text_RecapText	
+0x242c2929	Difficulties	
+0x242df3b2	Niche	
+0x242e6619	PopupPosition	
+0x242f769f	IsLowMorale	0
+0x242f9813	IsImagePopupOpen	0
+0x243003c0	IsEnabled	0
+0x2430f73f	IsVisible	0
+0x243129d9	GameSpeedBtnData	
+0x24314e01	ProductionColor	
+0x24324089	State	4
+0x2432e3dd	Header	4
+0x2433b4db	AutoCloseID	1
+0x2433bcc0	TechData	
+0x24344d94	Index	1
+0x2434e814	IconStyle	
+0x24355855	QuestDescriptionBase	
+0x24359c16	OnScreenPosition	
+0x24360568	FirstVisibleIndex	1
+0x24388f2c	HeightOffset	3
+0x243911b9	TechCategoryType	
+0x243a175e	PingElement	
+0x243af04b	SceneAnimation	
+0x243b43c4	ArrayMPSlotsBase	
+0x243b9e84	SoundGUID_Confirm	1
+0x243ba874	TransferBtn	
+0x243bc889	IsVisible	0
+0x243c819b	BuysEverything	0
+0x243c83f5	DiscardCargoBtnIsDisabled	0
+0x243cfe86	OverviewListData	
+0x243d2182	RefGUID	1
+0x243e30ac	IsLadderReason	0
+0x243e46a2	TradeRouteSoloDataBase	
+0x243ff38e	DrainageState	
+0x24401ab9	TabBtn	
+0x24402711	StampGroupData	
+0x244093d1	SizeIn	
+0x24415230	CosmeticToolOptions	
+0x2441721f	HasWarning	0
+0x24419eba	Benchmarkselection	
+0x2443017d	RadialProgressRight	3
+0x2443e2fd	Index	1
+0x244605e8	IsFocused	0
+0x2447fd22	IsExpanded	0
+0x2448fae1	TLCWrapperData	
+0x244ab016	Value	4
+0x244c2fa7	StateWithSelected	
+0x244c7db4	Workforce_Infotip	
+0x244c83c4	FuelConsumptionData	
+0x244d0af3	CheatID	1
+0x244e219f	IsLayoutListHorizontal	0
+0x244e4368	InteractionData	
+0x244eb1fd	Header	4
+0x2450043a	EmperorColor	
+0x24506091	StateInfoTip	
+0x24507dd7	TimerValue	3
+0x24515d57	NeedsBase	
+0x24515e10	AqueductHeightArrayBase	
+0x245169f1	CheckboxData	
+0x2451bead	GlobalCursorPosition	
+0x2451c811	PreviewModel	4
+0x24541e99	Click_IsEnabled	0
+0x245462c9	SelectedIndex	1
+0x2454e245	DLCIconArrayBase	
+0x24550e79	IsHovered	0
+0x2455324f	PrestigeProgressData	
+0x245566ef	TutorialGuid	1
+0x24558541	IsFocused	0
+0x2456a7b6	IsButtonPromptVisible	0
+0x24576bf5	CampaignBannerNotificationData	
+0x245a6661	SceneData	
+0x245b73a6	Index	1
+0x245b7f2a	HasAdditionalEffect	0
+0x245e13c5	SceneData	
+0x245eed4c	GoodsData	
+0x2460847d	SearchEntryArrayBase	
+0x24612cfd	IsVisible	0
+0x24624bb4	ShipType	
+0x246265a8	isFocused	0
+0x2463007c	TradingExchange	
+0x2464cb95	Layout	
+0x2465a0b7	DLC	
+0x24671b69	EditPresetButton	
+0x246749b4	IsPopupOpen	0
+0x24678229	ProvinceName	4
+0x2468010d	Infotip	1
+0x2468c320	ExpData	
+0x2469f0e5	ActionA	
+0x2469fe68	IsDefeatIconVisible	0
+0x246b62c3	WarningIsVisible	0
+0x246b789e	Rank	
+0x246ba6b3	WarProgress_InfotipGUID	1
+0x246cdd47	MinimapContent	
+0x246d5a68	ConstructionSlot	
+0x246d9c49	SlotContentBase	
+0x246e0295	FirstBits	1
+0x246ffb5c	IsInUse	0
+0x2470420b	SceneData	
+0x24711289	Health	
+0x2471410a	Offset	
+0x24715c02	CooldownIsVisible	0
+0x24739782	Header	4
+0x24745ab9	CurrentSpeed	
+0x24747add	StatusName	
+0x24751787	ToggleTwo	
+0x24753249	SelectedVersion	
+0x2475a5c1	IsActive	0
+0x2475d0ff	ShowNoteDetails	0
+0x2477af78	JumpToBtnInfoTip	
+0x247803c4	MaxDragPosition	
+0x24782858	IconName	
+0x247a529c	HeadlineData	
+0x247b036b	IsFavorite	0
+0x247b086f	AttributeListBase	
+0x247b4895	Layout	
+0x247bf034	Value	4
+0x247c1eab	IsDiscountVisible	0
+0x247eb72b	GameSetupOverview	
+0x2480289f	Infotip	1
+0x24809487	SceneAnimation	
+0x2480a60c	ActiveTradeVersionLoaderDataBase	
+0x2480fb35	ProfileData	
+0x2481199d	SecondaryPromptLabel	
+0x24822428	Position	3
+0x2484eef0	Items	
+0x24850f10	CanAfford	0
+0x2485661b	TextStyle	
+0x24861269	ActiveInfoTip	4
+0x24865dff	RenderID	1
+0x24868dad	Header	4
+0x24872300	YAxisLabel	
+0x24872685	PopupsButtonsBase	
+0x248740da	IsPositiveValue	0
+0x2488a5a3	UnlockOverlay	
+0x2489259f	ID_5	0
+0x248c26fa	ProgressValue	3
+0x248e0821	CosmeticToolSkinSelection	
+0x248f996b	IsReadOnly	0
+0x249026eb	InfoCornerEntryPoint	
+0x24911035	OnHover	0
+0x24945da9	OverviewData	
+0x2494dbbc	IsFocused	0
+0x24958658	TrackProgressValue	3
+0x24968d7b	LeaveSessionMarkerBase	
+0x2496bc66	ComboboxData	
+0x2497e0a4	Prlogress1	3
+0x249835ec	IsSecondaryButtonVisible	0
+0x24991ca9	ProjectProgressData	
+0x24997251	RequirementsDataBase	
+0x2499978a	ArrayGovernorPortraitBase	
+0x249c4ae7	IsEnabled	0
+0x249d304a	WarningData	
+0x249d56da	IslandName	4
+0x249d668d	ProductionButtonArrayDataBase	
+0x249e0c9c	IsAlternativeSound	0
+0x24a59458	AmountPopupData	
+0x24a5ec82	TendencyState	
+0x24a60d16	Preview	0
+0x24a68a7a	VillaBtn	
+0x24a79465	IsVisible	0
+0x24a81eb2	FocusedIndex	1
+0x24a9d951	Color	
+0x24aa68f0	Context	
+0x24ab0ce6	GoodsFilter	
+0x24ac13c2	EventPhaseText	
+0x24ac90f7	ShowControlClick	0
+0x24aca27d	MultiplayerData	
+0x24ad15a8	GovernorSelectionSectionsArrayBase	
+0x24ae7ed2	AlphabeticSortingButtonData	
+0x24b120a6	AmountSlider	
+0x24b25603	ProvinceSecondaryTitle	
+0x24b2988b	PlayerResult	4
+0x24b2daa3	SceneData	
+0x24b37553	SceneData	
+0x24b3e49a	OverflowThreshold	3
+0x24b3e5b0	BreakdownButtonArrayDataBase	
+0x24b488fd	IslandListBase	
+0x24b4aab2	CampaignBanner	
+0x24b4bcbb	CosmeticToolSceneData	
+0x24b5dfd8	IsScrollable	0
+0x24b64e36	SceneData	
+0x24b6d3c1	UnitType	
+0x24b7d6e0	PaginationData	
+0x24bae676	CheckboxDataBase	
+0x24bb3d72	SceneAnimation	
+0x24bb6232	IsComplete	0
+0x24bbbdea	GraphNodeElementArrayBase	
+0x24bc5ba3	GameSpeedState	
+0x24bd459f	OMProductionData	
+0x24bde663	BasinCapacity	1
+0x24bea778	GovernorSelectionSceneData	
+0x24bf9b20	ConnectionLineDataBase	
+0x24bffe29	DescriptionText	4
+0x24c04ce8	ArrayAvatarsBase	
+0x24c0fd32	AllowSystemClipboard	0
+0x24c21d7f	IsVisible	0
+0x24c2769c	OnScreenTextsBase	
+0x24c2824f	IsSubCategoryHeader	0
+0x24c30fba	HeaderProfile	
+0x24c41fc8	LocalCameraPosition	
+0x24c447ee	BuffData	
+0x24c631f8	States	
+0x24ca6176	VariableGamespeedData	
+0x24ce438f	FertilitiesCount	1
+0x24cf7b88	Progress	3
+0x24cfbead	InfoTip	
+0x24cfd995	BtnData	
+0x24d0f904	SplendourDeclineHeadline	
+0x24d0fc12	PopupData	
+0x24d28670	RivalDescription	
+0x24d40427	BtnLeftIsActive	0
+0x24d4083b	IsLowMoral	0
+0x24d41061	SubHeadline	4
+0x24d4bc62	Context	
+0x24d5ffbf	PaddingOuter	
+0x24d7cd7e	TradeRouteSoloDataBase	
+0x24d81c09	TextLabelID	
+0x24d89a93	CloudSlotsCurrent	1
+0x24d8e08a	SceneAnimation	
+0x24da80ad	IsActiveType	0
+0x24dab6c1	Popup1BuildingsGroupDataBase	
+0x24dc0a5e	EditPresetButtonVisible	0
+0x24dc66ff	UnitCardsBase	
+0x24ddf22c	StatsBase	
+0x24ddf75d	IsVisible	0
+0x24de60c6	BuildInfoEntriesBase	
+0x24de6846	CombatWarning	0
+0x24df0058	CategoryRotation	3
+0x24e11a48	FooterHeight	3
+0x24e41485	TutorialData	
+0x24e4dc01	WatermarkTexts	
+0x24e61652	Stat	
+0x24ea2147	NumOfVisibleItems	1
+0x24ea867c	CommandBtn	
+0x24ea963d	DisableLanguageButtons	0
+0x24eb1ef8	IsTextInputFocused	0
+0x24eb5b4e	GrayScale	3
+0x24ec3143	InfoData	
+0x24eca8ca	AppearDisabled	0
+0x24ed60df	DayNightSceneData	
+0x24ed9837	WarTypeDescription	
+0x24edd667	MissingSpaceString	4
+0x24ee46a1	CategoryBuildingsDataBase	
+0x24ef4750	ArrayMiscBuffsBase	
+0x24ef7b63	WorkforceValue	4
+0x24f01e64	VillaGUID	1
+0x24f0f6e8	ResetBtn	
+0x24f1783a	GovDecision	
+0x24f3bf09	IconTextData	
+0x24f437b7	RivalsAmount	1
+0x24f62bcb	IsVisible	0
+0x24f636cf	IsEnabled	0
+0x24f68a61	TabsGroupsDataBase	
+0x24f7a07e	IsGamepadHover	0
+0x24f84682	Military_1_Progress	3
+0x24fad1f5	IsNegative	0
+0x24fb430e	AvailableCargoSlots	1
+0x24fc6db8	RequestsGridDataBase	
+0x24ffb32e	EntriesBase	
+0x24ffeab0	Reward	
+0x2501d194	IsDragMode	0
+0x2504f348	Requirement	
+0x2505bb81	IsCurrentPlayerSlot	0
+0x250652ed	GamepadAction	
+0x2506ffae	ItemButtonData	
+0x250707dc	JumpToBtnIsVisible	0
+0x250726b5	IsMultiSelection	0
+0x2507e4e3	BuildModeData	
+0x250936aa	IsVisible	0
+0x2509ee43	SecFilters	
+0x250aa40e	FocusedProfileIndex	1
+0x250c16e5	InfotipGUID	1
+0x250d525c	Filter02	
+0x250de416	QuestEntryType	
+0x250e8208	EnableBlur	0
+0x250ed900	SearchBarBase	
+0x2510317c	IsResearchSlotFocused	0
+0x2513f5f5	Index	1
+0x2514b721	SceneAnimation	
+0x2515698a	IsVisible	0
+0x25166aa7	IsFocused	0
+0x25174e3f	SceneTransition	
+0x2517ab5f	CurrentProvince	
+0x2517eb60	IsVisible	0
+0x251a1744	InfoTipData	
+0x251bc27b	IsPortraitVisible	0
+0x251c3324	IsAvailable	0
+0x251e6a67	DeityDescription	
+0x25201981	ActionOptionsBtnsBase	
+0x252061a4	BreakdownData	
+0x25208434	PositiveReasons	
+0x25211d71	SceneData	
+0x25218393	ObjectDescription	
+0x2521fcae	CirclePosition	
+0x252274c4	SecondEffectDescription	
+0x2522f07f	Footer	
+0x2525d7a3	RightIconStyle	
+0x25263d0e	OnScreenEvacuationListBase	
+0x2526d710	InfoSection	
+0x252764da	UnlockDevotion	4
+0x2528aa46	OpenGameSetupIsEnabled	0
+0x2528c4e0	IsErrorVisible	0
+0x2529f484	GamePadBtnListBase	
+0x252b0615	IsEmperorRequest	0
+0x252c9bea	InfoLinesBase	
+0x252d0a61	ShipCombatStatus	0
+0x252ef53b	Progress	3
+0x252fbfc1	RewardDescription	
+0x25304a1b	Button	
+0x25306a02	SceneData	
+0x253185a2	InteractionStates	
+0x2531fda4	ScaleFactor	3
+0x25336df6	IsGovernorActive	0
+0x2534d494	State	4
+0x2537074f	TendencySorting	
+0x25372d65	Rival	
+0x2537fd10	TransferAmountButtonArrayBase	
+0x2538f75f	HUDGovernorRequest_Notification	
+0x2539634d	ObjectMenuSceneFocus	
+0x2539dd44	AudioCurrentlyPlayed	0
+0x253a3bcd	InfoOverlay	
+0x253a429a	ToggleOne	
+0x253af9d8	IndicatorDirection	
+0x253b4ad7	Width	3
+0x253c2b26	PassiveTrade	
+0x253d0f49	PlayerName	
+0x253d7640	ProfileBtnListBase	
+0x253e229d	QuestbookActiveTab	
+0x253ea30c	TrendSorting	
+0x253f78e2	RelativeContribution	3
+0x253fbb6d	UntrackedQuestData	
+0x2540960f	SceneData	
+0x2540d7d0	ScreenAreaViewport	
+0x2540e9ba	CharacterTitle	
+0x254265b6	UpgradeInfotip	
+0x2544a29f	GlobalSubMenuPopupPosition	
+0x25454197	HasNewEffect	0
+0x25455540	DLCCheckboxListBase	
+0x25471bf9	ViewBtn	
+0x2547cbe4	BaseInfotip	
+0x2548baa2	OnlinePlayerInfo	
+0x2548db79	WarningSeverity	
+0x254a11be	AnnoPresetsDataBase	
+0x254a47f3	Progress	3
+0x254afcd1	IsFilterButtonVisible	0
+0x254b07c1	ProjectType	
+0x254b912c	DataChangeRequest	
+0x254bea83	LineTexture	
+0x254d425a	FocusedIndex	1
+0x254fbfdd	BuiltBuildingIcon	4
+0x25502e4c	PaginationData	
+0x255101f9	Infotip	1
+0x2551124b	PhaseState	
+0x25525303	LeftMouseIsDown	0
+0x25555a19	GlobalPopupPosition	
+0x2555b8dd	ButtonData	
+0x25579970	HeadlineText	
+0x25584670	Scale	3
+0x2559d0f2	Headline	4
+0x255b25b4	SettingDropdownData	
+0x255b595b	GranaryOverflowData	
+0x255bddea	ChangeData	
+0x255be172	Type	
+0x255d2684	ItemBtnData	
+0x255f58ea	CampaignCharacterSelectionSceneData	
+0x2560355c	WarTypesBase	
+0x25604406	ArrayDataBase	
+0x2560b858	IsCPU	0
+0x2560f6f2	GameSetupActionButton	
+0x25616788	FocusedManualSaveGamesIndex	1
+0x2562d711	DeityInfotip	
+0x256328d9	IsSelected	0
+0x2564248f	ArrayMarkersBase	
+0x256431ca	SceneAnimation	
+0x2564453e	NotificationImageID	1
+0x2564d6d2	IsOrderVisible	0
+0x2564e272	IsUnitCamped	0
+0x25654811	NumericInputOnly	0
+0x25655a7d	EventFocusedIndex	1
+0x2566c467	IsNew	0
+0x256761f2	OnlinePlayerInfoBtnData	
+0x256924f3	NotIslandOwner	0
+0x256b33ed	StationHasWarning	0
+0x256bbd88	SecondaryButtonCursor	
+0x256da4f4	DynamicVideo	4
+0x256ff29f	SoundGUID	1
+0x25704bf5	EncounterParticipantData	
+0x2570c152	GroupNumber	4
+0x257256d9	Type	
+0x25728a18	WorldPos	
+0x2572d65e	SceneData	
+0x2573af6b	State	4
+0x25754934	IsVisible	0
+0x2575551b	FirstElement	0
+0x257686b2	IsVisible	0
+0x25769561	HasUnreadChanges	0
+0x2577d6d7	GovernersDomainData	
+0x2577ffbe	IslandBuffsDataBase	
+0x257ad430	Progress	3
+0x257c59aa	ArrayGroupButtonsBase	
+0x257d6b59	FocusedIndex	1
+0x257e0aa4	LeftButtonPromptTutorialHighlight	3
+0x257ffa3d	QuestUnreadType	
+0x25806304	SceneAnimation	
+0x25838cfd	ShipsPauseWarningData	
+0x2584be18	FirstColumnSortingButtonData	
+0x2588b96c	ResetIsEnabled	0
+0x25890313	OutgoingBuffArray	
+0x258a59da	CompassMarkersBase	
+0x258bc242	BannerType	
+0x258be9de	SceneData	
+0x258d34f5	NotificationType	
+0x258e2baf	SessionConnectivity	
+0x258e5dd3	CancelBtn	
+0x258ed3f7	PositiveReasons	
+0x258fa79c	InputField	
+0x258fb21c	IsVisible	0
+0x259053bb	IsConnectorVisible	0
+0x25907a15	FocusedIndex	1
+0x25914077	ID_6	0
+0x2591dd86	ProductivityBtnInfotip	
+0x25923cee	BuyShipData	
+0x2593beb7	MetaMenuData02Base	
+0x259833f2	Command	
+0x2599020a	AssignmentArrayBase	
+0x25993c6b	UpgradeInfotipGUID	1
+0x259a9c07	SelectionSound	1
+0x259ba2ea	CategoryButton	
+0x259d1e14	GlobalPosition	
+0x259de841	Presence	
+0x259e38b4	RewardsBase	
+0x259e6aad	DividerDataBase	
+0x259e9f95	IsEmpty	0
+0x259fc6ae	ShipStats	
+0x259fd432	ObjectID	
+0x25a00bd8	ProvinceName	4
+0x25a02a0c	YAxisLength	3
+0x25a0dd51	UnitBannerSceneDataBase	
+0x25a1f0a1	MainParentPosition	
+0x25a3654d	IsWarning	0
+0x25a3ac55	ProfileData	
+0x25a3f834	HeaderRenamable	
+0x25a44234	Text	4
+0x25a44ba1	Popop1Position	
+0x25a53bab	FocusedIndex	1
+0x25a72c6f	Profile	
+0x25a7e21c	IsVisible	0
+0x25a98802	IconStyle	
+0x25adef10	IsChecked	0
+0x25b0e1cc	ShipUnitContentData	
+0x25b51740	SectorProjectRewardsArrayBase	
+0x25b5199d	CurrentValue	1
+0x25b53cba	BuildSourceButton	
+0x25b66f8b	TradeTabID	1
+0x25b7b801	Data	
+0x25b7d5f7	IsLocked	0
+0x25b7dc9e	HeaderBase	
+0x25b8a0de	GroupValue	3
+0x25b95d85	Type	
+0x25b9a6f2	ToggleRepeatTimer	
+0x25baae0c	InfoTipGUID	1
+0x25baecc8	WarningState	
+0x25bb542b	GovernorInformationListBase	
+0x25bd00c2	IsOpen	0
+0x25bdfb02	IsTracked	0
+0x25be4e7e	IsVisible	0
+0x25bf10b9	Description	4
+0x25c015eb	Portrait_Second	
+0x25c02dac	IsFocused	0
+0x25c14388	MenuIsOpen	0
+0x25c206e4	IsFrozen	0
+0x25c23dd4	SubState	
+0x25c3e95a	IconColorIsLight	0
+0x25c453ad	ContextData	
+0x25c5bfff	IsStorageFocused	0
+0x25c63069	InteractionData	
+0x25c6cb2a	InfoTipData	
+0x25c72ece	FestivalData	
+0x25c80760	InfotipData	
+0x25c87ad4	DifficultyOptions	
+0x25c9d630	IsValidHeight	0
+0x25cca1d5	State	4
+0x25cd0cbe	LockedVisible	0
+0x25cdf994	RivalProvinceInfoBase	
+0x25cfa2b3	IsMPListFocused	0
+0x25d0e859	StatsBreakdownBase	
+0x25d1a9ce	ComboboxData	
+0x25d30740	Transition	
+0x25d43f51	LayoutType	
+0x25d44e29	IsEmptyRewards	0
+0x25d48cb2	PlayerData	
+0x25d5b764	DifficultyListOption	
+0x25d5d9f0	Popup1ProductionChainDataBase	
+0x25d6fb0c	PlayerContribution	4
+0x25d72051	ProvinceCardsBase	
+0x25d87d79	Size	
+0x25d8e39f	BuildingsGroupsBase	
+0x25da656f	States	
+0x25ddccdc	ChromaKeyColor	
+0x25de599c	BuildingsBtnsBase	
+0x25dfbcfd	RenderID	1
+0x25e12e11	MenuAnimEventData	
+0x25e19b6d	CharacterEffectsBase	
+0x25e19e65	IsVisible	0
+0x25e23bd3	RequestFocus	
+0x25e2c086	InfotipContext	
+0x25e51c98	ResearchQueueData	
+0x25e65eb3	ToBeDeleted_QuestInfo	
+0x25e776c3	UConnectIDData	
+0x25e7bb5e	MissingPlatform	0
+0x25e856fd	ArrayContentButtonsBase	
+0x25ea5031	Overview	
+0x25ea65f2	DataChangeRequest	
+0x25eb2fae	Progress	3
+0x25ef0b87	Icon_Title	
+0x25ef14e9	DisplayedOffset	
+0x25efa2e0	SceneData	
+0x25f3adf2	RenderID	1
+0x25f47191	SubtitlesColor	
+0x25f53811	AnimationData	
+0x25f53bad	PodiumArrayBase	
+0x25f65e21	IsPreviousVisible	0
+0x25f68ad2	UnitsCurrentBatleGrouplistBase	
+0x25f72afe	Title	4
+0x25f99f0b	Infotip	1
+0x25fac9dd	EmperorIsVisible	0
+0x25fc0ec4	Layout	
+0x25fc9993	InteractionData	
+0x25fe2742	ResponseUnitsBase	
+0x25fe3540	SceneData	
+0x25ffa5b2	TabsBtnsListBase	
+0x26005c86	GlobalKnowledgeValue	1
+0x26009edd	SectionChristian	
+0x26030dde	TertiaryButtonPrompt	
+0x26074af7	RightButtonPromptTutorialHighlight	3
+0x2607fdfd	ZOrder	1
+0x26093261	ActionGUID	1
+0x2609e741	Action_CustomGUID	1
+0x260a13c4	Storage	
+0x260aa807	IsSelected	0
+0x260ac324	FocusedIndex	1
+0x260b2b84	DataBase	
+0x260bb59a	IsActive	0
+0x260c0bff	PinSlots_CenterBase	
+0x260c4f3c	TImer	
+0x260cc546	ShowContentGroupIcon	0
+0x260db362	IsWarning	0
+0x261094ce	ShrineInfotip	
+0x2613cc01	Settings	
+0x2615875d	IsPlayerSkippingCutscene	0
+0x26162333	CheatCatgeoryIndex	1
+0x2616a74c	MapRotation	3
+0x2617f4f3	ProductionType	
+0x26181aed	MissingImportantActions	0
+0x2618744d	IsStamp	0
+0x26188f22	OpenMetaButton	
+0x26196d23	VariableGameSpeedData	
+0x261a5531	Btns	
+0x261a5984	GameModeInfoBase	
+0x261b18b5	GlobalType	
+0x261b478a	IsPlayerBet	0
+0x261bf667	IsDisabled	0
+0x261c74f8	Context	
+0x261cb89e	CategoryBuildingsDataBase	
+0x261d1e29	QueueOrderMode	0
+0x261e230f	BtnData	
+0x261e78f7	Index	1
+0x261e8794	QuestRewardBase	
+0x261ee7cb	HasWarning	0
+0x261f0943	ActionBtn	
+0x261f6389	ProvinceTabs	
+0x261fc470	Progress	3
+0x2621502e	IsCurrentPlyer	0
+0x2622fc5f	BlueprintName	
+0x26261203	ItemsData	
+0x2628fcc4	SceneAnimation	
+0x262918f5	CharacterNotificationFocusedIndex	1
+0x262bf940	IsSplendoErrorVisible	0
+0x262c91e7	Visibility	
+0x262d1066	RequirementsBase	
+0x262d8e3d	IsMainQuest	0
+0x262de146	Layout	
+0x262f944a	NoValidResearch	0
+0x262fc73d	IconText	
+0x2631ffdf	Infotip	1
+0x263245b0	IsButtonEnabled	0
+0x26342076	MoveUpBtnData	
+0x26342985	DeliveryState	
+0x26343474	ValueAmount	1
+0x26364f72	LogoPosition	
+0x2636ab31	IsNew	0
+0x2636f7c3	DLCActivationScene	
+0x26389e3f	OMBase	
+0x263ab53b	MilitaryTakeoverData	
+0x263ab9f8	Portrait_InfoTipGUID	1
+0x263b1ee1	SubHeader	
+0x263c031b	IsHighestRarity	0
+0x263c896b	Context	
+0x263d305a	SoundGUID_Hover	1
+0x263df350	LSRotate	
+0x263eae60	IsCurrentDropTarget	0
+0x263ed150	UnavailableActionsListBase	
+0x263ef3a4	TradeRouteItemsBase	
+0x2640b839	FirstTitleCombobox	
+0x26419e50	BackgroundType	
+0x264221fe	BtnAccept_MK	
+0x2642591a	InfotipContext	
+0x26429d11	ProfitSortingData	
+0x2643e4ba	LocalReligion_InfoTipGUID	1
+0x26444174	ArrayBulletPointBase	
+0x26448177	IsEnabled	0
+0x264569c1	OverviewData	
+0x26463e92	AddScreenButtonArrayBase	
+0x2646cc57	IsEnabled	0
+0x26477de8	TutorialCategory	
+0x26480dc0	IsVisible	0
+0x2648b54a	EndDegrees	3
+0x26496e5e	SectorProjectData	
+0x2649c882	InfotipData	
+0x264a2eef	ProvinceIconText	
+0x264a9e74	Base	
+0x264b733b	HealthStatus	
+0x264b7503	StatisticsBuffsBtnData	
+0x264bd61a	Type	
+0x264bf84f	BtnStates	
+0x264ca466	ColosseumCompleted	0
+0x264e00d0	DominantPatronHeader	
+0x264e1d83	ObjectiveIconTitle	
+0x264e4b75	AvailableSlots	1
+0x264f07fa	TextLabelID	
+0x264f9bf2	OMResidenceData	
+0x264fc8fd	BtnMute	
+0x26519cbf	MilitaryModulesBase	
+0x265317f9	ChanceDescription	
+0x26531fca	Details	
+0x26536851	SceneSettingDropdown	
+0x265545a3	DeityPortrait	4
+0x26563b32	IsVisible	0
+0x26564ff1	NavigationButtonBase	
+0x2657409e	FooterData	
+0x2657a9eb	BannerDeco	
+0x2658fb7b	BtnData	
+0x265982b2	IsVisible	0
+0x265a52bd	InfoTipData	
+0x265b27e6	StorageIsVisible	0
+0x265b6521	Context	
+0x265c846d	IsVisible	0
+0x265f45a2	InfoCornerEntryPoint	
+0x2661361f	IconVisible	0
+0x2661554b	IsSocket	0
+0x266508d5	SplitUpgradeRight	
+0x2666008a	Resources	
+0x266769a0	SaveShip	
+0x2667c030	DLCWarning	
+0x2667d4c5	CategoryIconText	
+0x26690205	IsVisible	0
+0x266af695	CardType	
+0x266b89e4	GroupIndex	1
+0x266b8b73	ProjectMarkerListBase	
+0x266ce933	LetterBoxListBase	
+0x266d7ae7	InfoCornerEntryPoint	
+0x266dead2	SortingToggle	
+0x266fe9e4	Portrait_Left	
+0x2670bad3	Selected	1
+0x2670fc75	TimerSublineIsWarning	0
+0x2672a0f2	SearchInputData	
+0x267386de	InfotipData	
+0x2673bc54	InfotipData	
+0x267561b6	ResetButtonData	
+0x2675ce9d	IsCurrentPhase	0
+0x2677981b	RelativePosition	
+0x2677b969	Style	
+0x2678aa0e	ListDataBase	
+0x2678c992	TotalFame	1
+0x2678fc56	AccessButtons	
+0x26790433	IsWarning	0
+0x26797d40	IslandData	
+0x267d166c	PopupPivot	
+0x2680013a	IsRandomizeEnabled	0
+0x26809e70	Queue	
+0x2680fec6	RivalData	
+0x268378f8	Alignment_X	
+0x2683a4d7	MPDLCActivation	
+0x2687541b	SceneAnimation	
+0x26878971	SectorProjectPhase	
+0x2687c86b	RallyButton	
+0x2687fba1	QuickToolsIsVisible	0
+0x26887e60	ScreenSize	
+0x268b67a9	ShipFilterData	
+0x268b687c	Title	4
+0x268c5101	ActionBtnTutorialGuid	1
+0x268de46b	AmountTextField	
+0x268dfac9	RefTextID	
+0x268e8ed6	PhaseState	
+0x268eead4	SocketContentBase	
+0x268f7953	Color	
+0x268f8e19	Index	1
+0x268fdaa6	SettingBtns	
+0x26929bf8	IsVisible	0
+0x2692ec37	FilterData	
+0x26936f69	IsSelectedEmperor	0
+0x2697173b	RGB2	
+0x269bc01c	BalanceBase	
+0x269cfc17	RefOID	
+0x269dc238	IsJumpToRegionIconVisible	0
+0x269e54e4	ShareBtn	
+0x269ea98b	DeityBackgroundOLD	4
+0x26a09d5d	EnterGUID	1
+0x26a1db6b	RacerArrayBase	
+0x26a2ccd9	Province	4
+0x26a2fa1e	IsHovered	0
+0x26a44749	IsGovernorCenter	0
+0x26a4ea07	ItemArrayBase	
+0x26a4eadb	BtnClose_MK	
+0x26a54ad8	FeedbackLabel_ID	
+0x26a55f0f	IsVisible	0
+0x26a6227d	Racer	
+0x26a64def	StorageAmount	3
+0x26a76ee7	IsSaving	0
+0x26a822ea	VisibleItemCount	1
+0x26a8f883	WarStrengthBase	
+0x26a900c1	IsSelectable	0
+0x26aa764f	Military_1Base	
+0x26ab790c	ModuleSlotsBase	
+0x26ac4f2b	IsHovered	0
+0x26ac9b85	BalancesBase	
+0x26acc1d6	IsFavourite	0
+0x26ace274	IsEscortShip	0
+0x26ae43fd	Profile	
+0x26af8ed0	SelectedSection	
+0x26b184d4	FocusedIndex	1
+0x26b280f5	isOMfocused	0
+0x26b349f5	TutorialGUID	1
+0x26b3ca16	IsVisible	0
+0x26b5e192	PlayerTitle	
+0x26b79516	TotalBelief	1
+0x26b90cb3	IsVisible	0
+0x26baed89	NewWar	0
+0x26bc2249	Scale	3
+0x26be3e91	IsRacerArrayHovered	0
+0x26be8e7b	Layout	
+0x26beaf3d	IsWorldMapAccessable	0
+0x26c2bc40	IsComplete	0
+0x26c359ad	TabsData	
+0x26c47553	FirstVisibleIndex	1
+0x26c48388	Infotip	1
+0x26c5b339	ProvinceName	4
+0x26c5d3a7	Context	
+0x26c638d5	RequestFocus	
+0x26c6ce52	State	4
+0x26c71fc5	IsCampaign	0
+0x26c86f61	PodiumArrayBase	
+0x26caaebf	FeatureLoaderDataBase	
+0x26cb0f4b	ShowDoubleClick	0
+0x26cc69b6	IsMetaItem	0
+0x26cc7885	ShipInfoTipdata	
+0x26cc90e2	PrimaryButtonCursor	
+0x26ce4008	CampaignCharacterSelectionArrayBase	
+0x26cf350d	SecondValueIsNegative	0
+0x26cf7b15	RequiredGoodsArrayBase	
+0x26cfbb8e	BoostBtn	
+0x26d020d7	TradeRouteGroupDataBase	
+0x26d082d7	HeadlineTextStyle	
+0x26d99b6c	NoValidOrder	0
+0x26dad048	IsFocused	0
+0x26dadb02	ValueAnimation	3
+0x26db10a0	IsVisible	0
+0x26dbda85	ID_10	0
+0x26dbe938	SetName	
+0x26dbec4b	BtnLeftIsActive	0
+0x26dd386b	CharacterPortrait	4
+0x26dffb6c	VisibilityCheckbox	
+0x26e206f8	SceneAnimation	
+0x26e2369b	ResourceState	
+0x26eb308d	SecondEffectName	
+0x26eb7b6b	NotificationDataBase	
+0x26ec1234	QuestTracker	
+0x26ec3b5b	StackIndex	1
+0x26f09880	ArrayOfDifficultyCardDataBase	
+0x26f0d6a0	Context	
+0x26f0e846	PingListDataBase	
+0x26f27f86	SearchInput	
+0x26f3771d	JumpToUnlock	
+0x26f3ef65	IsCDLC	0
+0x26f5839d	SceneAnimation	
+0x26f66f31	BtnCloseIsVisible	0
+0x26f80b2e	AudioCheckbox	
+0x26f84d56	IsCrossSave	0
+0x26f85399	SecondColumnSortingButtonData	
+0x26f8ab86	BtnJumpTo	
+0x26f8e069	ResetSingleSettingData	
+0x26f8f62f	IsResourceCoverageLow	0
+0x26face14	PinnedObjectBase	
+0x26fad413	IsWarning	0
+0x26fb9627	IsHero	0
+0x26fc0f9e	RefGUID	1
+0x26fc5dec	IsVisible	0
+0x26fd6838	PowerStrugglePortraitData	
+0x26fe5c25	HippodromeProgress	
+0x27000df8	GamePadAction	
+0x27005642	UpkeepCostBase	
+0x27030e09	Size	
+0x27055d0f	RivalDifficultyBase	
+0x270727bb	GlobalPopupPosition	
+0x27083562	ToBeDeleted_Daily_Timer	
+0x270848ef	Province	4
+0x27093a03	IsWarning	0
+0x2709b0ed	Rotation	3
+0x270b00ca	IsEffectTrayButtonVisible	0
+0x270b9480	IsVisible	0
+0x270c61db	InfoCornerEntryPoint	
+0x270d7295	ArrayReligionBuffsBase	
+0x270ed70c	ItemData	
+0x270f0905	IsUnderAttack	0
+0x270f5b41	Infotip	1
+0x2710679a	IsPanelOpen	0
+0x271495b9	IsAssemblyTakeover	0
+0x271512bb	State	4
+0x27154eed	RadialListBase	
+0x271609f3	FirstVisibleIndex	1
+0x271676f4	AutoUnloadCheckbox	
+0x27174c9b	IsActionBtnEnable	0
+0x271a19ee	PlayerColor	
+0x271b5193	SubMenuData	
+0x271b5b06	Color	
+0x271d670a	GoodBtnBase	
+0x271de1fe	RefOID	
+0x271f738f	ResetButtonVisible	0
+0x271fccd1	Enabled	0
+0x27203e34	IslandeName	4
+0x27205bbd	WarningData	
+0x2720fac1	IsFocused	0
+0x27217420	ArrayNeedEffectsBase	
+0x2722799e	RacerSocket	
+0x2722a888	ID_7	0
+0x27253e0b	ModuleData	
+0x27255ad5	Filters	
+0x27297d39	BtnPromptListBase	
+0x272b13af	IsProfileVisible	0
+0x272b180d	Speaker	4
+0x272d0b54	TakeoverOverlay	
+0x272d8469	IsSecondaryButton	0
+0x272dbc9d	ShipList1Base	
+0x272ddfd8	OMBase	
+0x272f6195	IsRenamableHeadline	0
+0x2730c668	Tendency	
+0x2731d043	MissingResources	0
+0x27326a4d	SeasonName	
+0x2733cf90	SceneFocus	
+0x27350c1b	Costs	
+0x2736061f	Timers	
+0x2736ea66	SceneData	
+0x27371809	IsFocusable	0
+0x273750df	Settings	
+0x27392f49	IsVisible	0
+0x2739bd1f	Button	
+0x2739e851	RomanizationData	
+0x273b8e9c	DemoIntroScene	
+0x273c4fac	Position	3
+0x273c7c5b	IsContextMenuActive	0
+0x273e81d1	ShopDetails	
+0x273eb489	VillaTab	
+0x273f8fc2	DayNightCycleIsOn	0
+0x27405a51	IsContentOriginVisible	0
+0x2742956f	HasMods	0
+0x2742a6a7	InternetConnectionVisible	0
+0x2742eab6	ListData01_LeftBase	
+0x27437757	IsSelected	0
+0x27443310	ShowControlClick	0
+0x2744efdd	RelativeContribution	3
+0x2745c77d	Header	4
+0x2746d7f3	NewQuestNotificationData	
+0x274829b1	ProgressBlocked	0
+0x2748e2a8	OMGenericData	
+0x274a26b4	InventoryData	
+0x274df26a	WorldSpaceOffset	
+0x274e9c3d	TripleThreat	0
+0x274ed93f	Date	
+0x274ef0e9	MainCursor	
+0x275192bc	SectorProjectData	
+0x2751d7b2	Animation	
+0x27524ce5	ConstructionState	
+0x275ab163	IsRuin	0
+0x275b42d0	AchievementState	
+0x275d4c35	GameSetupActionButton	
+0x275d52e7	State	4
+0x275d7b71	IsBottom	0
+0x275d7c5b	Filter	
+0x275e5978	SceneAnimation	
+0x275e5d76	GlobalKnowledgeData	
+0x275ea8b7	IsProdChain	0
+0x275ec346	OMMonument	
+0x275ec678	IsEditable	0
+0x275f041f	OwnerText	
+0x275f5686	ShipTypeInfotip	
+0x27612241	Progress	3
+0x27620e66	SizeIconHeadline	
+0x2764a8ae	RecentlyUnlockedBase	
+0x276523f3	AlphaGamma	3
+0x27658451	BasicActionCardsBase	
+0x276755e7	ShowDragDropDescription	0
+0x27682d0f	ContextData	
+0x27693e40	GlobalPosition	
+0x2769b4f4	MPDesyncPopupSceneData	
+0x276be6ee	IsVisible	0
+0x276bfff4	EntriesBase	
+0x276f0a7e	IsVisible	0
+0x276f3e59	ProvinceIconArrayBase	
+0x2770ec75	SceneAnimation	
+0x27711c17	Context	
+0x2771210a	InfoCornerEntryPoint	
+0x277228bc	LetterboxViewport	
+0x2772f90a	SceneAnimation	
+0x27738127	NotificationBannerData	
+0x27740c43	IsHighlighted	0
+0x27745f55	RSPress	
+0x2774703f	Portrait_Right	
+0x27757dd3	SettlementRightsData	
+0x2775c694	IsVisible	0
+0x2775dc95	UpgradePanelData	
+0x2775f18a	IsPreviousVisible	0
+0x27766f2c	Health	
+0x27770e32	ProfileTabs	
+0x27796100	SplendourBreakdownBase	
+0x277ae8fd	PlayerWarContribution	3
+0x277b96cd	UpgradeButton	
+0x277bb63e	FocusIndex	1
+0x277bde69	CurrentSelectionName	
+0x277c3734	IsTransitionMessageVisible	0
+0x277cc584	EventStates	
+0x277cd33b	LiveSaveToggle	
+0x27802d68	Repair_Btn_TutorialGuid	1
+0x2780e17b	WorkforceData	
+0x27838c69	IsCloudSave	0
+0x2783f899	ProfileEditBtn	
+0x2788639e	LayoutPopup	
+0x27897dc2	AxisPosition	3
+0x278a8760	LandCombat	
+0x278daede	VariableGameSpeedData	
+0x278eea49	AttributeID	1
+0x2790be17	ContentHeadline	
+0x2791f356	BtnIconState	
+0x279279b8	Size	
+0x27948a7d	VassalColor	
+0x2795c2ac	FocusedIndex	1
+0x2795e67f	TotalItemCount	1
+0x27974bd8	InfoTipData	
+0x2798f77b	IsInputVisible	0
+0x2799c673	MouseCursorPosition	
+0x279bbba7	IsChainFinalGood	0
+0x279c550f	StatusText	
+0x279ed990	NumOfVisibleItems	1
+0x279f72ce	MissingModule	0
+0x27a3226f	OMMusicHallData	
+0x27a3c933	ObjectiveEntryDataBase	
+0x27a3de16	RefGUID	1
+0x27a403e5	ContextMenu	
+0x27a459b0	Filters	
+0x27a45c94	ButtonArrayBase	
+0x27a5bb8a	IsVisible	0
+0x27a6ec0b	IsAscending	0
+0x27a7997c	IsSetting	0
+0x27a84fc9	ProvinceTitle	
+0x27aaf805	InfoTip	
+0x27ab479f	GeneralWarningData	
+0x27ac6f1e	IsVisible	0
+0x27accc1c	Popup	
+0x27ae01d4	SceneData	
+0x27ae2d58	IsStack	0
+0x27afb170	PersistentCoop	
+0x27b0fcd3	BaseData	
+0x27b1031b	Attacker	
+0x27b19871	Progress	3
+0x27b1b4e3	SettingsBtn	
+0x27b2f898	IsFocused	0
+0x27b3e7b0	IsFavourite	0
+0x27b42ed1	HasFirstIncident	0
+0x27b46bed	DeityArtworkOLD	4
+0x27b5194c	DebugButtonIsVisible	0
+0x27b5d2b0	VisibleItemSizeX	1
+0x27b6be49	SliderData	
+0x27b6ef1d	DynamicVideo	4
+0x27b739b1	BoostProgress	3
+0x27be8092	TakeOverBtn	
+0x27bf00df	TextInputRenameData	
+0x27bf3a61	ArraySecondaryColorsBase	
+0x27c1854c	ActionBtn	
+0x27c237cc	HoverIndex	1
+0x27c2d955	LeftPortraitData	
+0x27c30673	Description	4
+0x27c3de9d	StoreBtn	
+0x27c50857	Timer	4
+0x27c8327c	OptionalGoodsArrayBase	
+0x27c95795	ArrayProvinceIconsBase	
+0x27cacb92	OMBase	
+0x27ccc43a	IsFocused	0
+0x27cd74d8	SceneAnimation	
+0x27cdd4e2	TextInput	
+0x27cf9d19	SceneAnimation	
+0x27cfe157	BarterSlotsBase	
+0x27d04458	IsRightDividerVisible	0
+0x27d07100	Color	
+0x27d0fce7	ListData02Base	
+0x27d1bf93	CosmeticsID	1
+0x27d55d16	Transition	
+0x27d5e7d4	CompositionArrayBase	
+0x27d713df	IsVisible	0
+0x27d8d82b	RenderID	1
+0x27da3b5e	HighlightsID	1
+0x27dc250c	PortraitMenuType	1
+0x27dcf93b	ButtonClose	
+0x27dd88ab	ContextData	
+0x27dea59c	CloudSlotsMax	1
+0x27df7289	Reason	
+0x27e25636	Index	1
+0x27e2b5ed	SceneAnimation	
+0x27e32548	IsVisible	0
+0x27e3b0ec	IsVisible	0
+0x27e3e3f1	SceneAnimation	
+0x27e3eba7	FocusedIndex	1
+0x27e515a6	InfoPanelState	
+0x27e51c4f	DLCIconsBase	
+0x27e77e32	FeedbackLabel	4
+0x27e78782	City_Status	4
+0x27e89189	QuestObjectiveBase	
+0x27e8daec	HasByProduct	0
+0x27e9e776	ShowGranaryStorage	0
+0x27eb0e7b	BadgeDataBase	
+0x27ed2c5f	DeityColor	
+0x27ee15f0	Value	4
+0x27ee7b13	Infotip	1
+0x27f0cd7e	Profile	
+0x27f0d1cb	ProgressValue	3
+0x27f20831	InfoCornerEntryPoint	
+0x27f2a999	IsVisible	0
+0x27f30443	SceneAnimation	
+0x27f39141	RarityListBase	
+0x27f3bbe9	XPosition	3
+0x27f55345	Offscreen	
+0x27f72437	RenderID	1
+0x27f96f5b	RerollInfoData	
+0x27fa9a94	OpenSceneBtn	
+0x27fab136	Index	1
+0x27face12	IslandListData	
+0x27fae78d	Rank	
+0x27fb8129	ActionB	
+0x27fbbe19	Columns	1
+0x27fd5adf	ButtonClickable	0
+0x27fd7f1b	Body	4
+0x27fddd49	Effect	
+0x27ff0798	InfoTipData	
+0x28022687	GuestHouseBtn	
+0x28045330	Data	
+0x280713af	OverviewData	
+0x28084a82	ProdOverTime	
+0x280a3272	Name	4
+0x280c2499	PaginationCooldownArrayBase	
+0x280d8eb5	SceneData	
+0x280da5e2	TendencyState	
+0x280db3f6	AccessButtons	
+0x280f6e15	Scale	3
+0x2810437b	IsIrrigationSource	0
+0x281050cf	EffectTrayButton	
+0x281112d4	AssignmentButtonArrayBase	
+0x281362b3	ClaimRewardBtn	
+0x2813dc5a	Style	
+0x2814836a	ItemLocation	
+0x28156ff5	DetailsPanelIsFocused	0
+0x2818b68f	IconStyle	
+0x2818e8ab	BuyUnitBtn	
+0x281a11be	Headline	4
+0x281a5a88	BtnTabsData	
+0x281abcae	ArrayGamepadActionsBase	
+0x281b30d0	PlayBtnInfoTipData	
+0x281c3254	ActiveNotificationData	
+0x281c6f59	OnPatrol	0
+0x281ecad5	NotificationArchive	
+0x2821105b	FunctionalityState	
+0x2822ff19	PinsDataBase	
+0x28242470	Type	
+0x2824a293	LandUnitsData	
+0x2824ad0f	SelectionIndex	1
+0x2824ba68	Cooldown	3
+0x2826747d	Overflow_X	
+0x2826dbd6	TutorialUICategoriy	
+0x2827578b	VariableGameSpeedData	
+0x28292422	TradeGoodSelection	
+0x282af5b7	GlobalMajorNotificationPopupData	
+0x282b0d2d	IsCooldownVisible	0
+0x282bd63f	IsVisible	0
+0x282cdfaa	Rotation	3
+0x282d3c5e	FocusPriority	1
+0x282d9fb1	Title	4
+0x282ee880	State	4
+0x28304ca9	OnScreenBubbleDataBase	
+0x28310fc9	NegativeReasons	
+0x283276d3	IsFilterActive	0
+0x28350556	IsVisible	0
+0x2837e2d8	Progress	3
+0x2837e521	EntryBtn	
+0x2838df5e	ShowAssignInfo	0
+0x28397a2b	TimeOnly	0
+0x2839d9a6	QuestEntryID	
+0x283a9a53	AmountBtnList	
+0x283d53f0	IsEmpty	0
+0x283e52dc	Index	1
+0x283e8ad8	IsButtonVisible	0
+0x2842ba17	Index	1
+0x284317d0	TutorialRefGUID	1
+0x2843edb3	IsHighestChance	0
+0x28445395	WarType	
+0x28451f54	SettlementRights	3
+0x28453278	SiloConsumptionData	
+0x28456f6e	InfoCornerEntryPoint	
+0x2845a650	UnloadBtn	
+0x2845f3e5	IsSectorProjectContribution	0
+0x284696fa	SceneData	
+0x28472d8a	WarningIsVisible	0
+0x28473430	SceneAnimation	
+0x284761bc	ProductionDataBase	
+0x2849717a	Description	4
+0x284cbc9b	Subtitle	4
+0x284ce4e1	SessionGuid	1
+0x284d159b	BuffTimeout	1
+0x284f47fe	WonderInfotip	
+0x284f748f	IsVisible	0
+0x284fe40d	TechCategoryType	
+0x284fe505	ArrayPinsBase	
+0x28511052	ShipBtnInfoTipData	
+0x2851b79a	InteractionData	
+0x2853364f	Amount	4
+0x285390a5	FocusedIndex	1
+0x2854a608	IsAssignedToGroup	0
+0x28551f0f	FactionPanel	
+0x28554b58	WorkforceDataBase	
+0x28569230	OrnamentsButton	
+0x2857059a	HasUnreadChanges	0
+0x28586787	SectionPadding	
+0x28589e48	IsMilitary	0
+0x28591d82	IsActivateButton	0
+0x285939f3	SceneData	
+0x285b19bd	RequiredGoodsArrayBase	
+0x285b85bf	Color	
+0x285cef8f	HeadText	
+0x285e9ffe	IsVisible	0
+0x285ec7fd	TradeRouteGoodDataBase	
+0x285feadd	ProvinceIconBase	
+0x2860f275	IsCampaignQuest	0
+0x286253b8	Index	1
+0x28665b67	ItemPopup	
+0x286b629e	TextInput	
+0x286ba956	ButtonData	
+0x286beea8	IsVassalized	0
+0x286d1f12	NewGroupBtnData	
+0x286dd209	DisableRightBtn	0
+0x286f3968	MinimumZoomScale	3
+0x286f8e0f	IsEnabled	0
+0x2870b55d	CollectionData	
+0x287277d0	IsVisible	0
+0x2872deba	DLCIconsBase	
+0x2873d1fb	TotalPhaseCount	1
+0x2873f792	ContextData	
+0x28760eba	TimerSubline	
+0x2876d4ef	ArrayStorageButtonBase	
+0x287774c2	InfoTipData_RatRisk	
+0x2877cae7	ArrowLength	3
+0x28780d48	OMBaseData	
+0x287b8343	CheatCategoriesListBase	
+0x287bf0b8	CategoryComparisonBase	
+0x287cac6f	SubtitlesData	
+0x287e9cbb	OptionalNeedsBase	
+0x287f33c0	IsMilitary	0
+0x287fd3ba	SceneAnimation	
+0x288042a3	TakeoverOverlayData	
+0x2880a5fd	EquippedDeityName	
+0x288115d6	IsFundingInfoVisible	0
+0x2882a958	MainTitleButton	
+0x2883ceab	TierTabs	
+0x2884a75f	Enter_IsEnabled	0
+0x2884a9c2	Progress2	3
+0x28871d65	ConnectedBuildingsBase	
+0x288b321b	IsVisible	0
+0x288ccdb6	LSPress	
+0x288de5bc	SceneAnimation	
+0x289015b5	Progress_Value	
+0x2891c796	IsSelected	0
+0x28952227	ActionInProgress	
+0x2895adfe	SceneAnimationData	
+0x2895bc2b	FocusedIndexContent	1
+0x2895f07d	HUDGlobalRightBarData	
+0x2896db6c	OMBaseData	
+0x2896e7dc	DPadRight	
+0x28970383	SettingEntriesBase	
+0x28980d1b	PopupData	
+0x28986c2e	BlueprintToggle	
+0x289af007	State	4
+0x289b4536	PlayerInfo	
+0x289b9bab	SceneData	
+0x289bdbc0	IsInactive	0
+0x289df6e1	DLCData	
+0x28a0bf87	TLCDescription_LocalizationID	
+0x28a11b0f	ResetSingleSettingData	
+0x28a23ad6	SceneOffset	
+0x28a2efe2	SizeIn	
+0x28a38e56	InteractionData	
+0x28a46f3b	QuickAccessBtnArrayBase	
+0x28a4d02c	TotalHeight	3
+0x28a4f6ed	RewardName	
+0x28a672ff	SceneData	
+0x28a6de60	ElementArrayBase	
+0x28a6f41d	SelectedIndex	1
+0x28aa88a6	GranaryData	
+0x28aacad3	MapsCount	1
+0x28ac5397	IsVisible	0
+0x28ac668c	CheckBlacklist	0
+0x28acff4b	ProvinceIcon	4
+0x28af7ff5	GameSetupProvinceScene	
+0x28b14603	XAxisLineElementArrayBase	
+0x28b206e6	IsSelected	0
+0x28b28c9a	IsLiveSave	0
+0x28b3455d	OrderListBase	
+0x28b3922c	ShipHealth	3
+0x28b5e4d0	HeaderData	
+0x28b5f44a	IsNew	0
+0x28b65cab	IsStoreBtnVisible	0
+0x28b68a19	ThirdOverviewData	
+0x28b70db0	GUID	1
+0x28b78127	ProvinceIconBase	
+0x28b78b23	SublineTextStyle	
+0x28b7dc0b	IsComplete	0
+0x28b85131	EventInfo	
+0x28b8a411	FolderID	1
+0x28b9d049	ToSelectRequestedIndex	1
+0x28ba7820	InfoTipData	
+0x28ba8188	Colour	
+0x28baa086	WorldPosition	
+0x28bcc82b	HideBtn	
+0x28bd4a2a	RarityType	
+0x28c16ce2	CurrentReputation	
+0x28c192d0	DiplomacyState	
+0x28c2151d	GenericPageData	
+0x28c41735	ShrineThreshold	1
+0x28c42246	Size	
+0x28c5b362	ProvinceRegionalInfoBase	
+0x28c6b4e4	ButtonState	
+0x28c85479	FinanceOverviewData	
+0x28cda763	KeepFocusOnEnterKey	0
+0x28cdaaef	IsVisible	0
+0x28ce7807	Indentation	0
+0x28cee8fd	HideUI	0
+0x28cf56aa	ProductivityData	
+0x28cfe447	BuildDistributionButton	
+0x28d0bb47	OnExpedition	0
+0x28d32455	PortraitData	
+0x28d335ff	Position	3
+0x28d368e6	Panel	
+0x28d3e48c	IsNotOwned	0
+0x28d43670	DeitySelection	
+0x28d50e17	IconVisible	0
+0x28d54b46	Index	1
+0x28d632db	Position	3
+0x28d635f0	LocalReligionIcon	4
+0x28d63ad2	IsSelected	0
+0x28d65bfd	TimerData	
+0x28d6728d	VariableGamespeedData	
+0x28d6d2cd	VariableGameSpeedData	
+0x28d73810	ProductionBarData	
+0x28d7b547	ScalingCombobox	
+0x28d9d93b	FocusedIndex	1
+0x28db9ef4	HighlightsBase	
+0x28dbc0b9	TradeRouteLoadandUnloadDataBase	
+0x28dc950f	MacroMapData	
+0x28dc9ce9	FocusIndex	1
+0x28dcb409	SkinSelectedIndex	1
+0x28df8d68	Transition	
+0x28e23c9f	CoopSlotsBase	
+0x28e3073a	ShipModulesBase	
+0x28e3e035	Transition	
+0x28e3ec71	IsFullscreenVisible	0
+0x28e5bbca	Overview	
+0x28e68112	CurrentDifficulty	
+0x28e695bb	Connection	
+0x28e6f934	EntryPointSize	
+0x28e9f598	PrimaryBtnInfotip	
+0x28ec8aac	SlotsDataBase	
+0x28ed45d9	AreaScope	1
+0x28ee67b7	TextStyle	
+0x28eeb6d5	HPDataBase	
+0x28ef1768	IsVisible	0
+0x28f04779	SetIsCompleted	0
+0x28f0a653	LoadingScreenScene	
+0x28f1c039	GraphData	
+0x28f2ca5b	AchievementCardListBase	
+0x28f4057d	NoShipWarningData	
+0x28f5f8ad	CustomConfirmBtnSound	1
+0x28f6469a	UnitFocusIndex	1
+0x28f65d23	IsPopupOpen	0
+0x28f76aca	InfocornerAvailableHeight	3
+0x28f86cd2	ChainGuid	1
+0x28f8b970	Width	3
+0x28f8de89	RequestFocus	
+0x28f9bada	IsForeign	0
+0x28fa66a1	SplendourDeclineTimerIsVisible	0
+0x28fb1b57	DoubleThreat	0
+0x28fb6df6	Portrait	4
+0x28fc1102	CommandStatus	
+0x28fc4120	AmountButtonsBase	
+0x28fc4b32	ProvincePreview	
+0x28fc9520	Index	1
+0x28fd6e82	HeaderIconText	
+0x28fe5641	Btns	
+0x28ff633c	GamepadBtnListBase	
+0x29001c99	IsSiloButtonModuleVisible	0
+0x290197ff	RacerTrainingBase	
+0x2901a263	TimerComboBox	
+0x29050201	PlayerLost	0
+0x290577a6	ProvinceListBase	
+0x2907fce6	IsToChange	0
+0x290a4803	ArrayGroupButtonsBase	
+0x290ae7cf	IsLandUnitProducer	0
+0x290bb602	AutoCombatText	
+0x290e6ee8	AdditionalElements	
+0x290ed9bc	SceneAnimation	
+0x291087e5	SceneData	
+0x29108e78	IsHovered	0
+0x29109d93	ButtonData	
+0x29110bb0	IsHovered	0
+0x2911e510	ContentSizeY	3
+0x2912b0e8	TierBtnInfoTip	
+0x2912cf86	InfoTip	
+0x2913179d	FilterIsActive	0
+0x29135667	Color	
+0x2913a989	SearchInputData	
+0x29147004	InfoTipData	
+0x2914a1d3	RequestFocus	
+0x29153dee	ActivateButton	
+0x2915fd9e	ID_3	0
+0x29173e9b	States	
+0x29182b51	ActionChoices	
+0x291ac1c8	ArrayDLCButtonsBase	
+0x291e9e95	AutoCombatIsChecked	0
+0x291f082e	PinSlots_LeftBase	
+0x291fceb1	WindDirection	3
+0x29206ce5	GateStates	
+0x2920f966	StationId	1
+0x29234825	StampData	
+0x2923e1a8	Context	
+0x292430fa	CardSelected	0
+0x29243deb	StationTradeOptionDataBase	
+0x2924e13a	PinnedInfotip	
+0x2926cc74	Alpha	3
+0x292773d8	DLCBase	
+0x2928ed93	IsVisible	0
+0x292985cb	InfotipData	
+0x2929e658	HasLostInternetConnection	0
+0x292a4049	Innerpadding	
+0x292aecc3	SceneAnimation	
+0x292c0615	Content	4
+0x292c7904	AdditionalFiltersBase	
+0x292cb35b	IsFocused	0
+0x292f6e77	RomanUpgradeBtnData	
+0x2930f567	VariationSkinIndex	1
+0x2933c1a1	SettingNotificationArchive	
+0x29340fa1	States	
+0x2934be15	EventPreparation	
+0x2935d55d	IsFocused	0
+0x293682c5	RemappingPopupData	
+0x2936a7fe	HippodromeItemBtn	
+0x2939dbe3	InfoTip	
+0x2939e351	Data	
+0x2939ec61	ConfirmBtn	
+0x293a21e8	InWorldPreviewData	
+0x293af931	HeadlineStyle	
+0x293b0a3c	DeityName	4
+0x293d7c44	HasUnreadChanges	0
+0x293f0100	NewUnlocksBase	
+0x294028e1	TextPlane	
+0x294179b2	Infotip	1
+0x2941aa1d	IsActionPossible	0
+0x29438d66	ArrayTradeGoodsBase	
+0x29446793	OptionsBtnData	
+0x294492f5	IsVisible	0
+0x2945f298	IsSingle	0
+0x2946f31e	SceneAnimation	
+0x29484c3c	RivalDeleteBtn	
+0x2948c198	MinimapRadius	3
+0x294928a5	SlotBtn	
+0x29497ae8	GlobalDataBase	
+0x294a1be9	SceneAnimation	
+0x294acaaa	IsVisible	0
+0x294af9ad	ResetButtonData	
+0x294b417e	InfoTipContext	
+0x294d4795	VariableGameSpeedData	
+0x29503b38	ScrollPanel_Controller	
+0x29514279	AlarmedType	
+0x2951d3ff	ProductionAddOnState	
+0x2952df24	SetRewardPopup	
+0x29539f8b	Overview	
+0x2953b511	IsVisible	0
+0x29551249	StatisticsDisabled	0
+0x295647b6	IsEmpty	0
+0x2957ab83	IsEnter	0
+0x2957bcc6	SelectedTabID	1
+0x2958006f	ActionDetails	
+0x295906a8	MissingBeliefBanner	
+0x29596b7c	IsJumpToVisible	0
+0x295be8b1	ButtonOverlayData	
+0x295c324a	HorizontalVisibleItemCount	1
+0x295d4986	OMDrainage	
+0x295f3590	IsFocused	0
+0x295f646f	RatingsArrayBase	
+0x29627e3f	OrnamentsData	
+0x2962de0e	InventoryBase	
+0x296412fe	IsEquipped	0
+0x2964fafa	IsIsland	0
+0x296662b9	IDMainPrompt	
+0x2967cd9a	PrestigeContentData	
+0x29691636	ProgressValue	3
+0x29693f6b	IsInUse	0
+0x296c66fb	FooterBase	
+0x296e0efc	ConfirmBtn	
+0x2970462c	SelectedSpecialistInfotip	
+0x2970b1ba	StateInfotip	
+0x29722f59	Index	1
+0x297359d2	WorkforceSortingData	
+0x29740409	BtnJumpToIsVisible	0
+0x2974cac6	SceneFocus	
+0x2974fbf6	DataChange	
+0x297526cb	IsRearrangeMode	0
+0x2975d336	BackButtonVisible	0
+0x29775128	BuildSegmentButton	
+0x2977fedd	TabsIndex	1
+0x29791e1c	IsStopTimer	0
+0x2979b950	BalanceDescription	
+0x297c0668	ItemName	4
+0x297c643e	SecondOverviewData	
+0x297c828c	ShowQueueInfos	0
+0x297de31d	MixFactor	3
+0x29811bad	ProvinceInfotip	
+0x29819ec6	TraderInventoryData	
+0x2982ceb9	IsVisible	0
+0x2982dac8	SceneFocus	
+0x298315e5	StationInfoTipData	
+0x2983f6c7	IsTotalWar	0
+0x29862fbb	ScreenViewport	
+0x29877814	IsStorageWarning	0
+0x29882ad2	BtnStyle	
+0x2988d2bc	QuestObjectivesTLCData	
+0x2988ddf5	Text	4
+0x298a4c49	SceneData	
+0x298a5b6a	Section	0
+0x298a7d02	Layout	
+0x298a8965	ProvinceTabsBase	
+0x298ad006	Storage	
+0x298cae9b	Profile	
+0x298eba89	ItemsFilter	
+0x298ec299	ReligionScene	
+0x298f0577	SceneAnimation	
+0x298f506a	NoResourceText	
+0x29902b07	PinsArrayBase	
+0x29902c74	IsFocused	0
+0x2991e124	BenchmarkSceneData	
+0x29921c19	EditModeActive	0
+0x299286ae	ListElementEnum	
+0x2992d165	SceneData	
+0x29934755	QuicktoolsScene	
+0x2993c349	IsNew	0
+0x2994cf06	IsMPListFocused	0
+0x29964152	DifficultyData	
+0x29974244	ProvinceIconBase	
+0x2997e2f8	GamePadActionListBase	
+0x2997fca2	TabsData	
+0x29994819	BenefitHeader	
+0x299b1db2	Index	1
+0x299b3400	SceneAnimation	
+0x299be34f	Civilian_FocusedIndex	1
+0x299c1f79	ReasonsListBase	
+0x299c2d0b	GamepadActionsEnabled	0
+0x299c6c0c	SceneFocus	
+0x299c9901	IsProfileEmpty	0
+0x299d1750	BaseData	
+0x299d3420	EntryFocusedIndex	1
+0x299d5684	SceneData	
+0x299ebfff	CityStatusInfoTip	1
+0x29a0a1db	Index	1
+0x29a19666	LineLength	3
+0x29a21ffd	DifficultyRatingBase	
+0x29a2b299	IconText	
+0x29a46216	SceneAnimation	
+0x29a486d3	DeliveryData	
+0x29a53234	OMGovernorVillaData	
+0x29a553bd	BtnBaseData	
+0x29a579e6	EventSelectionData	
+0x29a8583e	ProductionChainData	
+0x29a9c3b2	StationID	1
+0x29a9e7c1	InfoCornerEntryPoint	
+0x29a9ed91	IconTextData	
+0x29aa4a00	GlobalPosition	
+0x29aabd75	TimersBase	
+0x29ab70fc	WorldPosition	
+0x29abb7c5	TierProgressBar	
+0x29abbf36	DarkenBackground	0
+0x29abfc25	MilitaryMarkerBase	
+0x29ac07de	IsVisible	0
+0x29ac90a4	PortraitData	
+0x29af0867	SectionRico	
+0x29af7cb3	RequestFocus	
+0x29af80de	EntryBtn	
+0x29b05dbd	BannerColor	
+0x29b11f09	Modules	
+0x29b2a651	DiscardCargoButtonData	
+0x29b2b2ca	StationOptionBtnEvent	
+0x29b2b5da	CityStatusBanner	
+0x29b3c1c3	Content	4
+0x29b3d61e	OMBaseData	
+0x29b465a4	Data	
+0x29b4863b	Infotip	1
+0x29b4aeb0	OMForeignData	
+0x29b4d7d4	IsActive	0
+0x29b50536	PositionData	
+0x29b5b8d5	IslandTabsData	
+0x29b67956	CategoryTabs	
+0x29b6a558	IsVisible	0
+0x29b8f4ee	TextInputRename	
+0x29b98575	OpenPopupBtnData	
+0x29bad841	ActionType	
+0x29bb6c7e	Text	4
+0x29bcbe96	IsVisible	0
+0x29be71ee	FilterArray	
+0x29bef4d8	IslandPanel	
+0x29bf6838	InfoTip	
+0x29c34245	OMBase	
+0x29c5ade9	IsVisible	0
+0x29c7c8cc	CancelButton	
+0x29ca1f5d	ControllerInputData	
+0x29caaf01	Rank	
+0x29cbcd6b	BBtn	
+0x29cc05d1	Overview	
+0x29cc1781	IsSecondaryIconVisible	0
+0x29cc2f18	CategoryInteraction	
+0x29cc7146	DifficultyEmperorOptionBase	
+0x29cd530b	Position	3
+0x29cf2d9a	IsInactive	0
+0x29cf8d3e	OMBaseData	
+0x29cfbae0	Rotation	3
+0x29d06b99	IsCloseButtonVisible	0
+0x29d0fd33	SingleBuildingData	
+0x29d33e40	PortraitData	
+0x29d5c32b	SubtitleVisible	0
+0x29d5fe87	PrestigeIslandListData	
+0x29d7775f	Position	3
+0x29d8d9b0	ProductionImage	4
+0x29d9a57b	ConstructionIsBlocked	0
+0x29d9e14d	InfoCorner	
+0x29dab8b7	CategorySelected	0
+0x29dad4d0	SeasonName	
+0x29db47aa	IsVisible	0
+0x29dc424a	SceneAnimation	
+0x29dcb690	IsModdingDetected	0
+0x29dcf827	EvacuationProgress	3
+0x29ddefa2	Title	4
+0x29dfe633	Context	
+0x29e01ec1	ImgProgressionChange	
+0x29e09bfe	IsHigherValue	0
+0x29e0ff34	InfernoIncidentData	
+0x29e2aa7c	IsVisible	0
+0x29e2fce2	TotalNeedCategory	1
+0x29e36920	ItemGridData	
+0x29e4ebb6	SceneData	
+0x29e64270	InfoPanelData	
+0x29e64373	CategoryBtnIsVisible	0
+0x29e65bcc	IsBuffActive	0
+0x29e6f8b4	IsVisible	0
+0x29e7abdc	ItemsGridBase	
+0x29e83209	IsVisible	0
+0x29e91c65	GroupContentBase	
+0x29eaccf1	RefGUID	1
+0x29eb454f	TechGroupArrayDataBase	
+0x29ec178e	SelectedShipListBase	
+0x29eed434	PublicGame	
+0x29ef2734	InfotipContext	
+0x29efa53d	IsNegative	0
+0x29f041fc	SceneData	
+0x29f0b4a1	Color	
+0x29f1a2af	TimerData	
+0x29f1d853	ArrayItemCargoSlotsBase	
+0x29f32098	CarouselCardsBase	
+0x29f38f8a	SceneFocus	
+0x29f581de	CardState	
+0x29f5afb2	ThirdColumnSortingButtonData	
+0x29f5bf54	HasWarning	0
+0x29f790ae	PromoDiscount	4
+0x29f7c0e3	IsVisible	0
+0x29f84499	PercentPerfect	3
+0x29f87581	RenderID	1
+0x29f8da45	ContentData	
+0x29f9d20c	OMBaseData	
+0x29fcb427	SectorProjectOverviewData	
+0x29fe31ba	IndexSecondary	1
+0x29fe52d6	FirstIslandTutorialVisible	0
+0x29ffbe72	ConstructionMenuRadialData	
+0x2a00b0bc	CheckboxData	
+0x2a0102a2	GovernorProfileButtonsArrayBase	
+0x2a0129dc	ActionName	4
+0x2a015a0a	SplendourProgress	
+0x2a01aee0	IsSlot	0
+0x2a01ecaf	CopyStampData	
+0x2a033a10	TextBoxSizeMultiplier	
+0x2a04a37f	CampaignEndingData	
+0x2a054e67	NeedElementsBase	
+0x2a056532	Index	1
+0x2a0588a2	DifficultyProgressBar	
+0x2a05bf5b	BuyUnitData	
+0x2a05fc28	IsVisible	0
+0x2a06cb0f	Transition	
+0x2a076888	Emperor_Right	
+0x2a0782ac	SceneAnimationObject	
+0x2a086ee3	AddGovernorBtn	
+0x2a08eb9f	IsVisible	0
+0x2a0c61ff	InfoTip	
+0x2a0ef3dd	RouteCreation	0
+0x2a0f863d	ConsumeGamepadEvents	0
+0x2a107138	LT	
+0x2a12550d	IsVisible	0
+0x2a14d686	ScreenSpacePos	
+0x2a14d8d9	Reward	
+0x2a153ff6	QuestbookEntriesBase	
+0x2a164e82	DescriptionText	4
+0x2a174c27	SavePresetsPopupData	
+0x2a186ae6	CostsBase	
+0x2a19d2f2	LocalViewConePosition	
+0x2a1b1829	ToggleControllerPreview	0
+0x2a1b537c	IsButtonPromptVisible	0
+0x2a1c4051	EventRewardPlusOptionalProgress	3
+0x2a1ce3d6	QuestbookTabsData	
+0x2a1d267f	Infotip	1
+0x2a1d63ca	IsColorSplit	0
+0x2a1ddb2d	IslandListDataBase	
+0x2a1e3181	HasTimer	0
+0x2a1e473b	Amount	4
+0x2a1ee046	SoundGUID	1
+0x2a219d37	SoundsBase	
+0x2a21bc15	CommandBtns	
+0x2a2309e1	CooldownData	
+0x2a236449	OMTradePier	
+0x2a238507	ConnectionLineType	
+0x2a245e55	Achievements	
+0x2a24716f	InfoCornerEntryPoint	
+0x2a24aa1b	AlliesBase	
+0x2a269747	SceneAnimation	
+0x2a28707e	CommunityProgressPercentage	3
+0x2a287203	FocusedIndex	1
+0x2a28f5df	ShowSingleLetterbox	0
+0x2a2b57a9	Title	4
+0x2a2c75c3	WarningState	
+0x2a2e64a8	IntializedVersion	
+0x2a2e9c0f	Layout	
+0x2a30b8c2	Lenght	3
+0x2a30d99b	ContractType	
+0x2a31846d	SceneAnimation	
+0x2a31e686	IsInvalidTrader	0
+0x2a321557	InfoTip	
+0x2a335a82	IsCurrentPlayer	0
+0x2a336beb	PhaseProgress	3
+0x2a33bb39	CategorySatistfaction	3
+0x2a342c3b	Context	
+0x2a34a071	Index	1
+0x2a37205c	KnowledgeBannerData	
+0x2a374daa	IsActive	0
+0x2a380367	Scale	3
+0x2a38ee95	GoodsGridBase	
+0x2a39535f	ChoicesBase	
+0x2a3957f8	BackgroundType	
+0x2a397b7b	GoodsFilterData	
+0x2a3a5735	SceneTransition	
+0x2a3ac035	Index	1
+0x2a3d4fdc	Headline	4
+0x2a3deee8	Navigation	
+0x2a3e450c	IsVisible	0
+0x2a3f35b0	AmountValue	
+0x2a3fddd2	Interaction	
+0x2a411c59	SceneAnimation	
+0x2a42e20d	IslandName	4
+0x2a43c516	AdvancedDifficultiesScene	
+0x2a4511fe	NegotiationActionsData	
+0x2a4568d8	RewardVisible	0
+0x2a465a16	IslandListDataBase	
+0x2a46a1f0	BtnInteractionData	
+0x2a4861c6	IconText	
+0x2a48e0f6	IsUploading	0
+0x2a4b1d79	AudioPreview	
+0x2a4b21ff	OMNarrativeRuinsProgressData	
+0x2a4c267d	SequenceChangeRequest	
+0x2a4d1cca	HealthIsVisible	0
+0x2a4d5104	InfoTipGUID	1
+0x2a4d5e16	InfotipData	
+0x2a4d66ee	Alliance	
+0x2a4e1f88	IsReadyForTakeover	0
+0x2a5251a1	ArrayBase	
+0x2a52884f	IsDailyMax	0
+0x2a552c12	BrushOptionsData	
+0x2a56bede	IsMissing	0
+0x2a57093a	ShowIntroAnim	0
+0x2a57dd7c	RemovePinCurrentDropActive	0
+0x2a581dc4	IsInputFocused	0
+0x2a5b2c38	FovMarkerBase	
+0x2a5b90e1	IsVisible	0
+0x2a5c40f4	ContentDescription	
+0x2a5c9e92	OMStates	
+0x2a5d0c33	Island_Name_InfoTip	1
+0x2a5d686b	CargoData	
+0x2a5db98f	Subline	4
+0x2a5e11f1	PopupIsOpen	0
+0x2a5e77a6	SelectedParticipant	
+0x2a5e7caf	FavoritesMenuWarningData	
+0x2a5eadbb	SingleUpgrade	
+0x2a5f19a6	FirstEffectIndex	1
+0x2a5f4dfb	ItemBtnBaseData	
+0x2a5f58cc	SceneAnimation	
+0x2a5fcca4	SlotsData	
+0x2a628c36	StoragePopupData	
+0x2a6315c7	InfoCornerPopup	
+0x2a646df1	MarkerElement	
+0x2a64a92e	HasError	0
+0x2a65435b	ArrayIslandGoodsBase	
+0x2a657ff7	MarkerDataBase	
+0x2a65dc8b	TendencyState	
+0x2a668478	IsVisible	0
+0x2a66bc62	NoTradeRights	0
+0x2a66cc60	HasPathConnection	0
+0x2a6742ad	Title	4
+0x2a674d41	LodesCount	1
+0x2a68ef20	VisitorCommentsBase	
+0x2a6a479d	VillaIconInfotipGUID	1
+0x2a6a668f	Infotip	1
+0x2a6ae324	Progress2	3
+0x2a6b6c02	ZoomResetBtnData	
+0x2a6bde89	IsVisible	0
+0x2a6d3fff	SceneAnimation	
+0x2a6e512b	PlayerRacerTabData	
+0x2a706484	RT	
+0x2a719ce5	Context	
+0x2a723b98	SplendourRank	
+0x2a745300	Unskippable	0
+0x2a74e456	ShipState	4
+0x2a75267b	Cooldown	3
+0x2a75a4d7	FillAmount	3
+0x2a75f0e9	QueueAmount	1
+0x2a779a38	CargoSlotsBase	
+0x2a787066	Background	4
+0x2a7ab05f	IsCustomized	0
+0x2a7b44e2	TabsData	
+0x2a7d92ff	Profile	
+0x2a7fa678	BarPercentageEncounter	3
+0x2a8027ac	OMBaseData	
+0x2a80dddc	CircleSize	
+0x2a80f7ae	GroupPanelIsExpanded	0
+0x2a81c53b	Description	4
+0x2a837c92	Rotation	3
+0x2a83dc6c	HeadlineTextStyle	
+0x2a85648a	IsHighlighted	0
+0x2a858e04	ArchivedEntriesBase	
+0x2a862ab8	IconTitle	
+0x2a871cfc	FocusedIndex	1
+0x2a876892	GranaryStorage	
+0x2a87e1c7	TradeRouteType	
+0x2a88339c	SessionTransitionObjectConsole	
+0x2a89157c	ConstructionPreviewData	
+0x2a89180c	Item	
+0x2a8a0e54	IconColorIsLight	0
+0x2a8a5e1f	AreaSizeAddition	
+0x2a8ac475	CosmeticSkinIndicator	
+0x2a8c2731	FilterData	
+0x2a8f214d	MinStockAmount	3
+0x2a8f2504	RivalsBase	
+0x2a8f5119	IsNew	0
+0x2a8f807c	SlotItemBtnData	
+0x2a90129a	IsNew	0
+0x2a93962f	IconStyle	
+0x2a94ad1e	IsInactive	0
+0x2a94d27f	WarningType	
+0x2a9578ed	ShipMarkerBase	
+0x2a95c50e	LighthouseMarkerBase	
+0x2a95cb92	OMGuestHouseData	
+0x2a95ceb0	IsNew	0
+0x2a961e96	BreakdownSortingData	
+0x2a964640	BaseData	
+0x2a97c301	ShipName	4
+0x2a97f96a	ProgressAmount	3
+0x2a9893d4	SettingDropdown	
+0x2a98db69	GlobalMajorIncidentData	
+0x2a99c8f9	IsVisible	0
+0x2a9abb55	ButtonText	4
+0x2a9bdb18	OffscreenRotation	3
+0x2a9bedc7	IsResetButtonVisible	0
+0x2a9cad7a	CompositionHeader	
+0x2a9da946	Headline	4
+0x2a9e8521	IsRepeatable	0
+0x2a9f1fee	ABtn	
+0x2aa05e60	Context	
+0x2aa07a6d	Context	
+0x2aa0b835	Cargo	
+0x2aa747b8	IsVisible	0
+0x2aa86f5a	DifficultyBar	
+0x2aa9a0b2	LeaveNotesScene	
+0x2aa9dc73	SubMenuBtnIsSelected	0
+0x2aaa401c	SceneAnimation	
+0x2aaa4f94	IsEnabled	0
+0x2aaad49d	MouseCursorVisible	0
+0x2aac11b2	GenericMarkerData	
+0x2aac9fd1	IsVisible	0
+0x2aacb32f	AngleSize	3
+0x2aad20eb	PasteSkinBtn	
+0x2aae08b7	SlotElementBase	
+0x2aae2e43	IsGood	0
+0x2ab245e2	EnterGUID	1
+0x2ab34156	InfoTip	
+0x2ab3f70c	SecondTitleCombobox	
+0x2ab441e7	CurrentProvince	
+0x2ab48b3a	NotesPopup	
+0x2ab4e61c	FactionInfo	
+0x2ab6a7d5	NegotiationEncounterParticipant	
+0x2ab90581	OMBluePrintData	
+0x2ab9fee7	SplendourRankArrayBase	
+0x2ababfe2	EventSelection	
+0x2abacf5e	IsVisible	0
+0x2abbbf27	Model3D	
+0x2abc0123	BtnCrossSave	
+0x2abc8117	BreakdownEntryArrayDataBase	
+0x2abced14	IsStart	0
+0x2abd2b86	MainTabs	
+0x2abe9d4c	ArrayStripesBase	
+0x2abeed4f	BtnData	
+0x2abf7717	NumOfSprites	1
+0x2ac0b94c	ShipModel	
+0x2ac17d4b	LeftPortraitVisible	0
+0x2ac1c4b1	ButtonArrayDataFirstSectionBase	
+0x2ac3a618	ShipRampProgress	3
+0x2ac55b81	ProgressValue	3
+0x2ac68d0e	CurrentProgress	3
+0x2ac804fb	AreaOffset	
+0x2ac90497	SessionTabsTutorialGuids	1
+0x2ac9ce1a	Alpha	3
+0x2ac9d167	PlayerPotraits	
+0x2aca0488	IsSelected	0
+0x2acb0ecf	MapData	
+0x2acb3e3f	ProvinceHeadline	
+0x2acb4c6a	NotificationTones	
+0x2acc2592	SliderData	
+0x2acc4532	RightTextStyle	
+0x2acce788	ConsumtionSortingData	
+0x2acd30ca	AvailableContractsBase	
+0x2acd6591	ProgressbarValue	3
+0x2ace5830	SlotContext	
+0x2acff519	WarningState	
+0x2ad001e8	IsHost	0
+0x2ad02f36	NavigationButtonsVisible	0
+0x2ad09b92	PopUpData	
+0x2ad196a3	IsActive	0
+0x2ad20ee7	DisableLeftBtn	0
+0x2ad3bb06	SceneAnimation	
+0x2ad4837e	Popop1	
+0x2ad549aa	DLCActivationPopup	
+0x2ad54cc7	IsDownloading	0
+0x2ad5beb5	CurrentTierProgressFame	1
+0x2ad67f29	GameSetupActionButton	
+0x2ad798a1	VisitorContentData	
+0x2ad7b71c	FocusedIndex	1
+0x2ad80ef2	WindDirection	3
+0x2adaddcb	TradeRouteType	
+0x2adb81f5	RouteGroupManagerData	
+0x2addbf7f	IsCreateRouteBtnVisible	0
+0x2ae6501b	Index	1
+0x2ae895f0	TimerData	
+0x2ae9355e	RefGUID	1
+0x2ae9878b	SavegameContext	
+0x2aeaf3a5	InfoTipData	
+0x2aeed1ff	GlobalPosition	
+0x2aefdbb1	IsVisible	0
+0x2af01d89	YAxisLineElementArrayBase	
+0x2af18f2d	Type	
+0x2af1a630	ID_1	0
+0x2af1d12f	ActNumber	
+0x2af20996	ProvinceIconBase	
+0x2af2a414	BuildModeInfo	
+0x2af341cd	IsHighlighted	0
+0x2af3616e	ArrayStarsBase	
+0x2af3fc86	PlayerColours	
+0x2af5bd05	ProgressData	
+0x2af67724	Indentation	0
+0x2af6f428	CategoryIndex	1
+0x2af845c7	GamescomPlaytimeData	
+0x2af8746e	BadgeText	4
+0x2afa8f7c	SceneData	
+0x2afba29b	SceneData	
+0x2afdd9bf	Infotip	1
+0x2afdfed2	ItemListBase	
+0x2afe2019	FeatureLoaderData	
+0x2afe7788	BtnDelete	
+0x2b0040a9	HasDominantPatron	0
+0x2b007ac7	BuySlotDataBase	
+0x2b00bed4	Data	
+0x2b02f305	IsLoading	0
+0x2b03b6ea	BtnBaseData	
+0x2b04544d	PodiumTabData	
+0x2b046f46	IsWarning	0
+0x2b055e23	TextLabelIsVisible	0
+0x2b05b45e	BarPercentageSelected	3
+0x2b07124a	IsLost	0
+0x2b0799ec	PlayerColor	
+0x2b0826d3	IsStopTimer	0
+0x2b08df74	Bridge	
+0x2b08fb06	SceneAnimation	
+0x2b09c6cb	EntriesBase	
+0x2b0b5b8f	HasCooldown	0
+0x2b0b8ee0	TLC	
+0x2b0d047a	SceneData	
+0x2b0d1938	HippodromeRacerState	
+0x2b0e8cc0	IsVisible	0
+0x2b10c121	AttributesButtonArrayDataBase	
+0x2b10feb9	IsVisible	0
+0x2b1288e0	FilterData	
+0x2b128bc3	IconsPanelFocusedIndex	1
+0x2b12faa7	ResearchSlotData	
+0x2b1392a9	IconsPanelIsExpanded	0
+0x2b13a85e	ProductivityProgress	3
+0x2b147b30	SecondaryIcon	4
+0x2b14e1c8	Button	
+0x2b14ed82	LoadGoods	
+0x2b156577	WarningData	
+0x2b16a784	IconText	
+0x2b172d2d	ActivateContextMenu	0
+0x2b195391	JumpToUnlock	
+0x2b1a30e7	IsVisible	0
+0x2b1acc1b	IsPlayer	0
+0x2b1cc9e4	Prestige_Amount	3
+0x2b1f6d98	IsProgressVisible	0
+0x2b1f910f	IsFocused	0
+0x2b1f9207	ZOrder	1
+0x2b20e9eb	IsCollectionComplete	0
+0x2b232b82	InfoTipData	
+0x2b2357a9	Headline	4
+0x2b23971e	SceneTransition	
+0x2b25335a	JumpToAvailable	0
+0x2b25c8bc	ProductionPageData	
+0x2b261a14	RightPortraitVisible	0
+0x2b28838b	CreateConfigStampBtnData	
+0x2b29045c	ArraySpecialistBuffBase	
+0x2b2b9b6c	Incident	
+0x2b2bebdb	ProvinceName	4
+0x2b2d7c29	GlobalData	
+0x2b2da4d3	AreSubtitlesVisible	0
+0x2b2dc018	IsVisible	0
+0x2b2e9426	InfoTipData	
+0x2b30eecd	SearchInput	
+0x2b31f5dd	HeaderText	4
+0x2b32e39f	InfocornerData	
+0x2b334d77	IsStartingProvince	0
+0x2b336087	ToggleCrossIsEnabled	0
+0x2b33ae51	RemainingPlacesBase	
+0x2b340360	TitleMenuBtnArrayBase	
+0x2b365c31	HasShipRamp	0
+0x2b37675e	SceneAnimation	
+0x2b37b66e	ConstructionMenuData	
+0x2b39db8e	QuestAssignee	1
+0x2b3b2771	CommandButtons	
+0x2b3c14d3	TextData	
+0x2b3c62e4	MoveDownBtnData	
+0x2b3d51d3	IsFullPotential	0
+0x2b3d7f10	SkipBtn	
+0x2b3dddc2	ShowChromaKey	0
+0x2b3e3f15	VariableGameSpeedData	
+0x2b3ec264	OMPublicService	
+0x2b3ee1b7	IsFocused	0
+0x2b3f65aa	ShowReloadText	0
+0x2b3fd86c	ConstructionProgressBase	
+0x2b404b8d	OMAqueductSceneData	
+0x2b40f2e2	AdvanceBtn	
+0x2b427e12	KnowledgeProgress_InfoTipGUID	1
+0x2b42a327	TabsData	
+0x2b432277	UpgradeBtnsData	
+0x2b43a964	EmperorActive	0
+0x2b43c11b	ArrayBulletPointBase	
+0x2b445bf1	NextTierFame	1
+0x2b4480ee	SecondaryButtonPrompt	
+0x2b473d07	Rotation	3
+0x2b47925e	SceneOverlayColor	
+0x2b484bdb	IsFocused	0
+0x2b485d28	AlphabeticSortingData	
+0x2b4943eb	TutorialData	
+0x2b4b11d1	ClaimSetRewardBtn	
+0x2b507293	TradeRouteGroupData	
+0x2b5208bb	IconTextData	
+0x2b55095f	IsMetaItem	0
+0x2b55d148	SceneTransition	
+0x2b56afd8	SceneData	
+0x2b5af9ad	DescriptionText	4
+0x2b5b1535	BtnCanalData	
+0x2b5c986b	SceneData	
+0x2b5cf14b	Color	
+0x2b5efb96	OMBaseData	
+0x2b5f41c5	AreaAlignment	
+0x2b5f8c75	ProgressValue	3
+0x2b60ad29	IsSelected	0
+0x2b60f180	IconStyle	
+0x2b611f38	Interaction	
+0x2b616835	EventRewardProgress	3
+0x2b62072e	IsEnabled	0
+0x2b622a3b	OnlinePlayerInfoBtnData	
+0x2b623847	ProductionSortingData	
+0x2b63872c	ShowAddditionalText	0
+0x2b63ef16	GoodsItemsDataBase	
+0x2b671570	EditPopup	
+0x2b6823e8	Popup1EmptyData	
+0x2b69d4d8	ZIndex	1
+0x2b6a9234	PromptID	
+0x2b6b3854	DisplayMode	
+0x2b6c7261	RouteSubMenuButtonDataBase	
+0x2b6eff7b	EventCompletion	
+0x2b6fc933	Right_StatusAttributesBase	
+0x2b707495	ItemButtonStates	
+0x2b71c5d5	GovernorIsTierTransition	0
+0x2b71c848	IsHoveredOrFocused	0
+0x2b735c3e	IsGlobal	0
+0x2b73c586	ArrayMPSlotsBase	
+0x2b746500	SlotStates	
+0x2b748005	IslandButtonsBase	
+0x2b753599	IsPriceVisible	0
+0x2b7574c2	EvacuationStates	
+0x2b78c52b	GovernanceData	
+0x2b79ca8d	StackAmount	1
+0x2b79fc7b	SelectedDeityInfotip	
+0x2b7a5dc9	Progress	3
+0x2b7ad28c	Province	4
+0x2b7b95b2	IsActive	0
+0x2b7bc3fa	InfoTip	
+0x2b7c7411	LoadGameBtn	
+0x2b7e6ecf	GenericMarkerData	
+0x2b80903d	ProgressbarBase	
+0x2b8094b0	IsGoodLocked	0
+0x2b8166fd	CheatSceneAlpha	3
+0x2b81c27b	KickBtn	
+0x2b8215ef	HasWarning	0
+0x2b831e72	ProvinceDescription	
+0x2b839dd4	SecondEffectIndex	1
+0x2b862cad	NotificationBase	
+0x2b87d414	ArrayLogosBase	
+0x2b87ec82	IsNew	0
+0x2b897ebf	TradeRouteType	
+0x2b8997b6	RomanizationDeco	
+0x2b8a5a94	Progress	3
+0x2b8b448e	SoundGUID	1
+0x2b8cbf80	IsRightSide	0
+0x2b8d0145	IsWidget	0
+0x2b8d219a	InfoTip	
+0x2b8d38e4	Position	3
+0x2b8de770	SceneAnimation	
+0x2b8e4cfb	TextIconArrayBase	
+0x2b8ecd9d	ComponentGUID	1
+0x2b91171f	HasTimer	0
+0x2b914366	HasWarning	0
+0x2b93f504	NotesNotificationFocusedIndex	1
+0x2b942bb3	IsFocused	0
+0x2b94b4c9	IsVisible	0
+0x2b959098	SizeOut	
+0x2b95fafd	PlayerInfoBtnData	
+0x2b962d6c	IsWarningVisible	0
+0x2b965c1a	ContextData	
+0x2b9699f6	SceneData	
+0x2b96abf3	IsHeaderSmaller	0
+0x2b98a4ee	Transition	
+0x2b99c9c3	NeedsUnlockNotificationCardBase	
+0x2b99f027	MoveOrderMode	0
+0x2b9aecd4	HeighestInfoTip	3
+0x2b9be60a	RefGUID	1
+0x2b9dd890	IsUbisoftConnect	0
+0x2b9e53ab	NotificationSize	
+0x2b9ea0ce	IsFavorite	0
+0x2b9f7b5d	SizeBase	
+0x2b9f8bb1	GenericMarkerData	
+0x2b9ff763	WaypointMarkerBase	
+0x2ba0ecc2	SelectedButtonIndex	1
+0x2ba1c85d	PurchasePriceSorting	
+0x2ba47e38	SceneData	
+0x2ba4891b	PresetsControlData	
+0x2ba5f02a	QuestType	
+0x2ba62a9a	LoadingRampsBase	
+0x2ba6d360	ShipOptionButtonData	
+0x2ba6f373	IsVisible	0
+0x2ba82e3e	SceneData	
+0x2baaf451	ID	1
+0x2bab70ad	Repair_Btn	
+0x2bad9162	OptionalGoodsArrayBase	
+0x2bad9f33	MinimapRadialWheel	
+0x2bae3133	WarningIsVisible	0
+0x2baf793f	IsWarning	0
+0x2bb20ed8	IsVisible	0
+0x2bb23dcb	CanBlockInfotip	0
+0x2bb42519	ResetSingleSettingData	
+0x2bb450a7	ControllerPreviewData	
+0x2bb52b8b	CursorPosition	
+0x2bb54b21	OMRecruitment	
+0x2bb5852d	PreTitleState	
+0x2bb653f4	CosmeticToolDataStates	
+0x2bb71f9c	IsDefeated	0
+0x2bb7c380	CreateStampBtnData	
+0x2bb99f0f	CosmeticLocation	
+0x2bba19be	MenuBtn	
+0x2bbd37f9	SceneAnimation	
+0x2bbd57f3	GraphElementArrayDataBase	
+0x2bbd8291	SingleThreat	0
+0x2bbf0626	OpenAdvancedButtonText	
+0x2bbf7202	InteractionData	
+0x2bc034a5	CosmeticToolAppearanceChoices	
+0x2bc0cf2c	Type	
+0x2bc0f500	NameInput	4
+0x2bc15538	InfoTipData	
+0x2bc2af75	LoadingState	
+0x2bc2c6dc	IsPauseRequested	0
+0x2bc3acf6	MaintenanceArrayBase	
+0x2bc4e2c2	CardButtonData	
+0x2bc63556	IsVisible	0
+0x2bc7d450	BuildingCostBase	
+0x2bc84277	EffectsBreakdownData	
+0x2bc8cdce	Portrait	4
+0x2bc9707b	OMTakeoverOverlayData	
+0x2bcb3d5d	Description	4
+0x2bcc77f6	Player	
+0x2bcca24e	OnScreenDataBase	
+0x2bccee5c	IsVisible	0
+0x2bce0f21	CustomCardBtnSound	1
+0x2bcf2000	TimerProgress	3
+0x2bcfbed9	RSHorizontal	
+0x2bd0787d	PlayerIconName	
+0x2bd0b10e	BtnHide	
+0x2bd0fbc8	IsEnabled	0
+0x2bd2e19b	ChapterTitle	
+0x2bd3e873	InfoTipGUID	1
+0x2bd53061	IsCurrentlyCrafted	0
+0x2bd71dad	HasRatRisk	0
+0x2bd7f98a	InfoTipData	
+0x2bd7fa27	SetTimeData	
+0x2bd904e1	IsSelected	0
+0x2bd91f75	Rider	
+0x2bd9da7c	GlobalMousePosition	
+0x2bda8a91	ArchiveFeatureBarData	
+0x2bdaac40	EventState	
+0x2bdabf8d	Transition	
+0x2bdb2cca	CargoData	
+0x2bdc0f66	DefaultRerollBtn	
+0x2bdea14e	SceneData	
+0x2bdfb650	EntityText	4
+0x2be09a95	SetRotation	3
+0x2be13120	Context	
+0x2be1c76b	Position	3
+0x2be25394	BreakdownTabsData	
+0x2be3674c	IsVisible	0
+0x2be43155	DiagonalConstructionToggle	
+0x2be4b139	SceneHeadline	
+0x2be64648	CategoryOverflow	3
+0x2be6ae7b	Description	4
+0x2be6f7e4	CompleteTradeBtnData	
+0x2be94f8e	LoadingDataBase	
+0x2be96ae4	IsShopButtonVisible	0
+0x2be9bedb	IsSaveButtonVisible	0
+0x2bea2325	Layout	
+0x2beaf9af	ErrorInfotip	
+0x2beb25c8	SelectedFilterText	
+0x2beb7295	FocusedIndex	1
+0x2bebbecd	LocalMousePosition	
+0x2bef38df	Rarity	
+0x2bf13748	IslandName	4
+0x2bf1dbf0	RequiredPrestigeBtnData	
+0x2bf3834f	UnloadGoods	
+0x2bf4c447	DefaultEntry	
+0x2bf5b77e	SubtitlesData	
+0x2bf69d9f	CivilianModulesBase	
+0x2bf6e886	States	
+0x2bf86db4	ShowBrowseButtons	0
+0x2bf935c0	ButtonBack	
+0x2bfaffbd	IsHOFReward	0
+0x2bfb3535	SetRewardsBase	
+0x2bfb81b7	Amount	4
+0x2bfb9408	IsSelectable	0
+0x2bfbfb02	Infotip	1
+0x2bfc28eb	TimerData	
+0x2bfd79ce	SceneData	
+0x2bfd7ef2	Sizing_Y	
+0x2bfeba68	NavigationTabs	
+0x2bff7f94	OpponentsBase	
+0x2c0328f4	StaticCursorIconPath	4
+0x2c04c4bd	RerollPanelData	
+0x2c05c3cd	WarStatus_InfotipGUID	1
+0x2c060077	ShipModules	
+0x2c0861ed	SuccessorGUID	1
+0x2c0d1f45	BattleData	
+0x2c10159b	Progress	3
+0x2c1112a6	TierListBase	
+0x2c112b44	DowngradeBtnData	
+0x2c135466	FooterBtnData	
+0x2c15289c	Construction	
+0x2c15670f	SubHeadline	4
+0x2c168291	PortraitGUID	1
+0x2c171da6	Infotip	1
+0x2c1affdf	IsInactive	0
+0x2c1d3e72	ArrayContentButtonsBase	
+0x2c1dc580	IsEmpty	0
+0x2c1ddbd0	IconText	
+0x2c1eafa5	CopySkinBtn	
+0x2c1eb75e	IsVisibile	0
+0x2c209c46	ItemInfo	
+0x2c225cbb	ProductionData	
+0x2c2315ff	Transition	
+0x2c2394ba	NotificationSoundGUID	1
+0x2c248581	NewsBoxesListBase	
+0x2c25c376	ArrayContextButtonsBase	
+0x2c2606ce	ID_2	0
+0x2c26a99b	ZoomData	
+0x2c276131	SetProgressValue	3
+0x2c2947ce	TotalValue	1
+0x2c29ae48	HealthValue	3
+0x2c29f818	LoadingRampsDataBase	
+0x2c2a07cd	AlarmedType	
+0x2c2bf79f	DPadLeft	
+0x2c2c4483	ID_4	0
+0x2c2dfb2e	GuidSecondary	1
+0x2c2f8f0c	BtnData	
+0x2c30d429	InfotipData	
+0x2c310502	CancelBtn	
+0x2c31dfc5	SceneData	
+0x2c327cd0	CargoInfo	
+0x2c32b9fd	IslandListData	
+0x2c32f1ef	HasRandomize	0
+0x2c347baf	IsBottom	0
+0x2c357bbc	IsCoopLeadReady	0
+0x2c35e92a	IsNew	0
+0x2c361d7b	FolderID	1
+0x2c364d9b	IsSkin	0
+0x2c36a09a	ParticipantGUID	1
+0x2c378f92	SetPatronButton	
+0x2c3883ae	ReinviteBtn	
+0x2c3b8652	Progress	3
+0x2c3c5689	IslandName	4
+0x2c3cb022	WindVisibility	0
+0x2c3ceec3	IsCurrentPlayerSlot	0
+0x2c3d62ec	SellSlotDataBase	
+0x2c3eaad3	RouteTargetToggleData	
+0x2c3eed93	IsSkinVisible	0
+0x2c435f78	Selected_IsEnabled	0
+0x2c45144b	IsVisible	0
+0x2c452128	GovernancePageData	
+0x2c458934	ShrinePermit	
+0x2c460e05	GovernorArrayBase	
+0x2c46c99e	WaterConsumption	
+0x2c472c9b	BtnData	
+0x2c477597	QuestStyle	
+0x2c479af0	HeaderRegion	
+0x2c47cbd3	IslandStorage	
+0x2c47d3bb	AutomateToggle	
+0x2c493348	ArraySettingsBase	
+0x2c4a0115	SelectedRewardFame	1
+0x2c4a73bf	ArrayFlyoutsBase	
+0x2c4cc2bc	NewsBoxFocusIndex	1
+0x2c4da91a	OffScreenBubbleData	
+0x2c4e06c4	BodyBase	
+0x2c4edd63	SceneData	
+0x2c4ff32b	Action	
+0x2c51d9d5	Region	
+0x2c52414a	Button	
+0x2c53292e	HippodromePracticeCompleted	
+0x2c537440	Text	4
+0x2c549ca0	Infocorner	
+0x2c54e35a	SliderRange	3
+0x2c56bc41	ButtonData	
+0x2c57ac6c	HealthIsVisible	0
+0x2c58746d	TotalSystemConsumption	1
+0x2c587da0	IconName	
+0x2c588a54	SkinChoicesArrayBase	
+0x2c5a4685	Infotip	1
+0x2c5b4288	TextBulletPoint	
+0x2c5b5137	BtnData	
+0x2c5bb24d	FocusPriority	1
+0x2c5c47e9	ArrayDataBase	
+0x2c5cf13f	NegotiatorParticipantData	
+0x2c5d2aa1	CurrencyReward	
+0x2c5d50f0	IsPositive	0
+0x2c5ead01	ButtonArrayDataBase	
+0x2c5eb1ce	IsKnowledgeVisible	0
+0x2c5ee504	QuestMarkerBase	
+0x2c60c1a5	GlobalPos	
+0x2c6118b7	FactionName	
+0x2c61fd19	FirstEffectValue	4
+0x2c6245a0	IsSelected	0
+0x2c62f7ab	NumOfVisibleItems	1
+0x2c630a34	DifficultyText	
+0x2c656615	IsSettingsFocused	0
+0x2c65797c	IconText	
+0x2c666860	GraphCheckboxData	
+0x2c68f3df	OpponentFocusedIndex	1
+0x2c69337f	BreakdownTabs	
+0x2c6b517a	InfoTip	
+0x2c6ed83d	Infotip	1
+0x2c6fcd6a	NewOMKontorWarehouse	
+0x2c701df5	SecondaryAction	
+0x2c7056d1	IsVisible	0
+0x2c726831	IsActive	0
+0x2c72cfd4	ScreenSpacePos	
+0x2c72e5ef	AssemblyDonation	
+0x2c733ed0	IconID	4
+0x2c73794c	ProfileData	
+0x2c740ea3	StartDegrees	3
+0x2c753bb7	Description	4
+0x2c76460c	SplitUpgradeLeft	
+0x2c77279a	WarningStateData	
+0x2c7754cf	PositionScreenSpace	
+0x2c7785ca	SceneAnimation	
+0x2c793d5f	RequirementsArrayBase	
+0x2c7b3468	LocalCursorPosition	
+0x2c7b8ed8	RequirementsDataBase	
+0x2c7b93f5	InfoCornerPopup	
+0x2c7d916d	ResourcesBase	
+0x2c7e06d1	IsSecondaryStyle	0
+0x2c7f85a6	QueueBase	
+0x2c7fa705	AdvancedRemappingBtnPrompt	
+0x2c7fc093	OnlinePlayerInfoBtnData	
+0x2c818fea	MapRotation	3
+0x2c82bc18	SceneData	
+0x2c85c54e	FocusPriority	1
+0x2c85e7d1	EmperorInfo	
+0x2c85f44c	GlobalEffectDescription	
+0x2c86a472	ChangeData	
+0x2c8740ba	ImpactIndex	1
+0x2c87ae08	CursorPoint	
+0x2c880073	CurrentPositionInformation	
+0x2c89e702	IsIconVisible	0
+0x2c8a3c93	Progress	3
+0x2c8a975f	WaitingForCoopSkip	0
+0x2c8ab88e	StaticHelp	
+0x2c8abf73	InfoPanelData	
+0x2c8b8089	InfoTipAlignment	
+0x2c8baef5	Infotip	1
+0x2c8e037a	IsVisible	0
+0x2c8e9acc	SceneAnimationObject	
+0x2c907d89	IsFocusable	0
+0x2c90c569	IsUnderAttack	0
+0x2c911f27	DLCDifficultyScene	
+0x2c94ffbc	ImportantWarningVisible	0
+0x2c9716ec	PreviewText	
+0x2c9a573d	IsPrestigiousVisitorsVisible	0
+0x2c9f8899	EmbeddedInfotip	
+0x2ca46cc1	UnlockPreconditionDataBase	
+0x2ca53474	IsInfoPanelVisible	0
+0x2ca57fdc	ExchangeData	
+0x2ca75aee	ConnectionIsVisible	0
+0x2ca989e9	ResetButtonData	
+0x2ca9fde8	ConstructionData	
+0x2cad1efd	InfoCardBase	
+0x2cb2c20d	VariableGameSpeedData	
+0x2cb48bdc	BenchmarkBtnData	
+0x2cb4d1ab	TextDisableReason	
+0x2cb4fce7	CharacterSummary	
+0x2cb67de0	DefaultSliderValue	3
+0x2cb6a2f6	ProductivitySortingData	
+0x2cb6a723	IsMilitaryShip	0
+0x2cb71362	UnitStatsBarBase	
+0x2cb89791	HealthData	
+0x2cb92666	BarterShipInventoryAddition	
+0x2cb9bba7	InfoCornerEntryPoint	
+0x2cbca0a9	SceneAnimation	
+0x2cbebdcf	StationListPosition	
+0x2cbef3b3	IsNew	0
+0x2cc17edd	ItemSockets	
+0x2cc194fd	IsTeamlead	0
+0x2cc207d8	Position	3
+0x2cc3495e	SceneAnimation	
+0x2cc49c70	InfoTip	
+0x2cc5b3c0	OffsetY	3
+0x2cc5cbc2	ChoiceButton	
+0x2cc77640	Context	
+0x2cc7a818	IsVisible	0
+0x2cc7de78	FirstVisibleIndex	1
+0x2cc9671c	DataTypeBase	
+0x2cc9af6f	SceneAnimationObject	
+0x2cc9b241	ButtonData	
+0x2ccb0f82	EventHeadline	
+0x2ccd7d3a	MinSliderValue	3
+0x2cce5101	Position	3
+0x2cce7cf4	RomanizationType	
+0x2ccf76f1	RegionalUpgradeBtnData	
+0x2ccf7949	BaseData	
+0x2cd02a08	StatsBase	
+0x2cd1cbad	StoragePage	
+0x2cd1faf2	Interaction	
+0x2cd2f5ff	SecondaryActionButton	
+0x2cd3129e	Infotip	1
+0x2cd3ab21	CosmeticContentOrigin	
+0x2cd98bf6	RiverCurrentRotation	3
+0x2cd9ff50	Infotip	1
+0x2cda9a84	VariableGameSpeed	
+0x2cdbb1a1	IsDateVisible	0
+0x2cdc04c2	OutputHeight	3
+0x2cdc4451	ResetSingleSettingData	
+0x2cdd5edd	BenchmarkContentBase	
+0x2cde602f	SceneData	
+0x2ce1b216	InvitationCheckbox	
+0x2ce1b3bb	ProductivitySpeed	
+0x2ce2527f	Profile	
+0x2ce73df8	StationID	1
+0x2ce7d0ad	StatisticsBtnData	
+0x2cec4317	DonateBtn	
+0x2cec6cb7	Popup2ProductionChainDataBase	
+0x2cec9fa2	AdditionalEffectIconText	
+0x2ced161c	CosmeticDescription	
+0x2cedc162	CurrentValue	1
+0x2cedcb78	ContractTimeVisible	0
+0x2cef1e23	BuildingGuid	1
+0x2cef82ec	BtnJumpToIsVisible	0
+0x2cf38fa8	CommandButtons	
+0x2cf431e5	Position	3
+0x2cf5ad54	SceneAnimation	
+0x2cf66d9b	Headline	4
+0x2cf780d4	OpenActionButton	
+0x2cf9ad6f	RequestFocus	
+0x2cfa1597	Infotip	1
+0x2cfb6207	SceneAnimation	
+0x2cfb7eeb	ProfileData	
+0x2cfde854	Index	1
+0x2cfe93f5	LastElement	0
+0x2cfea967	FlyoutArrayBase	
+0x2cff2038	BarterGoodAmount	
+0x2d0275e2	Position	3
+0x2d02be4a	WaitForGoodsButtonData	
+0x2d02f669	ForeignLabelData	
+0x2d09cc1f	ProgressValue	3
+0x2d0a2243	IsNextVisible	0
+0x2d0a7584	ArrayIslandsBase	
+0x2d0a8037	Progress1	3
+0x2d0c8e07	ArrayParticipantsBase	
+0x2d0eaec2	IsVisble	0
+0x2d0f0171	ConstructionHeadline	
+0x2d0ff79d	IsGovernorsDomainExpanded	0
+0x2d124093	StorylineID	1
+0x2d13144c	CurrentSettings	
+0x2d13379e	BuildModulesSelectionBtn	
+0x2d146e70	IslandName	4
+0x2d14eceb	BtnPreviewData	
+0x2d151a99	HasPathConnection	0
+0x2d160f79	Progress2	3
+0x2d178e89	IsHoveredOrFocused	0
+0x2d1a90d5	ProfileCustomizationScene	
+0x2d1b4de0	BuildingsButton	
+0x2d1d4fdb	IsVisible	0
+0x2d1da47e	NumOfAssignedShips	1
+0x2d1e98f0	ContentBtnDataBase	
+0x2d1f1da4	RarityCategoryArrayDataBase	
+0x2d1f27d6	ArrayDifficultySettingsBase	
+0x2d1f8046	IsVisible	0
+0x2d201554	ElementFlipped	0
+0x2d20a536	Profile	
+0x2d240b60	Selected_CustomGUID	1
+0x2d2478c5	EquippedDeity_Icon	4
+0x2d25a460	IsDifficultyVisible	0
+0x2d25c482	WrongIslandType	0
+0x2d267191	IsEnter_ShowFlyout	0
+0x2d29fa50	InfotipData	
+0x2d2a200d	RemainingPlaytime	4
+0x2d2b76f0	SceneData	
+0x2d2b9ece	InteractionData	
+0x2d2d8073	AnimationTime	3
+0x2d2dd620	CargoContentBase	
+0x2d2e7272	Letter_spacing	3
+0x2d2ed1f0	ShipPreview	
+0x2d2fe156	WarningIsVisible	0
+0x2d3003c6	SlotState	
+0x2d314697	Index	1
+0x2d317128	InfotipData	
+0x2d31acaa	IsCampaginOrChallenge	0
+0x2d32615a	GlobalMajorNotificationPopupData	
+0x2d326b39	SceneAnimationObject	
+0x2d333739	InfoTipData	
+0x2d336cf4	Value	4
+0x2d33d912	BtnRightIsActive	0
+0x2d33db14	Text	4
+0x2d34a84e	SetProgressState	
+0x2d353103	BackgroundPreloadingComplete	0
+0x2d354185	IsAccordionButton	0
+0x2d360f5f	Alpha	3
+0x2d360f6a	SelectedIconTextArrayDataBase	
+0x2d362d73	IsCurrentProvince	0
+0x2d36fb3b	Hulltype	
+0x2d37bce3	Pivot	
+0x2d3be37d	NavalUnitsData	
+0x2d3bfddb	StorylineID	1
+0x2d3c1a4e	OutdatedWarningBase	
+0x2d3c3cb6	IsVisible	0
+0x2d3cf4b6	InfoTipData	
+0x2d3f4b85	EntryPointData	
+0x2d3f778c	Button	
+0x2d411fd8	Description	4
+0x2d419b9c	RequirementsBase	
+0x2d41d9c0	CostsBase	
+0x2d422c6e	IsGroupBtn	0
+0x2d42dc5b	IsEmptyMessage	0
+0x2d44259d	DovecotData	
+0x2d443c7e	IsLoadingFinished	0
+0x2d452d1b	SelectedData	
+0x2d454ecb	State	4
+0x2d470742	AdvanceTimeChecked	0
+0x2d471652	ConflictingActionNotOverwritable	0
+0x2d473c1a	HeaderIconText	
+0x2d48fcc6	IsMissingFertility	0
+0x2d49494f	PlayButton	
+0x2d496996	TechCategoryType	
+0x2d4a2e8c	TEST_StampsSwitchVersions	
+0x2d4aa4b4	HasWarning	0
+0x2d4ba8da	TradeRoutes	
+0x2d4bdb42	TertiaryPromptLabel	
+0x2d4c0859	DPadHorizontal	
+0x2d4c2c35	IsFocused	0
+0x2d4c39a6	Infotip	1
+0x2d4ce842	IsWarningVisible	0
+0x2d4d0f99	ConstructionData	
+0x2d527758	Infotip	1
+0x2d52cdcd	Header	4
+0x2d533ffa	Rotation	3
+0x2d5478a9	IsFocused	0
+0x2d547b86	IsVisible	0
+0x2d5509b8	ID	1
+0x2d55e899	IsSecondUpgrade	0
+0x2d563f9c	BannerColor	
+0x2d56b2b8	VariableGameSpeed	
+0x2d56f071	StorageSorting	
+0x2d57a5ba	CrossSave	
+0x2d587956	CategoryValue	1
+0x2d59a352	Length	3
+0x2d59f746	Resources	
+0x2d5a3bcb	LightSetupGUID	1
+0x2d5b06bd	GameStatisticsBase	
+0x2d5bc8c0	VillaProgressInfotipGUID	1
+0x2d5be16e	HasMultipleAreas	0
+0x2d5c1b65	DeleteIsEnabled	0
+0x2d5ca556	TabsData	
+0x2d5e436c	IsUnlocked	0
+0x2d5e6895	ResourceName	4
+0x2d5ec5b9	BGData	
+0x2d5eccc7	IsFocusable	0
+0x2d60bdf7	State	4
+0x2d616edc	ReputationValue	1
+0x2d61ca2c	XPos	3
+0x2d61d51d	Title	4
+0x2d61faff	ContractFocusedIndex	1
+0x2d6210c8	UpgradeRefGUID	1
+0x2d63010c	SceneData	
+0x2d651768	OMRecruitmentScene	
+0x2d65af8b	ImageSize	
+0x2d65d0d7	RewardType	
+0x2d67d493	OMReligion	
+0x2d6ab569	ItemsSelectionPopupData	
+0x2d6e4399	InfoTipData	
+0x2d6e9a1a	IsBridgeVisible	0
+0x2d6f5f42	RestoreProgress	3
+0x2d6fba4a	GeneralNotificationFocusedIndex	1
+0x2d700b8e	Bottom	
+0x2d704082	IsInstalled	0
+0x2d707ec8	CameraPosition	
+0x2d71033e	Description	4
+0x2d716744	SceneData	
+0x2d718830	GlobalEffectValue	4
+0x2d739970	MonumentLevelBase	
+0x2d741e27	State	4
+0x2d77bc74	States	
+0x2d77c2c0	Layout	
+0x2d77d4f8	DominantPatronPortrait	4
+0x2d77f0e0	BtnData	
+0x2d79ab3d	GameSetupActionButton	
+0x2d7b277a	SubHeader	
+0x2d7cb32f	RequiredPrestigeIsWarningVisible	0
+0x2d7d5204	InfoTip	
+0x2d7e16d9	WarProgressBarDataBase	
+0x2d7f7573	Headline	4
+0x2d7fe937	AttackerColor	
+0x2d806465	EventStates	
+0x2d80a76e	Brightness	3
+0x2d846fe1	Infotip	1
+0x2d84d78d	MPSlotPlayersDataBase	
+0x2d84ddd1	Context	
+0x2d85bd3a	Timer	4
+0x2d85f17e	IsLocked	0
+0x2d88df34	Index	1
+0x2d8a81a3	QueuePosition	1
+0x2d8c39d9	IsEmptySlot	0
+0x2d8db411	InfoTipData	
+0x2d8edfff	BackgroundType	
+0x2d8f0634	OMBaseData	
+0x2d8fd1de	IsWarningVisible	0
+0x2d903a25	ShopCardBtn	
+0x2d903b12	CostsBase	
+0x2d920ff0	InfoTip	
+0x2d924036	SessionScope	1
+0x2d92eb34	ItemsFilter02	
+0x2d941cb0	ActionsListData	
+0x2d95c585	RewardSelectedIndex	1
+0x2d97c851	OutputBase	
+0x2d99a6a4	TextLabelID	
+0x2d9a5e7a	RampsInfotip	
+0x2d9aad80	Color	
+0x2d9c5a10	PreparationBtn	
+0x2d9c9f66	Button	
+0x2d9d633c	InfoFocused	0
+0x2d9e00ad	Second_Third_InfotipGUID	1
+0x2d9f2a52	ButtonData	
+0x2d9fd30f	Cooldown	3
+0x2da05a1d	Button	
+0x2da06d92	OMBaseData	
+0x2da07eb0	BtnData	
+0x2da208b0	IsNew	0
+0x2da225d8	NotificationSoundGUID	1
+0x2da3057f	StorageTendency	
+0x2da37d70	IsVisible	0
+0x2da499d7	SceneData	
+0x2da5346d	IsWrongRegion	0
+0x2da5e622	ContextData	
+0x2da5f332	IsContextFocusable	0
+0x2da62db1	IsSecondUpgrade	0
+0x2da87cb9	IsMandatory	0
+0x2da8b55a	SelectionSound	1
+0x2da98eda	ContractObjectivesBase	
+0x2dabf4b1	AppearDisabled	0
+0x2db0fbcb	OnlinePlayer	
+0x2db10143	ResourceArrayBase	
+0x2db1d32b	AdditionalText	
+0x2db59325	GovernorRequestTotal	1
+0x2db6cf34	IsVisible	0
+0x2db71dee	SceneAnimation	
+0x2db75427	FilterCheckBoxBase	
+0x2db75da2	SpecialistIsMissing	0
+0x2db9bf12	OMBase	
+0x2db9ce3b	IsPanelOpen	0
+0x2db9daae	ResourcesBase	
+0x2dba3981	BuildingsPopupData	
+0x2dbaa208	SubtitlesSize	
+0x2dbac1e3	IsSection	0
+0x2dbba719	ButtonActionID	
+0x2dbc3094	CurrentShipData	
+0x2dbca02c	TotalSteps	1
+0x2dbca1a0	NotesNotificationArchiveBase	
+0x2dbd4912	Sizing_X	
+0x2dbde20b	WarningVisible	0
+0x2dbe3e5b	IslandOwner	0
+0x2dbe67c3	RequestFocus	
+0x2dc033a0	VisualHierarchy	
+0x2dc0697b	CrossSaveVisible	0
+0x2dc0d9c8	IsConsumptionType	0
+0x2dc1f8e8	BtnsListBase	
+0x2dc2aab8	IsVisible	0
+0x2dc38f85	ID	1
+0x2dc47396	IsAchieved	0
+0x2dc4e95b	RefGUID	1
+0x2dc746b2	TopAchievementIndex	1
+0x2dcb02a6	ProgressIsVisible	0
+0x2dcb5cb6	Type	
+0x2dcbc41f	SavegameIndex	1
+0x2dccaadc	ZIndex	1
+0x2dcd53b7	IsMirror	0
+0x2dcd60ab	IsWarningVisible	0
+0x2dce2b6c	InfoTip	
+0x2dcefcec	IsPopupVisible	0
+0x2dcf7faf	TextStyle	
+0x2dd0e5b0	GroupBuildingsData	
+0x2dd12480	SceneAnimation	
+0x2dd1557a	CosmeticToolRotationData	
+0x2dd1cedf	GenericMarkerData	
+0x2dd452ae	IsVisible	0
+0x2dd8041b	IsVisible	0
+0x2dd9511e	GroupArrayDataBase	
+0x2dd9806f	CreateRouteBtnInfoTipData	
+0x2dda1d6d	StorageDataBase	
+0x2dda3bad	Slot	
+0x2ddb9f31	StorageData	
+0x2ddc5e91	ResetSingleSettingData	
+0x2ddcd81e	Scale	3
+0x2ddedb7f	Description	4
+0x2ddf4357	isEmpty	0
+0x2ddf9f94	GraphColor	
+0x2de0f232	InfotipData	
+0x2de19ae7	IsEnabled	0
+0x2de4cf86	WatningInfoTIp	
+0x2de5ba5f	IsTimerVisible	0
+0x2de5e235	SourceSorting	
+0x2de63dc4	SubStateListDataBase	
+0x2de75cde	IsTradeDisabled	0
+0x2de7f681	XAxisLabel	
+0x2de87f83	StartBtn	
+0x2de95315	TLCWrapper	
+0x2de9739c	Headline	4
+0x2dea18cb	IsVisible	0
+0x2dec353f	ParticipantListBase	
+0x2dec5ea1	Infotip	1
+0x2ded5157	Progress	3
+0x2ded5f5b	SubHeadline	4
+0x2dee2058	PresetsModifyPopupData	
+0x2dee6dae	CharacterDescription	
+0x2defcefb	ExplainerPopupContentBase	
+0x2df04674	InterpretResultAsBoolean	0
+0x2df15e0b	EffectsData	
+0x2df2eb81	RGB1	
+0x2df6bcbb	IsHost	0
+0x2df6e9b5	SplendorDescriptionData	
+0x2df70c1a	NewsButton	
+0x2dfa172a	Position	3
+0x2dfa8a96	Position	3
+0x2dfb3bf8	GoodsData	
+0x2dfc0122	Downgrade	
+0x2dfc3c33	PhaseLabel	
+0x2dfdedba	ScrollPosition	1
+0x2dffbccd	GlobalEffectTitle	
+0x2dffc7ff	GameSetupActionButton	
+0x2e00e148	ParticipantInfoTip	
+0x2e0130da	SceneAnimation	
+0x2e027f18	GameMode	
+0x2e02b61a	RacerTrainingNoEXP	0
+0x2e0388df	Description	4
+0x2e04b92d	CompositionUnitArrayBase	
+0x2e065e72	SublineTextStyle	
+0x2e0739ec	Infotip	1
+0x2e0856f9	IsWarningVisible	0
+0x2e08775d	ModelListBase	
+0x2e08c20b	TutorialGuid	1
+0x2e0942c0	UpgradeType	
+0x2e0a6876	TradeOverview	
+0x2e0afde0	SceneAnimation	
+0x2e0bbbda	ArrayGridContentBase	
+0x2e0bcd47	Breakdown	
+0x2e0c2409	Image	4
+0x2e10a591	InfoCornerEntryPoint	
+0x2e119466	Position	3
+0x2e128b59	RefGuid	1
+0x2e1556cc	Difficulty	1
+0x2e155ff6	TotalFame	1
+0x2e167975	SectorProjectPhaseState	
+0x2e16e8a0	IsComplete	0
+0x2e16f95c	FirstColumnSortingButtonData	
+0x2e174346	ObjectiveText	
+0x2e17618c	Index	1
+0x2e17a26e	NumOfVisibleItems	1
+0x2e1985df	IsProdChain	0
+0x2e1a00c7	PinSlots_RightBase	
+0x2e1ae1e0	Context	
+0x2e1b5875	IsCreated	0
+0x2e1bf826	TutorialGuid	1
+0x2e1c2d2b	Progress	3
+0x2e1dfe8f	RequestFocus	
+0x2e1eb4ef	MultiplayerInformationData	
+0x2e205ce3	SceneAnimation	
+0x2e209582	IsPopupVisible	0
+0x2e20a2f4	Military_FocusedIndex	1
+0x2e21070d	ShipModel	
+0x2e21a97a	InfotipData	
+0x2e2313a8	RadialProgressLeft	3
+0x2e238271	AreaSize	
+0x2e242bc1	IsSiloAddOnVisible	0
+0x2e250727	InfotipGUID	1
+0x2e253f5d	IconText	
+0x2e2546b2	CommandStatus	
+0x2e2686da	TransitionObject	
+0x2e26a1b7	InfoTip	
+0x2e27156a	IsCollectionComplete	0
+0x2e278141	IsSelected	0
+0x2e28808b	Inhabitant_Infotip	
+0x2e2ab61b	IsDominantPatron	0
+0x2e2bdd10	Amount	4
+0x2e2d03fb	PassiveTrade	
+0x2e2d28ee	TransferAmountData	
+0x2e2d66a3	IsTimerVisible	0
+0x2e2d7122	EntityIcon	4
+0x2e2d817f	ArrayShapesBase	
+0x2e2f9b29	SubHeaderData	
+0x2e318159	InternetConnection	
+0x2e324dfc	SceneAnimation	
+0x2e32961e	ChoiceButton	
+0x2e33359b	SceneData	
+0x2e346874	RacerIsMissing	0
+0x2e358a4c	RequiredPrestigeBtnData	
+0x2e35aff9	Item	
+0x2e36d93b	OMBaseData	
+0x2e3886fb	GlobalPos	
+0x2e391798	TradeRouteNameTextInputData	
+0x2e397001	SkinDescription	
+0x2e3c20a9	SceneUnlockBannerData	
+0x2e3cd2b5	SceneAnimationData	
+0x2e3d9016	InfotipData	
+0x2e3f70b5	LoadingTipsText	
+0x2e3fdf62	NavalUnitsData	
+0x2e3ff075	UnitsEntryBtnsBase	
+0x2e401233	Infotip	1
+0x2e403ea2	Data	
+0x2e413cb7	MaxDifficulty	1
+0x2e423a44	NotificationArchiveTabs	
+0x2e42692f	Description	4
+0x2e43fb31	DeleteBtnData	
+0x2e44f92d	Headline	4
+0x2e484a5f	BtnChangeIcon	
+0x2e485d34	IsBuildMode	0
+0x2e494ceb	CameraPosition	
+0x2e4e44b8	HasWarning	0
+0x2e4e5d6f	AdditionalDataBase	
+0x2e4edb07	CurrentWarningBase	
+0x2e4f6e55	FeedbackActive	0
+0x2e4fbee8	RadialsDataBase	
+0x2e546461	IsReputationActive	0
+0x2e54ab8a	ButtonData	
+0x2e5578a9	MultiInfoSection	
+0x2e588bab	ResourcesDataBase	
+0x2e5a2f45	NotificationSoundGUID	1
+0x2e5d4e9b	Index	1
+0x2e5d82de	AssemblyTakeoverChartDataBase	
+0x2e5f58d3	Profile	
+0x2e60c8cd	BtnStyle	
+0x2e619d8c	SceneAnimation	
+0x2e620c01	PhotoModeScene	
+0x2e63bbaa	HealthData	
+0x2e63eac0	Context	
+0x2e65098c	PositionY	3
+0x2e659b26	Storage	
+0x2e66a5de	VariationPagination	
+0x2e6718a1	LineType	
+0x2e673d33	DataBase	
+0x2e684a38	GroupBtnInteractionData	
+0x2e68deed	PaymentButton	
+0x2e68f949	DLCIcon	4
+0x2e691905	ContextualBtn	
+0x2e6de075	MaxHeight_Content	3
+0x2e6e4781	Headline	4
+0x2e6e78b9	QuestChoiceData	
+0x2e6f5781	Platform	
+0x2e724f39	IsIconVisible	0
+0x2e744d13	AutoSaveGamesBase	
+0x2e751c5e	Description	4
+0x2e755286	IsConnectReward	0
+0x2e7734ed	IsInactive	0
+0x2e780aba	CardBtn	
+0x2e78954e	AutoracingIsEnabled	0
+0x2e790647	DiplomacyState	
+0x2e7d0894	SelectedGovernorPreview	
+0x2e7e3ffa	NotificationPopupData	
+0x2e7ed186	IsTimerPaused	0
+0x2e800238	Infotip	1
+0x2e8219c8	HasNewUnlocks	0
+0x2e823256	BuySellAmountBtnDataBase	
+0x2e85716e	ResourceData	
+0x2e878556	PlayerBtnData	
+0x2e8796bb	ProgressValue	3
+0x2e88664a	CharacterNotificationData	
+0x2e88bed3	GovernorsArrayBase	
+0x2e8a0c71	GERBtnIsSelected	0
+0x2e8a8d75	TimerInput	
+0x2e8ad2ee	NumActiveParticipants	1
+0x2e8cde5a	RewardsSection	
+0x2e8eb08f	SceneAnimation	
+0x2e928cf1	Phase	4
+0x2e928d29	OMBase	
+0x2e941f6f	ArrayPattern1Base	
+0x2e949dc7	Tabs	
+0x2e94fd99	IsInProgress	0
+0x2e97b6a8	NeedBarState	
+0x2e9995b3	ID	1
+0x2e99f3f6	HasWarning	0
+0x2e9af6b6	ContentVersion	
+0x2e9b1a28	Infotip	1
+0x2e9c7391	RerollType	
+0x2e9cae56	BannerOpacity	3
+0x2e9cc1f0	IconColor	
+0x2e9cccf5	EmbeddedInfotipContext	
+0x2ea01819	EquippedSpecialistInfotip	
+0x2ea0a51d	IsGroupBtn	0
+0x2ea1aba6	TreatyStatusInfoTip	1
+0x2ea229a7	SceneTransition	
+0x2ea2b3fa	CategoryPosition	
+0x2ea31e1b	Description	4
+0x2ea4370b	LiveSavesBase	
+0x2ea459c1	SceneData	
+0x2ea58aa2	Infotip	1
+0x2ea65e7c	AlarmedType	
+0x2ea6bfb1	ZOrder	1
+0x2ea921e8	FirstValueIsNegative	0
+0x2ea9915e	IsMouseOverBanner	0
+0x2eaa4dbc	ZOrder	1
+0x2eab0524	Profile	
+0x2ead4bbe	ButtonPromptArrayBase	
+0x2eae0546	Preview	0
+0x2eae3291	ScreenAreaArrayBase	
+0x2eae6659	RenderID	1
+0x2eb22fd0	IsVisible	0
+0x2eb24e3d	Guid	1
+0x2eb2a16f	IsEnabled	0
+0x2eb47860	DPadDown	
+0x2eb5bd77	UnitFocusIndex	1
+0x2eb668d4	OnTransit	0
+0x2eb6be8a	IsEnter	0
+0x2eb6e716	InfoTip	
+0x2eb70969	IconStyle	
+0x2eb73ee1	Title	4
+0x2eb81db8	ActivePanel	
+0x2eb8b8c9	IsHostSlot	0
+0x2eb902f6	Label	4
+0x2eb94eb1	IsMultiplayer	0
+0x2eb9be6c	ButtonArrayDataSecondSectionBase	
+0x2eb9fca4	LB	
+0x2ebab4f4	IsVisible	0
+0x2ebae6b1	VerticalSpacer	0
+0x2ebbed6c	SlotState	
+0x2ebd0962	ViewDetailsHintText	
+0x2ebdc020	IntermediateUnlocksData	
+0x2ebe2e62	SceneData	
+0x2ec22542	GroupArrayDataBase	
+0x2ec23f9a	ProfileData	
+0x2ec28c8b	RewardSelected	0
+0x2ec2f697	WarningStates	
+0x2ec4da79	IsVisible	0
+0x2ec501f8	IsSectionHairline	0
+0x2ec555b2	HasNewTier	0
+0x2ec5b6f5	UnitsPreviewData	
+0x2ec60f8d	AutoracingIsEnabled	0
+0x2ec651b8	IsDisabled	0
+0x2ecb7dc6	SceneData	
+0x2ecbf05b	FocusedIndex	1
+0x2ecc2df9	IsTracked	0
+0x2ecc3c21	Description	4
+0x2ed18431	MapScale	3
+0x2ed2286c	InfoTipID	
+0x2ed3abd6	FocusedIndex	1
+0x2ed5265a	ToBeDeleted_TotalEvent_Timer	
+0x2ed53815	Data	
+0x2ed62fda	OffscreenBubblesBase	
+0x2ed87a33	SelectedMenu	
+0x2edaebf3	RarityCategory	
+0x2edb04d7	Size	
+0x2edbb6fc	SceneAnimation	
+0x2edbca32	RS	
+0x2edbdd55	ChoiceButtonEntryDataBase	
+0x2eddfd39	StarArrayBase	
+0x2eded0f0	TendencyEnumData	
+0x2edf3c52	Color	
+0x2edf9f47	Description	4
+0x2ee012ad	SceneAnimation	
+0x2ee0cbbf	YPosition	3
+0x2ee1069d	FirstEffectDescription	
+0x2ee11e1f	QueueIndex	1
+0x2ee12181	BannerGUID	1
+0x2ee14d34	LayoutInfo	
+0x2ee1dd98	IsMultiplayer	0
+0x2ee1de99	Phase	4
+0x2ee3b9df	GlobalIncidenceType	
+0x2ee3f1d1	IsRandomizeNameEnabled	0
+0x2ee45d33	ArrayProvincesBase	
+0x2ee502a3	FocusedIndex	1
+0x2ee634d1	Ramps	
+0x2ee64de1	SublineTextStyle	
+0x2ee65cef	Party_Color	
+0x2ee66011	FocusedIndex	1
+0x2ee6cef9	WarStatesDataBase	
+0x2ee6f8e2	NameData	
+0x2ee74c6b	PopupData	
+0x2ee7562b	InvitationStatus	
+0x2ee8be8f	ActionReasonTotal	
+0x2eea071d	NotificationPopUp	
+0x2eebcbb7	InfotipAlignment	
+0x2eecebac	ChoiceButtonEntryDataBase	
+0x2eefcfd1	DPad	
+0x2ef0ad26	VisibleSizeY	3
+0x2ef0f33a	Headline	4
+0x2ef1dfb3	Governor	
+0x2ef407a5	Size	
+0x2ef44a41	ContentData	
+0x2ef4f8db	Colour_SecondCharacter	
+0x2ef60fef	IsVisible	0
+0x2ef62f3b	Position	3
+0x2ef6a8af	InfoTip	
+0x2ef7416c	SceneAnimation	
+0x2ef7e4c3	SelectedGovernorDescription	
+0x2ef90b33	IsNextVisible	0
+0x2ef929f7	VisibleCardCount	1
+0x2ef9d764	NeedGuid	1
+0x2efa3f49	CancelBtnIsVisible	0
+0x2efad85b	SceneAnimation	
+0x2efafadf	Button	
+0x2efbc147	Headline	4
+0x2efcf258	SceneData	
+0x2efdd40a	ShipInventoryData	
+0x2efdeddb	DifficultyDisplay	
+0x2f012542	FTUXSceneData	
+0x2f03dd96	IsInEditMode	0
+0x2f0472be	IsReadOnly	0
+0x2f04b63a	BtnData	
+0x2f075dc7	Position	3
+0x2f07b367	BgOpacity	3
+0x2f087866	Data	
+0x2f0988af	ManualSaveGamesBase	
+0x2f09f7b2	StanceBtn	
+0x2f0b0361	PortraitData	
+0x2f0b9f2d	InfoCornerEntryPoint	
+0x2f0caf3d	ID	1
+0x2f0dc4f6	TradeSlider	
+0x2f131d12	CharacterNotificationRewardsBase	
+0x2f1323e0	TargetTech	1
+0x2f1331ba	IsConstructionBarExpanded	0
+0x2f13837b	PanelButtonData	
+0x2f145f10	ShowEditIcons	0
+0x2f146300	IsCurrentlyDragged	0
+0x2f157cb2	IsFocused	0
+0x2f15b683	RadialButtonsBase	
+0x2f16198c	PortraitData	
+0x2f1847fd	PreviewType	
+0x2f1b069c	ButtonData	
+0x2f1b3152	IsSecondaryButton	0
+0x2f1c3337	TextID	
+0x2f1d28f1	InfoText	4
+0x2f21891b	QuestUnreadType	
+0x2f21dda1	SceneAnimation	
+0x2f220919	MPRivalProvinceInfoArrayBase	
+0x2f2478fd	HasModules	0
+0x2f26280d	SceneAnimation	
+0x2f276722	IsPositive	0
+0x2f282639	IsSecondUpgradeConfirmButton	
+0x2f2c6405	Headline	4
+0x2f2e350d	Image	4
+0x2f2f1254	RadialIndex	1
+0x2f30aece	NotificationArchiveTabsButton	
+0x2f30b550	ScrollPosition	1
+0x2f30ec6d	CoolDownTimer	4
+0x2f310907	PhaseHintListBase	
+0x2f328079	IsVisible	0
+0x2f3354ae	QueueItemArrayDataBase	
+0x2f34a562	Header	4
+0x2f36aef4	Context	
+0x2f36bafc	Infotip	1
+0x2f38a13f	IsPrestigeContentVisible	0
+0x2f3a2af8	InfoTipData	
+0x2f3abef3	CustomPresetsDataBase	
+0x2f3af488	CityStatusNotificationData	
+0x2f3bb3bd	EffectInfotip	
+0x2f3c4540	ContinueBtnDetails	
+0x2f3d1e47	SecondEffectValue	4
+0x2f3e310d	PhaseData	
+0x2f3e46f1	ResetTrade	
+0x2f403fe8	FirstTimeExplainer	
+0x2f42fc67	Settings	
+0x2f44cea4	InteractionData	
+0x2f46fbdd	Context	
+0x2f47cc16	IsWaitingForHost	0
+0x2f4be979	IsVisible	0
+0x2f4bef1c	IsExpanded	0
+0x2f4e47b1	GridFocusedIndex	1
+0x2f4f63b2	TechItemType	
+0x2f51207f	IsCurrentAvailable	0
+0x2f514dba	SettlementButton	
+0x2f51d501	XAxisLength	3
+0x2f52a02e	IsFocused	0
+0x2f552380	ButtonListDataBase	
+0x2f554423	BulletpointsBase	
+0x2f555452	IsVisible	0
+0x2f55deae	IsMultiplayer	0
+0x2f564346	SceneAnimationObject	
+0x2f56b60a	InfoLayout	
+0x2f56f792	WrongIslandType	0
+0x2f58bc19	ContextData	
+0x2f593af6	ShowWarning	0
+0x2f5a7efd	LetterboxSizePerSide	
+0x2f5bccba	SubText	
+0x2f5cf018	Subline	4
+0x2f5da05e	Infotip	1
+0x2f5f212c	BuildModeData	
+0x2f616ee4	GlobalDeityBelief	1
+0x2f61b392	IsDefeated	0
+0x2f626162	IslandsListBase	
+0x2f639cc7	FilterData	
+0x2f63d1c2	TextInput	
+0x2f655a06	InfocornerEntryPoint	
+0x2f65bafc	Subline	4
+0x2f688a28	RaritySplendorArrayDataBase	
+0x2f698da8	IsNegative	0
+0x2f6a7d0e	Breakdown	
+0x2f6aad11	IsRaceAutomationEnabled	0
+0x2f6abc3d	Label	4
+0x2f6b30aa	ContextGUID	1
+0x2f6b6e75	JumpToUnlockFeature	
+0x2f6bb8ba	ID_8	0
+0x2f6cdfb0	CameraScale	
+0x2f6e8613	IsFocused	0
+0x2f700270	InteractionData	
+0x2f7189af	InfoTip	
+0x2f71d60d	AlmostUnlockedBase	
+0x2f72d6f1	IsEnabled	0
+0x2f732a45	IsFocused	0
+0x2f7373b9	RacePosition	4
+0x2f741764	IsBuilt	0
+0x2f74e91e	WarSettings	
+0x2f76a37f	HeightPercentage	3
+0x2f7bdc71	IsLastEntry	0
+0x2f7bef9c	ProvinceName	4
+0x2f7cb13d	WarningType	
+0x2f7ec55d	ArrayButtonActionsBase	
+0x2f7f1a07	SatisfiedNeedCategory	1
+0x2f7fdeec	IsVisible	0
+0x2f810bbd	OtherParticipantsData	
+0x2f811147	CostsBase	
+0x2f812d9c	CurrentDevotion	1
+0x2f8225de	IsDisabled	0
+0x2f851d87	ActionButton	
+0x2f85ff28	TotalItemsCount	1
+0x2f8953af	Category	
+0x2f89e272	RenderWorldOffset	
+0x2f8bab0a	ProfileAvatarsBase	
+0x2f8be17b	CurrentSplendour	
+0x2f8c0dae	OptionInfoBase	
+0x2f8e1649	Layout	
+0x2f8f21ea	AreaOffset	
+0x2f8f350e	ProductionData	
+0x2f8f8ef7	GlobalPosition	
+0x2f90641f	InteractionData	
+0x2f90ee40	CardStatus	
+0x2f91678e	IsVisible	0
+0x2f9181d3	WarningInfoTipData	
+0x2f91abbc	MenuIsVisible	0
+0x2f91c127	XBtn	
+0x2f91e134	DestroyedShipMarkerBase	
+0x2f9258fe	NavigationData	
+0x2f951043	IsPlayerOwned	0
+0x2f955ef6	Transition	
+0x2f95e943	ModuleBuildingData	
+0x2f968c34	SceneAnimation	
+0x2f9884ff	IsActive	0
+0x2f9887c2	UnlockOverlay	
+0x2f9c6540	BulletPointListBase	
+0x2f9e0874	SplendourAmountValueAnimation	3
+0x2f9e21d2	NotificationTone	
+0x2f9e85c9	Size	
+0x2fa04763	IncidentType	
+0x2fa0e208	Profile	
+0x2fa1aad0	Size	
+0x2fa30cd3	PreviewContext	
+0x2fa614aa	ScreenArrayBase	
+0x2fa67ad6	ButtonData	
+0x2fa6aa32	IsVisible	0
+0x2fa7d425	EmperorName	
+0x2fa7ec16	ProvinceImage	4
+0x2fa833af	RequestFocus	
+0x2fa8b254	PopupScreenPos	
+0x2fa8f451	Layout	
+0x2fa8fd08	UpgradeDisabled	0
+0x2fa9b7b9	GameSpeedState	
+0x2fa9f2e8	Position	3
+0x2fabe069	GoodDeliveryIsFinished	0
+0x2fadfa08	SceneTransition	
+0x2faeb413	TimeToggleInfoTip	
+0x2fafb58f	HasDecayImpact	0
+0x2fb0937d	ArrayProvinceIconsBase	
+0x2fb0b8b4	MultiplayerPlatformDataBase	
+0x2fb1c8b7	RequestFocus	
+0x2fb3114a	SkipMovieVisible	0
+0x2fb3d622	IsBtnVisible	0
+0x2fb408c8	MinDragPosition	
+0x2fb44fb8	IsWarning	0
+0x2fb47acc	ExchangeData	
+0x2fb4b505	ActionADescription	
+0x2fb4d0fa	ProgressValue	3
+0x2fb4dba5	SessionSwitchPopup	
+0x2fb5592a	IsConnectReward	0
+0x2fb64636	OMCityInstitution	
+0x2fb8106b	IsEventOverAndPlayerHasNotContributed	0
+0x2fb88b5c	IsUnderAttack	0
+0x2fb915c3	Tabs	
+0x2fba145d	IsCrossSave	0
+0x2fbb46c5	GlobalCursorPosition	
+0x2fbb5bd8	Index	1
+0x2fbbbe67	BtnData3	
+0x2fbd411b	TopHeight	1
+0x2fbd9ff1	Healthbar	3
+0x2fbec56f	IsHUDModeCentered	0
+0x2fc30046	FocusedIndex	1
+0x2fc32886	IsPerformable	0
+0x2fc4f9ac	GroupUnitsDataBase	
+0x2fc56bfe	ShipData	
+0x2fc5c710	InfotipData	
+0x2fc63a9c	SubHeadlineText	4
+0x2fc65127	ShipListBase	
+0x2fc7e218	ItemUnlockerData	
+0x2fc882af	ThirdValueIsNegative	0
+0x2fc8d03f	NeedButtonState	
+0x2fc97421	TrackedQuest	
+0x2fcaad32	JumpToUnlockFeature	
+0x2fcbca4b	InfoPanelData	
+0x2fcc3d1f	TradeRightsEnum	
+0x2fcc6ad8	ButtonData	
+0x2fccacce	ActionBDescription	
+0x2fcdc0db	NeedCategoryDataBase	
+0x2fcde613	SectionDifficultyData	
+0x2fcea5f2	Indentation	0
+0x2fd016f3	IsVisible	0
+0x2fd24d28	DetailsInfotip	
+0x2fd29fe8	NeedProgress	3
+0x2fd2c616	StateIsInCombat	0
+0x2fd3760c	Number	
+0x2fd41b06	SetDetailPopup	
+0x2fd4d59c	UseSoftTransition	0
+0x2fd69224	IsWarningVisible	0
+0x2fd73477	IsExpired	0
+0x2fd8827b	TradeMode	
+0x2fd8be2b	IsSelected	0
+0x2fd8f58b	Context	
+0x2fda5fd9	IsVisible	0
+0x2fdadf97	IsAudioBtnVisible	0
+0x2fdb1562	InfoTip	
+0x2fdb3deb	Data	
+0x2fdbcfd8	Right	
+0x2fdc8a93	Socket	
+0x2fde8d3b	IsVisible	0
+0x2fdeb4fa	GUID	1
+0x2fe041be	FocusedIndex	1
+0x2fe09b49	BuildingSelectionBtn	
+0x2fe21ca8	IsBtnSelected	0
+0x2fe2cbcd	OrnamentBtnBase	
+0x2fe343a9	Alpha	3
+0x2fe42c68	IconText	
+0x2fe43e42	IsVisible	0
+0x2fe4a9df	StreetsOptionsData	
+0x2fe62ebb	IsInQueue	0
+0x2fe6d7e2	IsFavorite	0
+0x2fe6ebc1	Portrait	4
+0x2fe868fb	ProgressValue	3
+0x2fe91d6b	ShopButton	
+0x2fe9f712	GenericPopupSceneData	
+0x2feb4e85	SelectedGamepadPresetIndex	1
+0x2fed3d2d	IsHeader	0
+0x2feeeb8b	DPadUp	
+0x2fef1962	isFocused	0
+0x2ff0563c	UnlockIconBase	
+0x2ff0fab0	NotificationEntryButton	
+0x2ff47fa8	GlobalOverview	
+0x2ff51d60	TutorialGUID	1
+0x2ff5c0da	ConstructionProgressValue	
+0x2ff6917e	SectorProjectStationData	
+0x2ff6a0ff	RelativeSize	
+0x2ff8a935	IsVisible	0
+0x2ff98603	Button	
+0x2ff98cff	IsMPListFocused	0
+0x2ffac017	ProgressValue	3
+0x2ffb2ab0	SizeYAccessBtn	3
+0x2ffb52b6	Military_2Base	
+0x2ffc3d2d	SceneData	
+0x2ffd2b9a	IsSubtitleTop	0
+0x2ffd8ef8	Button	
+0x2ffdeb63	IsVisible	0
+0x2ffe4f75	ShowWatermark	0
+0x2fffdc8c	CategoryIsNew	0

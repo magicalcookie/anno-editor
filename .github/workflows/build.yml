@@ -1,0 +1,112 @@
+# Builds Linux and Windows release binaries on every push and PR, uploads
+# them as workflow artifacts, and on a `v*` tag publishes a GitHub release.
+name: build
+
+on:
+  push:
+    branches: [trunk]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # GPUI and wgpu come from git; the CLI fetch is much faster than libgit2
+  # on the zed repository.
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+
+jobs:
+  build:
+    name: build (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-24.04
+            exe: anno-editor
+          - name: windows-x86_64
+            os: windows-2022
+            exe: anno-editor.exe
+    steps:
+      - uses: actions/checkout@v4
+
+      # GPUI's X11/Wayland platform and font stack link against these.
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libx11-xcb-dev libxcb1-dev libfontconfig-dev libfreetype-dev \
+            libasound2-dev libvulkan-dev libzstd-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+
+      - name: Build
+        run: cargo build --release --locked --bin anno-editor
+
+      - name: Package
+        shell: bash
+        run: |
+          name="anno-editor-${{ github.ref_type == 'tag' && github.ref_name || github.sha }}-${{ matrix.name }}"
+          name="${name:0:80}"
+          mkdir -p "dist/$name"
+          cp "target/release/${{ matrix.exe }}" README.md "dist/$name/"
+          cd dist
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            7z a -tzip "$name.zip" "$name" >/dev/null
+          else
+            tar czf "$name.tar.gz" "$name"
+          fi
+          echo "PKG_DIR=dist/$name" >> "$GITHUB_ENV"
+
+      # Unpacked folder: the artifact download is already a zip, so this
+      # avoids a zip inside a zip.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: anno-editor-${{ matrix.name }}
+          path: ${{ env.PKG_DIR }}
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        if: github.ref_type == 'tag'
+        with:
+          name: release-${{ matrix.name }}
+          path: |
+            dist/*.zip
+            dist/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          prerelease=""
+          case "$GITHUB_REF_NAME" in *-*) prerelease="--prerelease" ;; esac
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes $prerelease

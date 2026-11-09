@@ -1,0 +1,80 @@
+[package]
+name = "anno-editor"
+version = "0.1.0"
+edition = "2024"
+description = "Anno 117 and 1800 asset browser, island editor and UI editor"
+
+[workspace]
+members = ["formats"]
+
+[dependencies]
+anno-formats = { path = "formats" }
+anyhow = "1"
+# Hash maps keyed by our own small values (layout and image caches).
+foldhash = "0.2"
+# Tint maps and thumbnails as PNG.
+image = { version = "0.25", default-features = false, features = ["png"] }
+# A pool that stays up: per-template loads and bakes are short jobs, and
+# fresh threads per batch cost more than the jobs.
+rayon = "1.12"
+# `import`: heightmap and terrain mesh files (heightfield::files).
+gpui-editor-kit = { path = "vendor/gpui-editor-kit", features = ["import"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Glyph advances of the game's UI fonts, to size labels.
+ttf-parser = "0.25"
+# The UI canvas draws on GPUI's wgpu device (ui/gpu.rs): the kit's
+# revision, so the device types are GPUI's own.
+wgpu = { git = "https://github.com/gfx-rs/wgpu", rev = "cddb2f5d80dc0009b2ef6767635140cacf90a007", default-features = false, features = ["vulkan", "wgsl", "std"] }
+bytemuck = { version = "1", features = ["derive"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+wgpu = { git = "https://github.com/gfx-rs/wgpu", rev = "cddb2f5d80dc0009b2ef6767635140cacf90a007", default-features = false, features = ["dx12"] }
+
+[profile.dev]
+debug = 1
+
+# Dependencies (GPUI, the renderer, decoders) are far too slow unoptimized
+# for an interactive editor; build them like release once, keep our crates
+# fast to rebuild.
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.dev.package.anno-editor]
+opt-level = 2
+
+[profile.dev.package.anno-formats]
+opt-level = 2
+
+[profile.dev.package.gpui-editor-kit]
+opt-level = 2
+
+# Archive inflation runs during interactive loads.
+[profile.dev.package.zlib-rs]
+opt-level = 3
+
+[profile.dev.package.flate2]
+opt-level = 3
+
+# The 35 MB assets.xml parses in ~0.2 s optimised, ~1.5 s without.
+[profile.dev.package.quick-xml]
+opt-level = 3
+
+# The kit's patches; Cargo only reads [patch] from the root workspace.
+[patch."https://github.com/zed-industries/zed"]
+gpui = { path = "vendor/gpui-editor-kit/vendor/zed/gpui" }
+gpui_wgpu = { path = "vendor/gpui-editor-kit/vendor/zed/gpui_wgpu" }
+gpui_windows = { path = "vendor/gpui-editor-kit/vendor/zed/gpui_windows" }
+
+[patch.crates-io]
+async-task = { git = "https://github.com/zed-industries/async-task.git", rev = "015845a19fc31752c02367567d3b8900a406f9da" }
+calloop = { git = "https://github.com/zed-industries/calloop", rev = "3759371fee14c40066d64777e2a36b6ffcc22590" }
+
+[dev-dependencies]
+tempfile = "3"
+# Validates the UI canvas shader in tests (ui/gpu.rs), as wgpu would.
+naga = { git = "https://github.com/gfx-rs/wgpu", rev = "cddb2f5d80dc0009b2ef6767635140cacf90a007", features = ["wgsl-in"] }
+# Window tests (editor/tests.rs): GPUI's TestApp drives the real editor,
+# clicks and keys included, without a display or a GPU. The kit's GPUI
+# revision, so the types are the kit's own (patched to the vendored copy).
+gpui = { git = "https://github.com/zed-industries/zed", rev = "00b86477f8b81c8d20328b096200f91452a572df", package = "gpui", features = ["test-support"] }

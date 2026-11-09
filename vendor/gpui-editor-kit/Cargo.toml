@@ -1,0 +1,44 @@
+[package]
+name = "gpui-editor-kit"
+version = "0.1.0"
+edition = "2024"
+description = "Shared GPUI widgets, docking, viewport camera, gizmos and Vulkan mesh rendering for game editors"
+license = "Apache-2.0"
+
+[dependencies]
+anyhow = "1"
+# BC7 needs 128 partition/anchor tables; a vetted port beats retyping them.
+bcdec_rs = "0.2"
+# GPUI from Zed's repository, pinned. `gpui`, `gpui_wgpu` and `gpui_windows`
+# are patched (vendor/zed, tools/vendor-zed.py).
+gpui = { git = "https://github.com/zed-industries/zed", rev = "00b86477f8b81c8d20328b096200f91452a572df", package = "gpui" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "00b86477f8b81c8d20328b096200f91452a572df", package = "gpui_platform", features = ["x11", "wayland"] }
+gpui_util = { git = "https://github.com/zed-industries/zed", rev = "00b86477f8b81c8d20328b096200f91452a572df", package = "gpui_util" }
+# Zed's wgpu revision: GPUI draws with it, and so does the viewport hook.
+wgpu = { git = "https://github.com/gfx-rs/wgpu", rev = "cddb2f5d80dc0009b2ef6767635140cacf90a007", default-features = false, features = ["vulkan", "wgsl", "std"] }
+bytemuck = { version = "1", features = ["derive", "extern_crate_alloc"] }
+pollster = "0.4"
+# Same version GPUI uses, for RenderImage frames.
+image = { version = "0.25", default-features = false }
+# `import` feature: heightmap and terrain mesh files (heightfield::files).
+gltf = { version = "1", default-features = false, features = ["import", "utils"], optional = true }
+tobj = { version = "4", optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+meshopt = "0.7"
+
+# glibc's malloc_trim, to hand texels let go after upload back to the system.
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+libc = "0.2"
+
+# GPUI's windows draw with DX12 on Windows (vendor/zed/gpui_windows), and so
+# does the offscreen renderer there.
+[target.'cfg(target_os = "windows")'.dependencies]
+wgpu = { git = "https://github.com/gfx-rs/wgpu", rev = "cddb2f5d80dc0009b2ef6767635140cacf90a007", default-features = false, features = ["dx12"] }
+
+[features]
+# Reading and writing terrain as files other tools use: 16-bit PNG and raw
+# heightmaps, OBJ and glTF meshes. Off by default; it pulls in mesh loaders.
+import = ["dep:gltf", "dep:tobj", "image/png"]
+

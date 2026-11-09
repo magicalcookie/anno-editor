@@ -1,0 +1,3 @@
+target/
+# Scratch extracts and captures; game data must not land in history.
+work/
