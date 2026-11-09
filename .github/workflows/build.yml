@@ -23,6 +23,18 @@ jobs:
   build:
     name: build (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
+    # Azure Artifact Signing trusts this repo's `signing` environment via an
+    # OIDC federated credential, so only the job that signs enters it. PRs
+    # never sign: fork PRs get no token, and every signature counts against
+    # the account's monthly quota.
+    environment: ${{ matrix.sign && github.event_name != 'pull_request' && 'signing' || '' }}
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      # Off until the signing variables exist, so the workflow runs before
+      # Azure is set up.
+      SIGN: ${{ matrix.sign && github.event_name != 'pull_request' && vars.AZURE_SIGNING_ACCOUNT != '' }}
     strategy:
       fail-fast: false
       matrix:
@@ -33,6 +45,7 @@ jobs:
           - name: windows-x86_64
             os: windows-2022
             exe: anno-editor.exe
+            sign: true
     steps:
       - uses: actions/checkout@v4
 
@@ -54,6 +67,47 @@ jobs:
 
       - name: Build
         run: cargo build --release --locked --bin anno-editor
+
+      # No subscription needed: the signer role sits on the signing account.
+      - name: Azure login
+        if: env.SIGN == 'true'
+        uses: azure/login@v3
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+
+      # Timestamped, so the signature outlives the 3-day signing certificate.
+      - name: Sign
+        if: env.SIGN == 'true'
+        uses: azure/artifact-signing-action@v2
+        with:
+          endpoint: ${{ vars.AZURE_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.AZURE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ vars.AZURE_SIGNING_PROFILE }}
+          files: ${{ github.workspace }}\target\release\anno-editor.exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+          # Only the azure/login session above.
+          exclude-environment-credential: true
+          exclude-workload-identity-credential: true
+          exclude-managed-identity-credential: true
+          exclude-shared-token-cache-credential: true
+          exclude-visual-studio-credential: true
+          exclude-visual-studio-code-credential: true
+          exclude-azure-cli-credential: false
+          exclude-azure-powershell-credential: true
+          exclude-azure-developer-cli-credential: true
+          exclude-interactive-browser-credential: true
+
+      - name: Check signature
+        if: env.SIGN == 'true'
+        shell: pwsh
+        run: |
+          $sig = Get-AuthenticodeSignature target\release\anno-editor.exe
+          "$($sig.Status): $($sig.SignerCertificate.Subject)"
+          if ($sig.Status -ne 'Valid') { exit 1 }
 
       - name: Package
         shell: bash
