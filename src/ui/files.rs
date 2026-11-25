@@ -3,7 +3,6 @@
 // screens and templates are found by name instead of by guid. Parsing all
 // 4.7k assets takes a few seconds on all cores; the index is cached in the
 // config folder and rebuilt when the install's file count changes.
-use super::GENERATED;
 use crate::editor::{Editor, empty_pane};
 use anno_formats::{
     phx::{Asset, Value},
@@ -29,7 +28,7 @@ const VERSION: u32 = 4;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Entry {
-    /// File name under GENERATED: a guid, or `<name>scene` for screens.
+    /// File name in the game's generated folder: a guid, or `<name>scene` for screens.
     pub file: String,
     /// PHX kind letters: SC screen, WI widget template, CP component, …
     pub kind: String,
@@ -53,49 +52,58 @@ pub struct Entry {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Index {
     version: u32,
-    stamp: usize,
+    stamp: u64,
     /// Screens first, then templates, then the rest; by name within each.
     pub entries: Vec<Entry>,
     /// Each template's group in the widget library, worked out once the
     /// index loads (`library::group_templates`).
     #[serde(skip)]
     pub groups: Vec<Option<super::library::Group>>,
+    /// The game's folder the entries' files are in (`Screens::generated`).
+    #[serde(skip)]
+    pub generated: &'static str,
 }
 
 impl Index {
     #[cfg(test)]
-    pub(crate) fn of(entries: Vec<Entry>) -> Index {
+    pub(crate) fn of(entries: Vec<Entry>, sources: &anno_formats::phx::Sources) -> Index {
         let mut i = Index {
             entries,
             ..Default::default()
         };
-        i.groups = super::library::group_templates(&i);
+        i.groups = super::library::group_templates(&i, sources);
         i
     }
 
-    pub fn load_or_build(install: &Install, cache: &Path) -> Result<Index> {
-        // The library groups by widget types the Phoenix sources name.
-        anno_formats::phx::register_sources(install);
+    /// The library groups the templates by the widget types `sources`
+    /// (the install's) name.
+    pub fn load_or_build(
+        install: &Install,
+        sources: &anno_formats::phx::Sources,
+        generated: &'static str,
+        cache: &Path,
+    ) -> Result<Index> {
         if let Ok(bytes) = std::fs::read(cache)
             && let Ok(mut i) = serde_json::from_slice::<Index>(&bytes)
             && i.version == VERSION
-            && i.stamp == install.file_count()
+            && i.stamp == install.stamp()
         {
-            i.groups = super::library::group_templates(&i);
+            i.groups = super::library::group_templates(&i, sources);
+            i.generated = generated;
             return Ok(i);
         }
-        let mut i = Index::build(install);
+        let mut i = Index::build(install, generated);
         if let Some(dir) = cache.parent() {
             std::fs::create_dir_all(dir)?;
         }
         std::fs::write(cache, serde_json::to_vec(&i)?)?;
-        i.groups = super::library::group_templates(&i);
+        i.groups = super::library::group_templates(&i, sources);
         Ok(i)
     }
 
-    pub fn build(install: &Install) -> Index {
+    pub fn build(install: &Install, generated: &'static str) -> Index {
         let files: Vec<String> = install
-            .list(GENERATED.trim_end_matches('/'))
+            .list(generated.trim_end_matches('/'))
             .into_iter()
             .map(|p| p.rsplit('/').next().unwrap_or(&p).to_owned())
             .collect();
@@ -108,7 +116,7 @@ impl Index {
                     scope.spawn(move || {
                         files
                             .iter()
-                            .filter_map(|f| scan(install, f))
+                            .filter_map(|f| scan(install, generated, f))
                             .collect::<Vec<_>>()
                     })
                 })
@@ -169,10 +177,16 @@ impl Index {
         entries.sort_by_cached_key(|e| (kind_rank(&e.kind), title(&e.name).to_lowercase()));
         Index {
             version: VERSION,
-            stamp: install.file_count(),
+            stamp: install.stamp(),
             entries,
             groups: Vec::new(),
+            generated,
         }
+    }
+
+    /// The archive path of entry `file`.
+    pub fn path(&self, file: &str) -> String {
+        format!("{}{file}", self.generated)
     }
 
     /// Entries whose name, file or kind label contain every word of `query`.
@@ -214,8 +228,8 @@ struct Container {
     plain: bool,
 }
 
-fn scan(install: &Install, file: &str) -> Option<Scan> {
-    let bytes = install.read(&format!("{GENERATED}{file}")).ok()?;
+fn scan(install: &Install, generated: &str, file: &str) -> Option<Scan> {
+    let bytes = install.read(format!("{generated}{file}")).ok()?;
     let asset = Asset::parse(bytes).ok()?;
     let widgets = asset.widgets();
     let root_name = widgets
@@ -237,7 +251,7 @@ fn scan(install: &Install, file: &str) -> Option<Scan> {
         .enumerate()
         .filter_map(|(i, w)| {
             Some(Container {
-                template: asset.container_template(w)?.id.to_string(),
+                template: w.container_template()?.id.to_string(),
                 name: w.name.clone(),
                 widget: i as u32,
                 plain: super::hierarchy::plain(&asset, w),
@@ -319,9 +333,19 @@ pub struct Find {
     flipped: std::collections::BTreeSet<u8>,
     /// The widget library's search over the same index.
     pub library: super::library::Library,
+    /// The install's caches every screen opened from this pane shares.
+    shared: Option<Arc<super::Shared>>,
 }
 
 impl Find {
+    /// The install's shared caches (see [`super::Shared`]): one per
+    /// editor, so they go with its install.
+    pub fn shared(&mut self, module: &'static dyn anno_core::game::Module) -> Arc<super::Shared> {
+        self.shared
+            .get_or_insert_with(|| super::Shared::new(module))
+            .clone()
+    }
+
     /// The search field while it takes keys.
     pub(crate) fn typing(&mut self) -> Option<&mut dyn gpui_editor_kit::field::InputBuffer> {
         if self.editing.is_none() {
@@ -460,8 +484,8 @@ impl Find {
     /// `path`'s screen name as the file list shows it (`Construction Menu
     /// Scene`), once the index is in.
     pub(super) fn display_name(&self, path: &str) -> Option<String> {
-        let file = path.strip_prefix(GENERATED)?;
         let index = self.index.as_ref()?;
+        let file = path.strip_prefix(index.generated)?;
         let entry = index.entries.iter().find(|e| e.file == file)?;
         // As the list shows it: every screen is a Scene.
         Some(spaced(
@@ -548,8 +572,9 @@ impl Editor {
             return Vec::new();
         };
         let edited = |e: &&Entry| {
-            let path = format!("{GENERATED}{}", e.file);
-            (self.project.files).contains_key(&*anno_formats::rda::normalize_path(&path))
+            let path = index.path(&e.file);
+            self.project
+                .has_file(&anno_formats::rda::normalize_path(&path))
         };
         let screens = || index.entries.iter().filter(|e| e.kind == "SC");
         let mut picks: Vec<&Entry> = screens().filter(edited).collect();
@@ -562,12 +587,7 @@ impl Editor {
         picks
             .into_iter()
             .take(4)
-            .map(|e| {
-                (
-                    format!("{GENERATED}{}", e.file),
-                    format!("Open {}", title(&e.name)),
-                )
-            })
+            .map(|e| (index.path(&e.file), format!("Open {}", title(&e.name))))
             .collect()
     }
 
@@ -585,11 +605,16 @@ impl Editor {
             return;
         };
         self.ui_find.loading = true;
+        let generated = self.ui_screens().generated;
         let cache = self.config.join("ui-index.json");
+        let shared = self.ui_find.shared(self.module);
         cx.spawn(async move |this, cx| {
             let built = cx
                 .background_executor()
-                .spawn(async move { Index::load_or_build(&install, &cache) })
+                .spawn(async move {
+                    let sources = shared.sources(&install);
+                    Index::load_or_build(&install, sources, generated, &cache)
+                })
                 .await;
             this.update(cx, |this, cx| {
                 this.ui_find.loading = false;
@@ -731,7 +756,7 @@ impl Editor {
                         .into()
                     },
                     detail: SharedString::default(),
-                    selected: open.as_deref() == Some(&format!("{GENERATED}{}", e.file)),
+                    selected: open.as_deref() == Some(&list_index.path(&e.file)),
                 }
             },
             move |this: &mut Editor, i, event, cx| {
@@ -746,7 +771,7 @@ impl Editor {
                     FileRow::Entry(r) => r,
                 };
                 let e = &click_index.entries[r];
-                let path = format!("{GENERATED}{}", e.file);
+                let path = click_index.path(&e.file);
                 // Shift adds the screen to the open file's game view.
                 if event.modifiers().shift
                     && let Some(ui) = &mut this.ui
@@ -905,6 +930,7 @@ mod tests {
                 entry("0143fdc2", "CP", "StackLayout"),
             ],
             groups: Vec::new(),
+            generated: "",
         };
         assert_eq!(index.find("map", Show::Layouts), [0]);
         assert_eq!(index.find("QUEST tracker", Show::Layouts), [1]);
@@ -916,12 +942,13 @@ mod tests {
     // Needs the game: screens are found by name and come first.
     #[test]
     fn install_index_names_screens() {
-        let Some(dir) = std::env::var_os("ANNO117_DIR") else {
+        let Some(dir) = anno_formats::vfs::install_dir("ANNO117_DIR") else {
             eprintln!("skipping: ANNO117_DIR unset");
             return;
         };
-        let install = Install::open(dir).unwrap();
-        let index = Index::build(&install);
+        let families = crate::games::profile(anno_core::game::Game::Anno117).archive_families;
+        let install = Install::open(dir, families).unwrap();
+        let index = Index::build(&install, "data/ui/studio/generated/");
         assert!(index.entries.len() > 4000);
         assert_eq!(index.entries[0].kind, "SC");
         let hits = index.find("minimap", Show::Screens);
@@ -973,7 +1000,7 @@ impl Editor {
                 crate::project::count(e.used_by as usize)
             ));
         }
-        let path = format!("{GENERATED}{}", e.file);
+        let path = format!("{}{}", self.ui_screens().generated, e.file);
         let name = title(&e.name);
         Some(
             div()

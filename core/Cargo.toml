@@ -1,0 +1,24 @@
+[package]
+name = "anno-core"
+version = "0.1.0"
+edition = "2024"
+description = "What the editor shares across Anno games: which game, the shape of its profile, finding installs and installed mods"
+
+[dependencies]
+anno-formats = { path = "../formats" }
+anyhow = "1"
+# The sky map, ocean and textures an ambient preset is made into; the kit is
+# shared and knows no game.
+gpui-editor-kit = { path = "../vendor/gpui-editor-kit" }
+# The coast map runs across cores (water::coast).
+rayon = "1.12"
+# Strip vertices go to the GPU as they are (water::StripVertex).
+bytemuck = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.56"

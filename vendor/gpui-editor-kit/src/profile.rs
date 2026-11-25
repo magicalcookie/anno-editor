@@ -13,6 +13,9 @@ static STATS: Mutex<Option<(Instant, Spans)>> = Mutex::new(None);
 
 pub fn enable() {
     ENABLED.store(true, Ordering::Relaxed);
+    // GPUI's own draw phases, as spans named "gpui …": a window rebuild's
+    // layout and paint happen there, outside the host's spans.
+    gpui::set_draw_timer(add);
 }
 
 /// Whether spans are on: hosts print their own measurements only then.
@@ -28,6 +31,19 @@ pub fn span(name: &'static str) -> Option<Span> {
 }
 
 pub struct Span(&'static str, Instant);
+
+/// Takes what was gathered since the last report or take, by span name:
+/// count and total, slowest first. For benchmarks that look at one frame.
+pub fn take() -> Vec<(&'static str, u32, Duration)> {
+    let Some((_, spans)) = STATS.lock().unwrap().take() else {
+        return Vec::new();
+    };
+    let mut out: Vec<_> = (spans.into_iter())
+        .map(|(name, (n, total, _))| (name, n, total))
+        .collect();
+    out.sort_by(|a, b| b.2.cmp(&a.2));
+    out
+}
 
 /// Prints and clears what was gathered so far, without waiting for the
 /// 2 s report: for benchmarks.
@@ -49,16 +65,24 @@ fn print(since: Instant, spans: &Spans) {
 
 impl Drop for Span {
     fn drop(&mut self) {
-        let took = self.1.elapsed();
-        let mut stats = STATS.lock().unwrap();
-        let (since, spans) = stats.get_or_insert_with(|| (Instant::now(), BTreeMap::new()));
-        let (n, total, worst) = spans.entry(self.0).or_default();
-        *n += 1;
-        *total += took;
-        *worst = (*worst).max(took);
-        if since.elapsed() >= Duration::from_secs(2) {
-            print(*since, spans);
-            *stats = None;
-        }
+        add(self.0, self.1.elapsed());
+    }
+}
+
+/// Counts `took` under `name` as a span would: for times measured
+/// elsewhere, such as a pass's GPU time read back from timestamps.
+pub fn add(name: &'static str, took: Duration) {
+    if !enabled() {
+        return;
+    }
+    let mut stats = STATS.lock().unwrap();
+    let (since, spans) = stats.get_or_insert_with(|| (Instant::now(), BTreeMap::new()));
+    let (n, total, worst) = spans.entry(name).or_default();
+    *n += 1;
+    *total += took;
+    *worst = (*worst).max(took);
+    if since.elapsed() >= Duration::from_secs(2) {
+        print(*since, spans);
+        *stats = None;
     }
 }

@@ -6,16 +6,13 @@
 // cube's square. The editor does the same for rocks and decoration placed
 // on buildable land.
 use super::{IslandEditor, Item, harbour};
-use anno_formats::{grids::Kind, model::Model, vfs::Install};
+use anno_formats::{a7m::grids::Kind, model::Model, vfs::Install};
 use gpui_editor_kit::math::{self, Mat4};
 use std::collections::{HashMap, HashSet};
 
 /// A cfg's `MeshCenter` and `MeshExtent`.
 type Box3 = ([f32; 3], [f32; 3]);
 
-/// `StaticBlockingObject` "CampaignBuildBlocker". `EditorBlocking` (92981,
-/// Voada Wall Blocking) is a destructible palisade, not a footprint.
-pub const BLOCKER: u32 = 101128;
 /// Cube side in metres per `Variation`: the asset lists cube_1x1, 2x2, 4x4,
 /// 8x8 and 16x16 in this order.
 pub const SIZES: [u32; 5] = [1, 2, 4, 8, 16];
@@ -138,11 +135,12 @@ impl IslandEditor {
         let Some(records) = self.spot_records.clone() else {
             return self.say("Blocker records are still loading", true);
         };
-        let Some(record) = records.get(&BLOCKER) else {
+        let blocker = self.rules().build_blocker;
+        let Some(record) = records.get(&blocker).filter(|_| blocker != 0) else {
             return self.say("No shipped island has a build blocker to copy", true);
         };
         let assets = self.assets.clone();
-        let templates = self.game.profile().decoration_templates;
+        let templates = self.rules().decoration_templates;
         let decoration = |guid: u32| {
             assets
                 .as_ref()
@@ -156,6 +154,7 @@ impl IslandEditor {
             let is_decor = match item {
                 Item::Prop(_) => false,
                 Item::Object(id) => self
+                    .island
                     .doc
                     .objects
                     .iter()
@@ -174,7 +173,13 @@ impl IslandEditor {
             covered += 1;
         }
         // Only buildable land needs blocking; the rest is closed already.
-        if let Some(areas) = self.doc.grids.as_ref().and_then(|g| g.layer(Kind::AreaIds)) {
+        if let Some(areas) = self
+            .island
+            .doc
+            .grids
+            .as_ref()
+            .and_then(|g| g.layer(Kind::AreaIds))
+        {
             cells.retain(|&[x, z]| {
                 areas
                     .cell_at(x as f32 + 0.5, z as f32 + 0.5)
@@ -185,9 +190,15 @@ impl IslandEditor {
         cubes.truncate(MAX_BLOCKERS);
         let placed: Vec<_> = cubes
             .iter()
-            .map(|&(variation, [x, z])| (record, [x, self.doc.field.height([x, z]), z], variation))
+            .map(|&(variation, [x, z])| {
+                (
+                    record,
+                    [x, self.island.doc.field.height([x, z]), z],
+                    variation,
+                )
+            })
             .collect();
-        let n = self.replace_generated(&[BLOCKER], placed);
+        let n = self.replace_generated(&[blocker], placed);
         self.layers.spots = true;
         self.say(
             format!(

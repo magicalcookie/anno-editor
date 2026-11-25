@@ -7,9 +7,10 @@ use crate::ui::bindings::{
     ASSIGN, FileTable, T_ACTION, T_BOOL, T_EVENT, T_FLOAT, T_OBJECT, T_STRING, Target, in_words,
     kind_name, logic_name, plain, slot_widget,
 };
+use crate::ui::evaluate::Builtin;
 use anno_formats::phx::{
     DefaultValue,
-    binding::{Converter, NewBinding, NewSlot, Slot, builtin},
+    binding::{Converter, NewBinding, NewSlot, Slot},
 };
 use anyhow::{Result, bail};
 use gpui_editor_kit::gpui::{Pixels, Point};
@@ -18,19 +19,19 @@ use std::collections::HashMap;
 /// A place no binding of the file names yet, made when a wire lands on
 /// or leaves its `+` pin, as the game's files reach one (round 16: a clip
 /// nobody started, and a new button's OnPress, had no pin): a clip
-/// action or event (`builtin::START` …) of the file's clip `clip`, or of
+/// action or event (`Builtin::Start` …) of the file's clip `clip`, or of
 /// clip `clip` in the template container `widget` shows, or an event the
 /// widget type of container `widget` declares.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(in crate::ui) enum NewPlace {
     Clip {
         clip: usize,
-        id: u32,
+        id: Builtin,
     },
     NestedClip {
         widget: usize,
         clip: anno_formats::phx::Guid,
-        id: u32,
+        id: Builtin,
     },
     Event {
         widget: usize,
@@ -43,12 +44,12 @@ impl NewPlace {
         match self {
             NewPlace::Clip { clip, id } => NewSlot::Clip {
                 clip,
-                path: vec![(1, 0x8000_0000 | id)],
+                path: vec![(1, id.uid())],
             },
             NewPlace::NestedClip { widget, clip, id } => NewSlot::NestedClip {
                 widget,
                 clip,
-                path: vec![(1, 0x8000_0000 | id)],
+                path: vec![(1, id.uid())],
             },
             NewPlace::Event { widget, uid } => NewSlot::Widget {
                 widget,
@@ -61,7 +62,7 @@ impl NewPlace {
     /// Nothing · Start", "BtnOverlay_DS › clip Enter · Start", "Btn ·
     /// OnPress".
     fn label(self, ft: &FileTable) -> String {
-        let what = |id: u32| builtin::name(id).unwrap_or("?");
+        let what = |id: Builtin| id.name().unwrap_or("?");
         match self {
             NewPlace::Clip { clip, id } => format!(
                 "clip {} · {}",
@@ -81,8 +82,7 @@ impl NewPlace {
             NewPlace::Event { widget, uid } => {
                 // A built-in (the root's Shown) by its name, else the
                 // widget type's event.
-                let name = match builtin::name(uid & 0x7fff_ffff).filter(|_| uid & 0x8000_0000 != 0)
-                {
+                let name = match Builtin::of_uid(uid).and_then(Builtin::name) {
                     Some(name) => name.to_owned(),
                     None => ft
                         .type_events(widget)
@@ -106,10 +106,10 @@ impl NewPlace {
 }
 
 /// What a wire into clip action `id` does to the clip.
-fn clip_verb(id: u32) -> Option<&'static str> {
+fn clip_verb(id: Builtin) -> Option<&'static str> {
     match id {
-        builtin::START => Some("starts"),
-        builtin::STOP => Some("stops"),
+        Builtin::Start => Some("starts"),
+        Builtin::Stop => Some("stops"),
         _ => None,
     }
 }
@@ -947,7 +947,7 @@ impl UiEditor {
                     // clip Leave, with OnMouseLeave …".
                     let acts = match slots.get(t) {
                         Some(Slot::Clip { path, .. } | Slot::Nested { path, .. }) => {
-                            path.last().and_then(|&(_, id)| clip_verb(id & 0x7fff_ffff))
+                            (path.last()).and_then(|&(_, id)| clip_verb(Builtin::of_uid(id)?))
                         }
                         _ => None,
                     };

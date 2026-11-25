@@ -153,6 +153,19 @@ pub fn status_chip(dot: Rgba, text: impl Into<SharedString>, action: Option<Stat
         .children(action.map(|a| a.h(px(20.)).px_2().text_size(px(11.))))
 }
 
+/// Editor chords are written as `Ctrl …`. On macOS the same chord is
+/// Command, and the key handlers already treat the platform modifier as
+/// Control. Menu rows and keycaps pass their shortcut through this.
+pub fn platform_shortcut(shortcut: impl Into<SharedString>) -> SharedString {
+    let shortcut = shortcut.into();
+    if cfg!(target_os = "macos")
+        && let Some(rest) = shortcut.strip_prefix("Ctrl")
+    {
+        return SharedString::from(format!("Cmd{rest}"));
+    }
+    shortcut
+}
+
 /// A keyboard key, for shortcut hints: `Raise [1]`, `[Enter] Last selected`.
 pub fn keycap(key: impl Into<SharedString>) -> Div {
     div()
@@ -165,7 +178,7 @@ pub fn keycap(key: impl Into<SharedString>) -> Div {
         .text_size(px(10.))
         .font_weight(FontWeight::NORMAL)
         .text_color(theme::get().muted)
-        .child(key.into())
+        .child(platform_shortcut(key))
 }
 
 /// A [`keycap`] for a filled (primary) button: an outline in the label's
@@ -181,7 +194,7 @@ pub fn keycap_on_fill(key: impl Into<SharedString>) -> Div {
         .text_size(px(10.))
         .font_weight(FontWeight::NORMAL)
         .text_color(theme::get().on_accent.alpha(0.85))
-        .child(key.into())
+        .child(platform_shortcut(key))
 }
 
 /// A tool strip button: icon, its name under it. Names make a strip of
@@ -241,6 +254,26 @@ pub fn tool_button(
                 })
                 .child(label.into()),
         )
+}
+
+/// A captioned group of [`tool_button`]s in a tool strip. The caption is
+/// quieter than the tool names under it (at one size the strip read as
+/// two rows of labels), but muted rather than disabled: it names a real
+/// group. Put a `toolbar_separator().mt(px(18.))` between groups.
+pub fn tool_group(caption: impl Into<SharedString>, tools: impl IntoElement) -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(1.))
+        .child(
+            div()
+                .pl_1()
+                .text_size(px(10.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(theme::get().muted)
+                .child(caption.into()),
+        )
+        .child(tools)
 }
 
 /// A colour chip, `rgb` as 0xRRGGBB: a 28×18 tile with a light edge.
@@ -2426,7 +2459,7 @@ fn menu_row(
             div()
                 .text_color(theme::get().muted)
                 .text_size(px(10.))
-                .child(shortcut.into()),
+                .child(platform_shortcut(shortcut)),
         )
 }
 
@@ -2474,7 +2507,7 @@ pub fn menu_item_off_why(
                 .flex()
                 .justify_between()
                 .child(label)
-                .child(div().text_size(px(10.)).child(shortcut.into())),
+                .child(div().text_size(px(10.)).child(platform_shortcut(shortcut))),
         )
         .child(
             div()
@@ -2527,7 +2560,7 @@ pub fn menu_item(
             div()
                 .text_color(theme::get().muted)
                 .text_size(px(10.))
-                .child(shortcut.into()),
+                .child(platform_shortcut(shortcut)),
         )
 }
 

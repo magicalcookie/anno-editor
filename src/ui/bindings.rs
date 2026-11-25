@@ -6,12 +6,13 @@
 // editor's words for bindings come from: slots (`FileTable::label`, and
 // `slot_label` for the timeline's lanes), converters (`logic_name`),
 // values (`short`) and kinds; built-in property names are
-// `binding::builtin::name`.
+// `Builtin::name` (evaluate.rs).
 use super::UiEditor;
+use super::evaluate::Builtin;
 use crate::editor::{Editor, empty_pane};
 use anno_formats::phx::{
-    Asset, DefaultValue, Guid, Widget,
-    binding::{Converter, Slot, builtin},
+    Asset, DataFields, DefaultValue, Guid, Widget,
+    binding::{Converter, Slot},
     name_crc,
 };
 use gpui_editor_kit::{
@@ -44,7 +45,9 @@ pub(super) type PathName<'a> = dyn Fn(usize, &[(u32, u32)]) -> Option<String> + 
 /// [`FileTable::label`], the timeline its lanes with what its templates
 /// tell.
 pub(super) fn slot_label(
+    sources: &anno_formats::phx::Sources,
     asset: &Asset,
+    fields: &DataFields,
     widgets: &[Widget],
     slots: &[Slot],
     slot: usize,
@@ -64,17 +67,17 @@ pub(super) fn slot_label(
                 Some(w) => name(*w),
             };
             let what = match (widget, &path[..]) {
-                (Some(w), [(field, uid)]) if uid & 0x8000_0000 == 0 => {
+                (Some(w), [(field, uid)]) if uid & Slot::BUILTIN == 0 => {
                     input(*w, path).map(|n| format!("{n}{}", axis(*field)))
                 }
-                (Some(w), [(_, c), (field, _)]) if c & 0x8000_0000 == 0 => {
+                (Some(w), [(_, c), (field, _)]) if c & Slot::BUILTIN == 0 => {
                     input(*w, path).map(|n| format!("{n}{}", axis(*field)))
                 }
                 _ => None,
             };
             format!(
                 "{who} · {}",
-                what.unwrap_or_else(|| path_label(asset, path))
+                what.unwrap_or_else(|| path_label(asset, fields, path))
             )
         }
         // Steps not known (a template not in the install) read as `…`:
@@ -87,14 +90,14 @@ pub(super) fn slot_label(
             } else {
                 steps.join(" › ")
             },
-            path_label(asset, path)
+            path_label(asset, fields, path)
         ),
         Some(Slot::Clip { clip, path }) => {
             let clip = asset
                 .clips()
                 .get(*clip)
                 .map_or_else(|| "clip".to_owned(), |c| format!("clip {}", c.name));
-            format!("{clip} · {}", path_label(asset, path))
+            format!("{clip} · {}", path_label(asset, fields, path))
         }
         Some(Slot::Template(i, field)) => {
             let p = asset.properties().get(*i).map_or_else(
@@ -103,7 +106,7 @@ pub(super) fn slot_label(
             );
             format!("{p}{}", axis(*field))
         }
-        Some(Slot::Constant { value, .. }) => short(value),
+        Some(Slot::Constant { value, .. }) => short(sources, value),
         None => "?".into(),
     }
 }
@@ -124,7 +127,7 @@ pub(super) fn nested_steps(
         let ws = at.widgets();
         if let Some(&i) = at.widget_ids(&ws).get(id) {
             names.push(ws[i].name.clone().unwrap_or_else(|| "widget".into()));
-            let deeper = at.container_template(&ws[i]).and_then(|r| open(r.id));
+            let deeper = ws[i].container_template().and_then(|r| open(r.id));
             match deeper {
                 Some(t) if k + 1 < inner.len() => at = t,
                 _ if k + 1 < inner.len() => break,
@@ -151,11 +154,12 @@ fn axis(field: u32) -> &'static str {
 }
 
 /// A widget property path: builtins by name, data paths by their ids.
-pub(super) fn path_label(asset: &Asset, path: &[(u32, u32)]) -> String {
+pub(super) fn path_label(asset: &Asset, fields: &DataFields, path: &[(u32, u32)]) -> String {
     match path {
-        [(field, id)] if id & 0x8000_0000 != 0 => {
-            let id = id & 0x7fff_ffff;
-            let what = builtin::name(id).map_or_else(|| format!("builtin {id:#x}"), str::to_owned);
+        [(field, id)] if id & Slot::BUILTIN != 0 => {
+            let id = id & !Slot::BUILTIN;
+            let what = (Builtin::of(id).and_then(Builtin::name))
+                .map_or_else(|| format!("builtin {id:#x}"), str::to_owned);
             format!("{what}{}", axis(*field))
         }
         // A template input of a container, or the root's WidgetType property.
@@ -179,14 +183,14 @@ pub(super) fn path_label(asset: &Asset, path: &[(u32, u32)]) -> String {
                     .iter()
                     .find(|p| p.uid == id)
                     .map(|p| asset.property_name(p).to_owned())
-                    .or_else(|| anno_formats::phx::data_field_name(id).map(str::to_owned))
+                    .or_else(|| fields.name(id).map(str::to_owned))
             };
             // A component whose instance sits in a template that does not
             // ship (the construction bar's, kept from Anno 1800): the
             // property by the component JSON, the instance by its id.
             if let [(_, c), (field, uid)] = path[..]
                 && name(c).is_none()
-                && let Some((component, property)) = anno_formats::phx::component_property_name(uid)
+                && let Some((component, property)) = fields.component_property(uid)
             {
                 return format!("{component} {c:08x}.{property}{}", axis(field));
             }
@@ -199,7 +203,7 @@ pub(super) fn path_label(asset: &Asset, path: &[(u32, u32)]) -> String {
 }
 
 /// A value in a few characters: floats trimmed, vectors in brackets.
-pub(super) fn short(v: &DefaultValue) -> String {
+pub(super) fn short(sources: &anno_formats::phx::Sources, v: &DefaultValue) -> String {
     let f = |bits: u32| {
         let x = f32::from_bits(bits);
         let s = format!("{x:.3}");
@@ -216,9 +220,9 @@ pub(super) fn short(v: &DefaultValue) -> String {
         DefaultValue::S32(v) => v.to_string(),
         // A hashed enum entry by its name (Orientation's 1505389363 is
         // Horizontal); other numbers as they are.
-        DefaultValue::U32(v) => {
-            anno_formats::phx::unique_entry_name(*v).unwrap_or_else(|| v.to_string())
-        }
+        DefaultValue::U32(v) => sources
+            .unique_entry_name(*v)
+            .map_or_else(|| v.to_string(), str::to_owned),
         DefaultValue::F32(bits) => f(*bits),
         DefaultValue::Vec(v) => format!(
             "[{}]",
@@ -312,6 +316,7 @@ pub(super) struct Chip {
 /// 1,017 times). `FileTable::kind` and the golden checks both ask this.
 pub(super) fn defined_kind(
     asset: &Asset,
+    fields: &DataFields,
     slots: &[Slot],
     s: usize,
     defined: &dyn Fn(usize, Option<u32>, u32) -> Option<u32>,
@@ -321,17 +326,17 @@ pub(super) fn defined_kind(
             widget: Some(w),
             path,
         } => match path[..] {
-            [(field, uid)] if uid & 0x8000_0000 == 0 => {
+            [(field, uid)] if uid & Slot::BUILTIN == 0 => {
                 defined(*w, None, uid).map(|k| if field >= 2 { T_FLOAT } else { k })
             }
-            [(_, c), (field, uid)] if c & 0x8000_0000 == 0 => {
+            [(_, c), (field, uid)] if c & Slot::BUILTIN == 0 => {
                 defined(*w, Some(c), uid).map(|k| if field >= 2 { T_FLOAT } else { k })
             }
             _ => None,
         },
         _ => None,
     };
-    by_definition.or_else(|| slot_kind(asset, slots, s))
+    by_definition.or_else(|| slot_kind(asset, fields, slots, s))
 }
 
 /// The PropertyType a slot holds, when the file tells it: constants by
@@ -339,28 +344,33 @@ pub(super) fn defined_kind(
 /// properties by their kind, built-in widget properties by what they are,
 /// game data by its field. Container inputs and component properties live
 /// in other files: unknown here.
-pub(super) fn slot_kind(asset: &Asset, slots: &[Slot], s: usize) -> Option<u32> {
+pub(super) fn slot_kind(
+    asset: &Asset,
+    fields: &DataFields,
+    slots: &[Slot],
+    s: usize,
+) -> Option<u32> {
     Some(match slots.get(s)? {
         Slot::Constant { kind, value } => kind.or_else(|| value_kind(value))?,
         Slot::Template(_, field) if *field >= 2 => T_FLOAT,
         Slot::Template(p, _) => asset.properties().get(*p)?.kind,
         Slot::Widget { path, .. } => match path[..] {
-            [(field, id)] if id & 0x8000_0000 != 0 => match id & 0x7fff_ffff {
-                builtin::VISIBLE => T_BOOL,
+            [(field, id)] if id & Slot::BUILTIN != 0 => match Builtin::of_uid(id)? {
+                Builtin::Visible => T_BOOL,
                 // One channel of a colour is a number, as an axis is.
-                builtin::COLOR if field >= 2 => T_FLOAT,
-                builtin::COLOR => T_COLOR,
-                builtin::ALPHA | builtin::ROTATION => T_FLOAT,
-                builtin::TEXT | builtin::IMAGE => T_STRING,
-                builtin::POSITION | builtin::SCALE | builtin::PIVOT if field >= 2 => T_FLOAT,
-                builtin::SIZE if field >= 2 => T_FLOAT,
-                builtin::POSITION | builtin::SCALE | builtin::PIVOT => T_VEC3,
-                builtin::SIZE => T_VEC2,
+                Builtin::ColorTint if field >= 2 => T_FLOAT,
+                Builtin::ColorTint => T_COLOR,
+                Builtin::AlphaTint | Builtin::RotationAngle => T_FLOAT,
+                Builtin::Text | Builtin::Image => T_STRING,
+                Builtin::Position | Builtin::Scale | Builtin::PivotPoint if field >= 2 => T_FLOAT,
+                Builtin::Size if field >= 2 => T_FLOAT,
+                Builtin::Position | Builtin::Scale | Builtin::PivotPoint => T_VEC3,
+                Builtin::Size => T_VEC2,
                 _ => return None,
             },
             // One axis of a field (Layout.TextPlane.x) is a number.
             [_, .., (field, _)] if field >= 2 => T_FLOAT,
-            [_, .., (_, last)] if path.len() >= 2 => anno_formats::phx::data_field_type(last)?,
+            [_, .., (_, last)] if path.len() >= 2 => fields.kind(last)?,
             _ => return None,
         },
         _ => return None,
@@ -395,6 +405,8 @@ pub(super) struct FileTable {
     pub asset: std::sync::Arc<Asset>,
     pub widgets: std::sync::Arc<[Widget]>,
     pub table: anno_formats::phx::binding::Bindings,
+    /// The game's field table, which names and types data paths.
+    pub fields: &'static DataFields,
     inputs: std::collections::HashMap<usize, std::sync::Arc<Asset>>,
     /// Components (and effects) the slots address, by (widget, component
     /// uid): the instance's name and its ComponentTemplate, which names
@@ -411,6 +423,9 @@ pub(super) struct FileTable {
     /// The slots that are events, one bit each (see `resolve_events`).
     events: Vec<u64>,
     pub eval: Option<super::scene::FileEval>,
+    /// The install's enum names and widget types, for labels and
+    /// descriptions.
+    pub sources: std::sync::Arc<anno_formats::phx::Sources>,
 }
 
 impl FileTable {
@@ -436,15 +451,17 @@ impl FileTable {
                 // showed `Layout.20517da9`), else by id.
                 let t = self.inputs.get(&w)?;
                 let p = t.properties().iter().find(|p| p.uid == c)?;
-                let field = anno_formats::phx::data_field_name(uid)
-                    .map_or_else(|| format!("{uid:08x}"), str::to_owned);
+                let field =
+                    (self.fields.name(uid)).map_or_else(|| format!("{uid:08x}"), str::to_owned);
                 Some(format!("{}.{field}", t.property_name(p)))
             }
             _ => None,
         };
         let steps = self.nested.get(&slot).map_or(&[][..], Vec::as_slice);
         slot_label(
+            &self.sources,
             &self.asset,
+            self.fields,
             &self.widgets,
             &self.table.slots,
             slot,
@@ -474,7 +491,7 @@ impl FileTable {
             };
             t.properties().iter().find(|p| p.uid == uid).map(|p| p.kind)
         };
-        defined_kind(&self.asset, &self.table.slots, s, &defined)
+        defined_kind(&self.asset, self.fields, &self.table.slots, s, &defined)
     }
 
     /// What slot `s` is for, in the words of the game's Phoenix sources: a
@@ -491,11 +508,15 @@ impl FileTable {
         match path[..] {
             [(_, uid)] => {
                 let owner = self.native.get(&(*w, uid))?.2?;
-                anno_formats::phx::property_description(owner, uid)
+                self.sources
+                    .property_description(owner, uid)
+                    .map(str::to_owned)
             }
-            [(_, c), (_, uid)] if c & 0x8000_0000 == 0 => {
+            [(_, c), (_, uid)] if c & Slot::BUILTIN == 0 => {
                 let owner = self.components.get(&(*w, c))?.1.guid()?;
-                anno_formats::phx::property_description(owner, uid)
+                self.sources
+                    .property_description(owner, uid)
+                    .map(str::to_owned)
             }
             _ => None,
         }
@@ -547,7 +568,7 @@ impl FileTable {
                 // A step into an object walks a view model's fields, unless
                 // it is the widget's component (AnnoButtonWT · Focus).
                 let walks = path.len() > 1
-                    && uid & 0x8000_0000 == 0
+                    && uid & Slot::BUILTIN == 0
                     && !self.components.contains_key(&(w, uid));
                 (walks || object(w, uid)).then_some((w, uid))
             }
@@ -591,19 +612,19 @@ impl FileTable {
             } => match path[..] {
                 // The alignment and overflow enums are named after their
                 // property; both sizings share one.
-                [(1, id)] if id & 0x8000_0000 != 0 => {
-                    let id = id & 0x7fff_ffff;
-                    let name = if builtin::SIZING.contains(&id) {
+                [(1, id)] if id & Slot::BUILTIN != 0 => {
+                    let b = Builtin::of_uid(id)?;
+                    let name = if Builtin::SIZING.contains(&b) {
                         "TextBoxSizing"
-                    } else if builtin::ALIGNMENT.contains(&id) || builtin::OVERFLOW.contains(&id) {
-                        builtin::name(id)?
+                    } else if Builtin::ALIGNMENT.contains(&b) || Builtin::OVERFLOW.contains(&b) {
+                        b.name()?
                     } else {
                         return None;
                     };
-                    anno_formats::phx::enum_named(name)
+                    self.sources.enum_named(name)
                 }
                 [(1, uid)] => own(self.inputs.get(w)?, uid),
-                [(_, c), (1, uid)] if c & 0x8000_0000 == 0 => {
+                [(_, c), (1, uid)] if c & Slot::BUILTIN == 0 => {
                     own(&self.components.get(&(*w, c))?.1, uid)
                 }
                 _ => None,
@@ -638,12 +659,10 @@ impl FileTable {
             // actions); an animated template's Start … Completed.
             Slot::Widget { path, .. } | Slot::Nested { path, .. } => {
                 if let Some(&(_, id)) = path.last()
-                    && id & 0x8000_0000 != 0
+                    && id & Slot::BUILTIN != 0
                 {
-                    let b = id & 0x7fff_ffff;
-                    if b == builtin::SHOWN
-                        || b == 0x3d
-                        || (builtin::START..=builtin::COMPLETED).contains(&b)
+                    let b = id & !Slot::BUILTIN;
+                    if b == Builtin::Shown.id() || b == Builtin::Event3d.id() || Builtin::is_clip(b)
                     {
                         return Some(true);
                     }
@@ -776,7 +795,7 @@ impl FileTable {
     }
 
     /// The last layout's run of binding `i`.
-    pub fn trace(&self, i: usize) -> Option<anno_formats::phx::binding::Trace> {
+    pub fn trace(&self, i: usize) -> Option<super::evaluate::Trace> {
         self.eval.as_ref()?.trace.get(i)
     }
 
@@ -792,8 +811,12 @@ impl FileTable {
             Some(_) if self.flow(i).out => "passes its event on".into(),
             Some(t) => format!(
                 "({}) → {}",
-                t.args.iter().map(short).collect::<Vec<_>>().join(", "),
-                t.value.as_ref().map_or_else(|| "nothing".to_owned(), short)
+                (t.args.iter())
+                    .map(|v| short(&self.sources, v))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                (t.value.as_ref())
+                    .map_or_else(|| "nothing".to_owned(), |v| short(&self.sources, v))
             ),
             // Clip Start/Stop are written when an event fires;
             // Completed is read when the clip sends it.
@@ -969,7 +992,7 @@ impl UiEditor {
         let mut inputs: std::collections::HashMap<usize, std::sync::Arc<Asset>> =
             Default::default();
         for (w, wd) in widgets.iter().enumerate() {
-            if let Some(r) = asset.container_template(wd)
+            if let Some(r) = wd.container_template()
                 && let Some(t) = self.images.asset(&self.install, r.id)
             {
                 inputs.insert(w, t);
@@ -985,7 +1008,7 @@ impl UiEditor {
                 Slot::Widget {
                     widget: Some(w),
                     path,
-                } if matches!(path[..], [(_, c), _] if c & 0x8000_0000 == 0) => Some(*w),
+                } if matches!(path[..], [(_, c), _] if c & Slot::BUILTIN == 0) => Some(*w),
                 _ => None,
             })
             .collect();
@@ -1068,6 +1091,8 @@ impl UiEditor {
             nested,
             events: Vec::new(),
             eval,
+            sources: self.images.shared.sources(&self.install).clone(),
+            fields: self.images.shared.screens.data_fields,
         };
         ft.events = ft.resolve_events();
         let t = std::sync::Arc::new(ft);
@@ -1141,7 +1166,7 @@ impl UiEditor {
                 let v = eval
                     .and_then(|e| e.value(p.uid).cloned())
                     .unwrap_or_else(|| asset.default_at(p.default));
-                (asset.property_name(p).to_owned(), short(&v))
+                (asset.property_name(p).to_owned(), short(self.sources(), &v))
             })
             .collect();
         values.sort();
@@ -1628,6 +1653,7 @@ impl Editor {
 /// a template input of another class, that class's paths below it. Built
 /// once per game from every template.
 pub struct Catalog {
+    fields: &'static DataFields,
     by_class: std::collections::HashMap<Guid, Vec<Vec<u32>>>,
     /// (class, path) → the class of the object there.
     links: std::collections::HashMap<Guid, Vec<(Vec<u32>, Guid)>>,
@@ -1639,14 +1665,20 @@ const LINK_DEPTH: usize = 3;
 const MAX_PATHS: usize = 4000;
 
 impl Catalog {
-    pub fn build(install: &anno_formats::vfs::Install) -> Catalog {
+    /// Reads every compiled file in `generated` (the game's folder); its
+    /// paths are named through `fields`.
+    pub fn build(
+        install: &anno_formats::vfs::Install,
+        generated: &str,
+        fields: &'static DataFields,
+    ) -> Catalog {
         use rayon::prelude::*;
         type Found = (
             Vec<(Guid, Vec<u32>)>,
             Vec<(Guid, Vec<u32>, Guid, u32)>,
             Option<(Guid, Vec<(u32, Guid)>)>,
         );
-        let files = install.list("data/ui/studio/generated");
+        let files = install.list(generated.trim_end_matches('/'));
         let found: Vec<Found> = files
             .par_iter()
             .filter_map(|f| {
@@ -1693,22 +1725,13 @@ impl Catalog {
             }
         }
         for list in by_class.values_mut() {
-            list.sort_by_cached_key(|p| field_path(p));
+            list.sort_by_cached_key(|p| field_path(fields, p));
         }
-        Catalog { by_class, links }
-    }
-
-    /// The process's catalog for `install`'s game, built on first use.
-    pub fn of(install: &anno_formats::vfs::Install) -> std::sync::Arc<Catalog> {
-        static BUILT: std::sync::Mutex<Vec<(anno_formats::game::Game, std::sync::Arc<Catalog>)>> =
-            std::sync::Mutex::new(Vec::new());
-        let game = install.game();
-        if let Some(c) = BUILT.lock().unwrap().iter().find(|(g, _)| *g == game) {
-            return c.1.clone();
+        Catalog {
+            fields,
+            by_class,
+            links,
         }
-        let c = std::sync::Arc::new(Catalog::build(install));
-        BUILT.lock().unwrap().push((game, c.clone()));
-        c
     }
 
     /// Field paths known on `class`, its own first, then those reached
@@ -1717,7 +1740,7 @@ impl Catalog {
         let mut out: Vec<Vec<u32>> = Vec::new();
         let mut seen = std::collections::HashSet::new();
         self.walk(class, &mut Vec::new(), LINK_DEPTH, &mut out, &mut seen);
-        out.sort_by_cached_key(|p| field_path(p));
+        out.sort_by_cached_key(|p| field_path(self.fields, p));
         out
     }
 
@@ -1751,10 +1774,11 @@ impl Catalog {
 }
 
 /// `Data.TextData.Text`: field ids by name, unknown ones by id.
-fn field_path(ids: &[u32]) -> String {
+fn field_path(fields: &DataFields, ids: &[u32]) -> String {
     ids.iter()
         .map(|&id| {
-            anno_formats::phx::data_field_name(id)
+            fields
+                .name(id)
                 .map_or_else(|| format!("{id:08x}"), str::to_owned)
         })
         .collect::<Vec<_>>()
@@ -1825,7 +1849,8 @@ impl Target {
         let [(field, id)] = self.path()[..] else {
             unreachable!("binder targets are one built-in")
         };
-        let name = builtin::name(id & 0x7fff_ffff).expect("binder targets have names");
+        let name =
+            (Builtin::of_uid(id).and_then(Builtin::name)).expect("binder targets have names");
         format!("{name}{}", axis(field))
     }
 
@@ -1847,20 +1872,20 @@ impl Target {
 
     /// PropertyField and built-in id (an axis of a vector for X/Y/Scale).
     pub(super) fn path(self) -> Vec<(u32, u32)> {
-        let b = |f: u32, id: u32| vec![(f, 0x8000_0000 | id)];
+        let b = |f: u32, id: Builtin| vec![(f, id.uid())];
         match self {
-            Target::Visible => b(1, builtin::VISIBLE),
-            Target::Alpha => b(1, builtin::ALPHA),
-            Target::Color => b(1, builtin::COLOR),
-            Target::Text => b(1, builtin::TEXT),
-            Target::Image => b(1, builtin::IMAGE),
-            Target::X => b(2, builtin::POSITION),
-            Target::Y => b(3, builtin::POSITION),
-            Target::Width => b(2, builtin::SIZE),
-            Target::Height => b(3, builtin::SIZE),
-            Target::ScaleX => b(2, builtin::SCALE),
-            Target::ScaleY => b(3, builtin::SCALE),
-            Target::Rotation => b(1, builtin::ROTATION),
+            Target::Visible => b(1, Builtin::Visible),
+            Target::Alpha => b(1, Builtin::AlphaTint),
+            Target::Color => b(1, Builtin::ColorTint),
+            Target::Text => b(1, Builtin::Text),
+            Target::Image => b(1, Builtin::Image),
+            Target::X => b(2, Builtin::Position),
+            Target::Y => b(3, Builtin::Position),
+            Target::Width => b(2, Builtin::Size),
+            Target::Height => b(3, Builtin::Size),
+            Target::ScaleX => b(2, Builtin::Scale),
+            Target::ScaleY => b(3, Builtin::Scale),
+            Target::Rotation => b(1, Builtin::RotationAngle),
         }
     }
 
@@ -2114,7 +2139,7 @@ impl UiEditor {
         let kind = match &source {
             Source::Data { fields, .. } => fields
                 .last()
-                .and_then(|&f| anno_formats::phx::data_field_type(f)),
+                .and_then(|&f| self.screens().data_fields.kind(f)),
             Source::Input(i) => self.asset.properties().get(*i).map(|p| p.kind),
             Source::Value => None,
         };
@@ -2173,7 +2198,7 @@ impl UiEditor {
             let kind = match &source {
                 Source::Data { fields, .. } => fields
                     .last()
-                    .and_then(|&f| anno_formats::phx::data_field_type(f))
+                    .and_then(|&f| self.screens().data_fields.kind(f))
                     .unwrap_or(T_STRING),
                 Source::Input(i) => self.asset.properties()[*i].kind,
                 Source::Value => unreachable!("refused above"),
@@ -2306,7 +2331,7 @@ impl UiEditor {
         };
         own(&self.asset).or_else(|| {
             self.install
-                .list(super::GENERATED.trim_end_matches('/'))
+                .list(self.screens().generated.trim_end_matches('/'))
                 .iter()
                 .find_map(|p| {
                     own(&anno_formats::phx::Asset::parse(self.install.read(p).ok()?).ok()?)
@@ -2412,7 +2437,7 @@ impl UiEditor {
 }
 
 impl Editor {
-    /// Reads the game-data catalog in the background, once per game.
+    /// Reads the game-data catalog in the background, once per install.
     fn load_catalog(&mut self, cx: &mut Context<Self>) {
         let Some(ui) = &self.ui else {
             return;
@@ -2420,11 +2445,11 @@ impl Editor {
         if ui.catalog.is_some() {
             return;
         }
-        let install = ui.install.clone();
+        let (shared, install) = (ui.images.shared.clone(), ui.install.clone());
         cx.spawn(async move |this, cx| {
             let catalog = cx
                 .background_executor()
-                .spawn(async move { Catalog::of(&install) })
+                .spawn(async move { shared.catalog(&install) })
                 .await;
             this.update(cx, |this, cx| {
                 if let Some(ui) = &mut this.ui {
@@ -2644,12 +2669,11 @@ impl Editor {
                 // cut at the inspector's width all read the same. A leaf
                 // the search names exactly ranks first.
                 let mut rows = Vec::new();
+                let data_fields = ui.screens().data_fields;
                 for (prop, name, paths) in ui.data_roots(catalog) {
                     for fields in paths {
-                        let path = field_path(&fields);
-                        let leaf = fields
-                            .last()
-                            .and_then(|&f| anno_formats::phx::data_field_type(f));
+                        let path = field_path(data_fields, &fields);
+                        let leaf = fields.last().and_then(|&f| data_fields.kind(f));
                         if !needle.is_empty() && !path.to_lowercase().contains(&needle) {
                             continue;
                         }
@@ -2923,7 +2947,7 @@ fn hint_line(text: impl Into<SharedString>) -> Div {
 
 #[cfg(test)]
 mod tests {
-    use super::{Catalog, Source, Target, Transform};
+    use super::{Source, Target, Transform};
     use crate::ui::UiEditor;
     use crate::ui::test_support::{
         BUTTON, ICON_ROW, bindings, input, install, key, labels, node, open, path, reopen, select,
@@ -3109,7 +3133,6 @@ mod tests {
     #[test]
     fn the_binder_writes_one_sound_binding_per_property() {
         use crate::ui::graph::wiring::Drop;
-        use anno_formats::phx::binding::builtin;
         let Some(mut ui) = open(ICON_ROW) else {
             return;
         };
@@ -3163,7 +3186,7 @@ mod tests {
         let visible = (0..t.slots.len())
             .find(|&s| {
                 matches!(&t.slots[s], Slot::Widget { widget: Some(w), path }
-                    if *w == widget && path[..] == [(1, 0x8000_0000 | builtin::VISIBLE)])
+                    if *w == widget && path[..] == [(1, crate::ui::evaluate::Builtin::Visible.uid())])
             })
             .unwrap();
         let scalable = input(&ui, "-IsScalable_Content");
@@ -3208,11 +3231,20 @@ mod tests {
     // undo takes the binding out again.
     #[test]
     fn binding_game_data_to_visible_follows_the_data() {
+        let _flags = crate::ui::preview::FLAG_TESTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let Some(install) = install() else {
             return;
         };
-        let catalog = Catalog::of(&install);
-        let mut ui = UiEditor::load(install, &path("minimapscene")).unwrap();
+        let mut ui = UiEditor::load(
+            crate::ui::test_support::shared(&install),
+            install,
+            &path("minimapscene"),
+        )
+        .unwrap();
+        let catalog = ui.images.shared.catalog(&ui.install);
+        let data_fields = ui.screens().data_fields;
         // A yes/no field the minimap's data hands to its content, found
         // through the hand-off into the content template.
         let (prop, root, fields) = ui
@@ -3221,11 +3253,8 @@ mod tests {
             .find_map(|(prop, name, paths)| {
                 let p = paths.into_iter().find(|p| {
                     p.len() >= 2
-                        && p.last()
-                            .and_then(|&f| anno_formats::phx::data_field_type(f))
-                            == Some(0)
-                        && p.iter()
-                            .all(|&f| anno_formats::phx::data_field_name(f).is_some())
+                        && p.last().and_then(|&f| data_fields.kind(f)) == Some(0)
+                        && p.iter().all(|&f| data_fields.name(f).is_some())
                 })?;
                 Some((prop, name, p))
             })
@@ -3253,9 +3282,7 @@ mod tests {
                 .any(|v| v.writes && v.raw == "LogicalInvert" && v.converter == "not")
         );
         // The sampler answers the field under its path of names.
-        let names = fields
-            .iter()
-            .map(|&f| anno_formats::phx::data_field_name(f).unwrap());
+        let names = fields.iter().map(|&f| data_fields.name(f).unwrap());
         let path = std::iter::once(root.as_str())
             .chain(names)
             .collect::<Vec<_>>()
@@ -3374,14 +3401,24 @@ mod tests {
         let Some(install) = install() else {
             return;
         };
-        let mut ui = UiEditor::load(install.clone(), &path(ICON_ROW)).unwrap();
+        let mut ui = UiEditor::load(
+            crate::ui::test_support::shared(&install),
+            install.clone(),
+            &path(ICON_ROW),
+        )
+        .unwrap();
         let text = node(&ui, "Text");
         let labels = labels(&ui.file_table(text).unwrap());
         assert!(
             labels.iter().any(|l| l.contains("Layout.Overflow_Y")),
             "{labels:#?}"
         );
-        let ui = UiEditor::load(install, &path("minimapscene")).unwrap();
+        let ui = UiEditor::load(
+            crate::ui::test_support::shared(&install),
+            install,
+            &path("minimapscene"),
+        )
+        .unwrap();
         let tracks: Vec<&str> = ui
             .player
             .clips

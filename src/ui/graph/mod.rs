@@ -13,7 +13,8 @@
 use super::bindings::{
     FileTable, T_EVENT, Target, logic_name, short, slot_kind, slot_widget, value_kind,
 };
-use anno_formats::phx::binding::{Converter, Slot, builtin};
+use crate::ui::evaluate::Builtin;
+use anno_formats::phx::binding::{Converter, Slot};
 use std::collections::HashMap;
 use wiring::{NewPlace, Places};
 
@@ -25,11 +26,11 @@ pub(super) mod wiring;
 
 /// The clip actions an event drives: Start and Stop (no shipped file
 /// binds Pause or Resume).
-const CLIP_ACTIONS: [u32; 2] = [builtin::START, builtin::STOP];
+const CLIP_ACTIONS: [Builtin; 2] = [Builtin::Start, Builtin::Stop];
 
 /// The clip events a wire starts from: Started and Completed (no shipped
 /// file reads Stopped, Paused or Resumed).
-const CLIP_EVENTS: [u32; 2] = [builtin::STARTED, builtin::COMPLETED];
+const CLIP_EVENTS: [Builtin; 2] = [Builtin::Started, Builtin::Completed];
 
 /// Bindings one graph draws; a whole big file is past reading anyway.
 const MAX_BINDINGS: usize = 300;
@@ -397,7 +398,7 @@ impl Builder<'_> {
             o => o,
         };
         let n = self.node(owner, title);
-        let kind = slot_kind(&self.ft.asset, &self.ft.table.slots, s);
+        let kind = slot_kind(&self.ft.asset, self.ft.fields, &self.ft.table.slots, s);
         let at = *self.outs.entry((n, key)).or_insert_with(|| {
             let mut pin = Pin::new(name);
             pin.slot = Some(s);
@@ -615,7 +616,9 @@ impl Graph {
                 outs: vec![{
                     let mut pin = Pin::new(out_name);
                     pin.slot = bd.targets.first().copied();
-                    pin.kind = pin.slot.and_then(|t| slot_kind(&ft.asset, slots, t));
+                    pin.kind = pin
+                        .slot
+                        .and_then(|t| slot_kind(&ft.asset, ft.fields, slots, t));
                     pin
                 }],
                 note: (!ran).then_some(outcome),
@@ -645,9 +648,12 @@ impl Graph {
                     .as_ref()
                     .filter(|t| t.args.len() == bd.sources.len())
                     .and_then(|t| t.args.get(k))
-                    .map(short)
+                    .map(|v| short(&ft.sources, v))
             };
-            let result = trace.as_ref().and_then(|t| t.value.as_ref()).map(short);
+            let result = trace
+                .as_ref()
+                .and_then(|t| t.value.as_ref())
+                .map(|v| short(&ft.sources, v));
             let arg_kind = |k: usize| {
                 trace
                     .as_ref()
@@ -660,7 +666,7 @@ impl Graph {
             // (round 15: one flag per binding drew most events as data).
             let flow = ft.flow(i);
             let constant = |s: usize| match slots.get(s) {
-                Some(Slot::Constant { value, .. }) => Some(short(value)),
+                Some(Slot::Constant { value, .. }) => Some(short(&ft.sources, value)),
                 _ => None,
             };
             // The PropertyType a fixed value is stored as.
@@ -676,7 +682,7 @@ impl Graph {
                     .constants
                     .get(&s)
                     .copied()
-                    .filter(|&sp| super::typed_text(&ft.asset, sp).is_some());
+                    .filter(|&sp| super::typed_text(&ft.sources, &ft.asset, sp).is_some());
                 let rgb = span.and_then(|sp| super::constant_rgb(&ft.asset, sp, stored(s)));
                 (span, rgb)
             };
@@ -808,8 +814,8 @@ impl Graph {
                 let Some(id) = id else { continue };
                 let name = &t.clips()[c].name;
                 for action in CLIP_ACTIONS {
-                    let what = builtin::name(action).expect("named");
-                    let path = [(1, 0x8000_0000 | action)];
+                    let what = action.name().expect("named");
+                    let path = [(1, action.uid())];
                     let bound = written(&|s: &Slot| {
                         matches!(s, Slot::Nested { widget: x, inner, path: q }
                             if *x == w && inner[..] == [id] && q[..] == path)
@@ -929,8 +935,8 @@ impl Graph {
                 }
                 let n = b.node(Owner::Clip(c), format!("clip {}", ft.asset.clips()[c].name));
                 for action in CLIP_ACTIONS {
-                    let what = builtin::name(action).expect("named");
-                    let path = [(1, 0x8000_0000 | action)];
+                    let what = action.name().expect("named");
+                    let path = [(1, action.uid())];
                     let node = &mut b.g.nodes[n];
                     let bound = written(
                         &|s: &Slot| matches!(s, Slot::Clip { clip, path: q } if *clip == c && q[..] == path),
@@ -949,8 +955,8 @@ impl Graph {
                 // What it sends that nothing reads yet: its Started and
                 // Completed, wires to start from.
                 for id in CLIP_EVENTS {
-                    let what = builtin::name(id).expect("named");
-                    let path = [(1, 0x8000_0000 | id)];
+                    let what = id.name().expect("named");
+                    let path = [(1, id.uid())];
                     let node = &mut b.g.nodes[n];
                     let used = read(
                         &|s: &Slot| matches!(s, Slot::Clip { clip, path: q } if *clip == c && q[..] == path),
@@ -969,14 +975,14 @@ impl Graph {
             // starts a clip when the file opens, as 99 shipped files copy
             // their root's Shown into a clip's Start (round 17: "start it
             // when the screen shows" had no pin).
-            let shown = 0x8000_0000 | builtin::SHOWN;
+            let shown = Builtin::Shown.uid();
             let used = read(&|s: &Slot| {
                 matches!(s, Slot::Widget { widget: Some(0) | None, path }
                     if matches!(path[..], [(_, id)] if id == shown))
             });
             if widget.is_none() && !used && !ft.asset.clips().is_empty() {
                 let n = b.node(Owner::Reads(0), owner_title(ft, 0));
-                let what = builtin::name(builtin::SHOWN).expect("named");
+                let what = Builtin::Shown.name().expect("named");
                 let mut pin = Pin::new(format!("+ {what}"));
                 pin.id = what.to_owned();
                 pin.event = true;
@@ -1000,9 +1006,9 @@ impl Graph {
             if let Some(n) = v
                 .parse::<u32>()
                 .ok()
-                .and_then(|id| anno_formats::phx::enum_entry_name(g, id))
+                .and_then(|id| ft.sources.enum_entry_name(g, id))
             {
-                pin.value = Some(n);
+                pin.value = Some(n.to_owned());
             }
         };
         let mut enum_out = HashMap::new();

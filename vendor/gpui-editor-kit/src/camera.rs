@@ -73,6 +73,23 @@ impl Camera {
         }
     }
 
+    /// The camera mirrored through the horizontal plane at `level`: the
+    /// anchor mirrored, tilted past the horizon by as much as this one looks
+    /// down (`π − tilt`), panned the other way down the screen. Its eye is
+    /// this one's mirrored, and it sees the mirrored world upside down: its
+    /// picture flipped top to bottom is what a mirror at `level` shows this
+    /// camera, with no change of winding. Tilt is set directly, past the
+    /// interactive range.
+    pub fn mirrored(self, level: f32, extent: impl Into<Extent>) -> Self {
+        let a = self.anchor(extent);
+        Self {
+            tilt: std::f32::consts::PI - self.tilt,
+            pan: [self.pan[0], -self.pan[1]],
+            center: Some([a[0], 2. * level - a[1], a[2]]),
+            ..self
+        }
+    }
+
     pub fn is_perspective(self) -> bool {
         self.fov > 0.
     }

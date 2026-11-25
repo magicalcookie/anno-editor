@@ -2,7 +2,6 @@
 // the game's widget templates, searched by name. A double-click adds one
 // where Add would; a drag drops it on the canvas (into the group there, its
 // pivot where it lands) or on a widget tree row.
-use super::GENERATED;
 use super::files::{Index, spaced};
 use super::hierarchy::{NewWidget, Place};
 use crate::editor::{Editor, empty_pane};
@@ -103,8 +102,11 @@ pub struct Group {
 /// name (its sliders share one): such a type is named after the word its
 /// templates share, Sliders (round 15: they all landed under Focusable
 /// widgets and there was no Sliders group).
-pub(super) fn group_templates(index: &Index) -> Vec<Option<Group>> {
-    use anno_formats::phx::{Guid, widget_type_info};
+pub(super) fn group_templates(
+    index: &Index,
+    sources: &anno_formats::phx::Sources,
+) -> Vec<Option<Group>> {
+    use anno_formats::phx::Guid;
     let by_file: std::collections::HashMap<&str, usize> = index
         .entries
         .iter()
@@ -115,7 +117,7 @@ pub(super) fn group_templates(index: &Index) -> Vec<Option<Group>> {
     let phoenix = |start: &str| {
         let mut at = start;
         for _ in 0..8 {
-            if let Some(t) = Guid::parse(at).and_then(widget_type_info) {
+            if let Some(t) = Guid::parse(at).and_then(|g| sources.widget_type(g)) {
                 return Some(t);
             }
             at = index
@@ -166,7 +168,7 @@ pub(super) fn group_templates(index: &Index) -> Vec<Option<Group>> {
                         .map_or_else(|| spaced(&t.name), |(_, label)| (*label).to_owned());
                     Some(Group {
                         name,
-                        tip: t.description,
+                        tip: t.description.clone(),
                     })
                 }
                 _ => {
@@ -396,7 +398,8 @@ impl super::UiEditor {
                     .example
                     .as_ref()
                     .context("No shipped screen shows this template to copy")?;
-                let asset = Asset::parse(self.install.read(&format!("{GENERATED}{file}"))?)?;
+                let path = format!("{}{file}", self.screens().generated);
+                let asset = Asset::parse(self.install.read(&path)?)?;
                 let copy = asset.widget_copy(&asset.widgets(), *w as usize)?;
                 self.add_copy(&copy, &widget_name(&entry.name), None, place)
             }
@@ -617,8 +620,20 @@ mod tests {
             widget_type: None,
             ..index.entries[0].clone()
         });
+        // An 1800 screen opened meanwhile leaves the groups as they were:
+        // 1800 ships no Phoenix sources, and while they were one table for
+        // the process its (none) replaced 117's, and AnnoButtonWT fell to
+        // Other templates.
+        if let Some(dir) = anno_formats::vfs::install_dir("ANNO1800_DIR") {
+            let families = crate::games::profile(anno_core::game::Game::Anno1800).archive_families;
+            let install =
+                std::sync::Arc::new(anno_formats::vfs::Install::open(dir, families).unwrap());
+            let path = "data/ui/studio/generated/00dba1a6-05b4-464d-94f7-2f2bfeda2609";
+            let shared = crate::ui::test_support::shared(&install);
+            crate::ui::UiEditor::load(shared, install, path).unwrap();
+        }
         // Grouped once it holds them all, as a loaded index is.
-        let index = Index::of(index.entries);
+        let index = Index::of(index.entries, ui.sources());
         let mut lib = Library::default();
         let all = lib.search("", &index);
         assert_eq!(
@@ -663,7 +678,7 @@ mod tests {
                 ..template.clone()
             });
         }
-        let index = Index::of(entries);
+        let index = Index::of(entries, ui.sources());
         assert_eq!(
             lib.search("slider", &index),
             [
@@ -685,7 +700,7 @@ mod tests {
         let Some(mut ui) = open(ICON_ROW) else {
             return;
         };
-        let index = Index::of(Vec::new());
+        let index = Index::of(Vec::new(), ui.sources());
         for kind in NewWidget::ALL {
             let before = ui.asset.widgets().len();
             let said = ui
@@ -734,9 +749,7 @@ mod tests {
         let widgets = ui.asset.widgets();
         let w = ui.nodes[added].widget;
         assert_eq!(
-            ui.asset
-                .container_template(&widgets[w])
-                .map(|r| r.id.to_string()),
+            widgets[w].container_template().map(|r| r.id.to_string()),
             Some(index.entries[0].file.clone())
         );
         assert_eq!(&*ui.nodes[added].name, "AnnoButtonWT");

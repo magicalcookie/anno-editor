@@ -12,12 +12,13 @@
 // in a plain group every anchor is the group's origin. The overlay draws the
 // parent's Size box with its nine anchor points, the pivot, and the
 // Position arrow between them.
+use super::layout::anchor_offset;
 use super::{
     UiEditor,
     scene::{Frame, apply, inverse},
 };
 use crate::editor::Editor;
-use anno_formats::phx::{Edit, Value, layout::anchor_offset};
+use anno_formats::phx::{Edit, Value};
 use anyhow::{Result, bail};
 use gpui_editor_kit::{
     field::{EditEvent, Filter, TextEdit, text_field},

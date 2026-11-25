@@ -4,9 +4,10 @@
 // the layout evaluates them like values a container passes in, so bindings,
 // label texts and clips react. "Fill sample data" picks a plausible value
 // per property from its type and name.
+use super::layout;
 use super::{UiEditor, default_text};
 use crate::editor::Editor;
-use anno_formats::phx::{Asset, DefaultValue, Guid, layout};
+use anno_formats::phx::{Asset, DefaultValue, EnumInfo, Guid, Sources};
 use anyhow::Result;
 use gpui_editor_kit::{
     field::{EditEvent, Filter, TextEdit, text_field},
@@ -33,7 +34,7 @@ pub struct Prop {
     pub kind: u32,
     pub default: DefaultValue,
     /// An enum input's EnumAsset: its values show and type as entry
-    /// names where the game ships them (`phx::enum_entry_name`).
+    /// names where the game ships them (`phx::Sources::enum_entry_name`).
     pub enum_asset: Option<Guid>,
 }
 
@@ -117,7 +118,7 @@ fn floats(v: &DefaultValue) -> Vec<f32> {
 }
 
 /// Text to edit a value as.
-fn edit_text(v: &DefaultValue, enum_asset: Option<Guid>) -> String {
+fn edit_text(sources: &Sources, v: &DefaultValue, enum_asset: Option<Guid>) -> String {
     match v {
         DefaultValue::Str(s) => s.clone(),
         DefaultValue::Bool(b) => (*b != 0).to_string(),
@@ -125,28 +126,28 @@ fn edit_text(v: &DefaultValue, enum_asset: Option<Guid>) -> String {
         // An enum entry by name (AlignmentX 1 is Center); the id when the
         // game ships no name for it.
         DefaultValue::U32(u) => enum_asset
-            .and_then(|g| anno_formats::phx::enum_entry_name(g, *u))
-            .or_else(|| anno_formats::phx::unique_entry_name(*u))
-            .unwrap_or_else(|| u.to_string()),
+            .and_then(|g| sources.enum_entry_name(g, *u))
+            .or_else(|| sources.unique_entry_name(*u))
+            .map_or_else(|| u.to_string(), str::to_owned),
         DefaultValue::F32(_) | DefaultValue::Vec(_) => floats(v)
             .iter()
             .map(|x| x.to_string())
             .collect::<Vec<_>>()
             .join(", "),
-        other => default_text(other),
+        other => default_text(sources, other),
     }
 }
 
 /// Parses `text` as a value of property kind `kind` (shape from `default`);
-/// an enum's entry also by its name, any case.
+/// an enum's entry also by its name, any case, given the enum.
 fn parse(
     kind: u32,
     default: &DefaultValue,
     text: &str,
-    enum_asset: Option<Guid>,
+    enum_info: Option<&EnumInfo>,
 ) -> Result<DefaultValue> {
     if kind == ENUM
-        && let Some(e) = enum_asset.and_then(anno_formats::phx::enum_info)
+        && let Some(e) = enum_info
     {
         let t = text.trim();
         if let Some(x) = e.entries.iter().find(|x| x.name.eq_ignore_ascii_case(t)) {
@@ -184,143 +185,54 @@ pub fn sample(p: &Prop) -> Option<DefaultValue> {
     sample_value(&p.name, p.kind, &p.default)
 }
 
-/// What game-object icon fields show with sample data: the gold coin.
-const SAMPLE_ICON: &str = "data/ui/2kimages/main/icons/icon_resource_money_4.png";
+type Samples = std::sync::Arc<dyn anno_core::ui::SampleData>;
 
-/// What the game's own assets put where layout only has sample data: the
-/// minimap ring's entries, from the `MinimapScene` and `GameSpeedFeature`
-/// assets in `assets.xml`. Read once per process (the sampler is a plain
-/// function the layout calls).
-struct SceneContent {
-    /// The ring list (`RadialButtonsBase`) item by item, in its groups'
-    /// order (the wheel group components on the list: DayAndNight,
-    /// GameSpeed, Controls, Lodes, Fertilities): icon path and badge text.
-    ring: Vec<(String, String)>,
-    /// `RadialMinimapData.MapsCount` / `LodesCount`: where the Lodes and
-    /// Fertilities groups begin.
-    controls: usize,
-    lodes: usize,
-    /// Where the fertilities begin in `ring`.
-    fertilities: usize,
+thread_local! {
+    /// What the game's own assets give the screen this thread lays out
+    /// (`Shared::sample`). The sampler is a plain function the layout
+    /// calls, so a layout hands it over on its thread (`with_sample`).
+    static SAMPLE: std::cell::RefCell<Sample> = std::cell::RefCell::new(Sample::default());
 }
 
-static SCENE_CONTENT: std::sync::OnceLock<Option<SceneContent>> = std::sync::OnceLock::new();
-
-/// Reads the scene content sample data draws from (see [`SceneContent`]);
-/// later calls do nothing.
-pub fn load_scene_content(install: &anno_formats::vfs::Install) {
-    SCENE_CONTENT.get_or_init(|| {
-        let xml = install.read(install.game().profile().assets_path).ok()?;
-        SceneContent::read(std::str::from_utf8(&xml).ok()?)
-    });
+/// What the sampler answers from on one thread: the game's own content,
+/// the image its icon fields show (`Screens::sample_icon`) and how many
+/// items its lists stamp.
+#[derive(Clone, Default)]
+pub(super) struct Sample {
+    pub data: Option<Samples>,
+    pub icon: Option<&'static str>,
+    pub list_items: usize,
 }
 
-impl SceneContent {
-    fn read(xml: &str) -> Option<SceneContent> {
-        // An asset's values run to `</Values>` (`</Asset>` also closes
-        // `<Asset>` list items inside, as in MinimapDotSortOrder).
-        let asset = |template: &str| {
-            let at = xml.find(&format!("<Template>{template}</Template>"))?;
-            let rest = &xml[at..];
-            Some(&rest[..rest.find("</Values>")?])
-        };
-        let inner = |chunk: &'_ str, tag: &str| -> Option<String> {
-            let open = format!("<{tag}>");
-            let at = chunk.find(&open)? + open.len();
-            let end = chunk[at..].find(&format!("</{tag}>"))?;
-            Some(chunk[at..at + end].to_owned())
-        };
-        // An Icon (or Fertility, Slot) asset's texture: its own
-        // IconFilename, where its Standard block names it.
-        let icon = |guid: &str| -> Option<String> {
-            let at = xml
-                .match_indices(&format!("<GUID>{guid}</GUID>"))
-                .map(|(at, _)| at)
-                .find(|&at| xml[..at].trim_end().ends_with("<Standard>"))?;
-            let rest = &xml[at..];
-            let values = &rest[..rest.find("</Values>")?];
-            inner(values, "IconFilename").map(|p| p.replace('\\', "/"))
-        };
-        let minimap = asset("MinimapScene")?;
-        let speeds = asset("GameSpeedFeature")?;
-        let button = |name: &str| {
-            let block = inner(minimap, name)?;
-            icon(&inner(&block, "Icon")?)
-        };
-        let listed = |block: &str, tag: &str| -> Vec<String> {
-            block
-                .split(&format!("<{tag}>"))
-                .skip(1)
-                .filter_map(|s| icon(&s[..s.find(&format!("</{tag}>"))?]))
-                .collect()
-        };
-        let none = String::new();
-        let mut ring: Vec<(String, String)> = Vec::new();
-        ring.extend(button("DayNight").map(|i| (i, none.clone())));
-        // The game lays the speeds and controls out clockwise in this order
-        // (the 2026-11-04 shots: fastest next to day and night, pause next
-        // to the notes button).
-        for speed in ["Fastest", "Fast", "Normal", "Paused"] {
-            let block = inner(speeds, speed)?;
-            ring.push((icon(&inner(&block, "Icon")?)?, none.clone()));
-        }
-        // CoopPing only shows in a co-op game.
-        let controls: Vec<String> = ["NotesTool", "QuickNavigation", "SwitchSession"]
-            .iter()
-            .filter_map(|b| button(b))
-            .collect();
-        let lodes = listed(&inner(&inner(minimap, "LodesPerRegion")?, "Roman")?, "Slot");
-        let fertilities = listed(&inner(minimap, "FertilityOrder")?, "GUID");
-        let (n_controls, n_lodes) = (controls.len(), lodes.len());
-        let first_fertility = ring.len() + n_controls + n_lodes;
-        ring.extend(controls.into_iter().map(|i| (i, none.clone())));
-        // A lode shows how many deposits are left.
-        ring.extend(lodes.into_iter().map(|i| (i, "5".to_owned())));
-        // An island has a handful: the ring's Fertilities group keeps room
-        // for 8 (its MinGroupItemCount).
-        ring.extend(fertilities.into_iter().take(8).map(|i| (i, none.clone())));
-        Some(SceneContent {
-            ring,
-            controls: n_controls,
-            lodes: n_lodes,
-            fertilities: first_fertility,
-        })
-    }
+impl Sample {
+    /// How many items a list shows with sample data. The game stamps its
+    /// one container child per element of its DataSource (0x30000001);
+    /// three show a list as a list without crowding the preview. A preview
+    /// choice, not game data.
+    pub(super) const LIST_ITEMS: usize = 3;
 
-    /// A sampled value the scene content answers: `item` is the list item
-    /// the path is under (see `layout::Parent::item`).
-    fn sample(&self, item: Option<(&str, usize)>, name: &str, last: &str) -> Option<DefaultValue> {
-        match item {
-            // How many items the list stamps (see `layout`'s sample count).
-            None if name.ends_with("minimapradialwheel.radialbuttonsbase#len") => {
-                Some(DefaultValue::S32(self.ring.len() as i32))
-            }
-            // Radial menus all name their list `RadialButtonsBase`; the
-            // minimap's is under `MinimapRadialWheel`.
-            Some((list, n)) if list.ends_with("MinimapRadialWheel.RadialButtonsBase") => {
-                let (icon, badge) = self.ring.get(n)?;
-                if last == "icon" {
-                    Some(DefaultValue::Str(icon.clone()))
-                } else if last == "text" && name.ends_with("textdata.text") {
-                    Some(DefaultValue::Str(badge.clone()))
-                } else if name.ends_with("states.context.index") {
-                    // Context 1 picks the sector style without a button
-                    // tile: fertilities are information, not buttons (they
-                    // float on the band in the 2026-11-04 shots).
-                    Some(DefaultValue::S32(i32::from(n >= self.fertilities)))
-                } else {
-                    None
-                }
-            }
-            None if name.ends_with("radialminimapdata.mapscount") => {
-                Some(DefaultValue::S32(self.controls as i32))
-            }
-            None if name.ends_with("radialminimapdata.lodescount") => {
-                Some(DefaultValue::S32(self.lodes as i32))
-            }
-            _ => None,
+    /// `shared`'s game's, with the content read from `install`.
+    pub(super) fn of(shared: &super::Shared, install: &anno_formats::vfs::Install) -> Sample {
+        Sample {
+            data: shared.sample(install).cloned(),
+            icon: shared.screens.sample_icon,
+            list_items: Sample::LIST_ITEMS,
         }
     }
+}
+
+/// Runs `f` (a layout) with `sample` as what the sampler answers from;
+/// the thread's previous one comes back after, so a nested layout of
+/// another install's screen can't leave its own behind.
+pub(super) fn with_sample<R>(sample: Sample, f: impl FnOnce() -> R) -> R {
+    struct Restore(Sample);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SAMPLE.set(std::mem::take(&mut self.0));
+        }
+    }
+    let _restore = Restore(SAMPLE.replace(sample));
+    f()
 }
 
 /// Flags that show a state the game turns on only when something happens:
@@ -470,16 +382,18 @@ fn flag_name(name: &str) -> &str {
 /// it off the UI thread; `stop` ends it early (a newer probe replaced it).
 pub fn probe_flags(
     install: &anno_formats::vfs::Install,
+    shared: &super::Shared,
     asset: &Asset,
     preview: &layout::Preview,
     shown: bool,
     stop: &std::sync::atomic::AtomicBool,
 ) -> Option<Vec<FlagEffect>> {
-    probe(install, asset, preview, shown, stop, true)
+    probe(install, shared, asset, preview, shown, stop, true)
 }
 
 fn probe(
     install: &anno_formats::vfs::Install,
+    shared: &super::Shared,
     asset: &Asset,
     preview: &layout::Preview,
     shown: bool,
@@ -489,6 +403,8 @@ fn probe(
     use rayon::prelude::*;
     use std::collections::HashMap;
     type Assets = HashMap<Guid, Option<std::sync::Arc<Asset>>>;
+    let sample = Sample::of(shared, install);
+    asset.use_palettes(&shared.palettes);
     // One layout with `flip` switched. `stale` instances read what changed
     // since the cache's last layout of this root; without them (and with a
     // generation of its own) the build starts over.
@@ -506,26 +422,31 @@ fn probe(
             preview: preview.clone(),
             shown,
             sample: Some(sample_value as layout::Sampler),
+            list_items: sample.list_items,
+            fields: Some(shared.screens.data_fields),
             sample_generation: generation,
             stale,
             record_reads: flip.is_none(),
             ..Default::default()
         };
-        let tree = layout::Tree::build_cached(
-            asset,
-            &mut |g| {
-                assets
-                    .entry(g)
-                    .or_insert_with(|| {
-                        super::scene::read_asset(install, g).map(std::sync::Arc::new)
-                    })
-                    .clone()
-            },
-            // Widths only need to agree between the runs compared.
-            &mut |_, text| Some(text.chars().count() as f32 * 9.),
-            &opts,
-            cache,
-        );
+        // Runs may go to other threads: each hands the sample over itself.
+        let tree = with_sample(sample.clone(), || {
+            layout::Tree::build_cached(
+                asset,
+                &mut |g| {
+                    assets
+                        .entry(g)
+                        .or_insert_with(|| {
+                            super::scene::read_asset(shared, install, g).map(std::sync::Arc::new)
+                        })
+                        .clone()
+                },
+                // Widths only need to agree between the runs compared.
+                &mut |_, text| Some(text.chars().count() as f32 * 9.),
+                &opts,
+                cache,
+            )
+        });
         let read = PROBE.take().map(|p| p.read).unwrap_or_default();
         (looks(&tree, asset), read, tree)
     };
@@ -840,8 +761,9 @@ pub fn set_game_flag(path: &str, on: Option<bool>) {
     data.generation += 1;
 }
 
-/// Held by tests that flip the game's real flags: the flags are one table
-/// for the process, and two such tests at once see each other's flips.
+/// Held by tests that flip the game's real flags, and by tests that lay a
+/// screen out twice and compare: the flags are one table for the process,
+/// and a flip from another test between two layouts changes the second.
 #[cfg(test)]
 pub(crate) static FLAG_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -879,9 +801,7 @@ fn sample_rules(
     // Game-object fields come as a path (`IconTextData.TextData.Text`):
     // prefixes and exact names are about the field, words anywhere.
     let last = n.rsplit('.').next().unwrap_or(&n);
-    if let Some(Some(content)) = SCENE_CONTENT.get()
-        && let Some(v) = content.sample(item, &n, last)
-    {
+    if let Some(v) = SAMPLE.with_borrow(|c| c.data.as_ref()?.sample(item, &n, last)) {
         return Some(v);
     }
     let starts = |words: &[&str]| words.iter().any(|w| last.starts_with(w));
@@ -927,9 +847,10 @@ fn sample_rules(
     };
     match kind {
         // How many entries a list shows: as many as sample lists stamp.
-        INT | UINT if last.ends_with("itemcount") => Some(DefaultValue::S32(
-            anno_formats::phx::layout::SAMPLE_LIST_ITEMS as i32,
-        )),
+        INT | UINT if last.ends_with("itemcount") => {
+            let items = SAMPLE.with_borrow(|c| c.list_items);
+            Some(DefaultValue::S32(items as i32))
+        }
         // A count of entries (`MapsCount`, `LodesCount`: where the minimap
         // ring's next group begins) is a few; a figure reads as 12.
         INT | UINT if last.ends_with("count") && floats(default).iter().all(|v| *v == 0.) => {
@@ -985,9 +906,9 @@ fn sample_rules(
         }
         // A game-object icon field (`Data.Icon`) names an image by path:
         // show a resource icon so icon slots are not empty.
-        STRING if *default == DefaultValue::None && last.contains("icon") => {
-            Some(DefaultValue::Str(SAMPLE_ICON.into()))
-        }
+        STRING if *default == DefaultValue::None && last.contains("icon") => SAMPLE
+            .with_borrow(|s| s.icon)
+            .map(|icon| DefaultValue::Str(icon.into())),
         // Image, sound and id strings name assets; text would break them.
         STRING
             if [
@@ -1095,14 +1016,19 @@ impl UiEditor {
         let keys = self.preview_instances(fi);
         let Some(shown) = self
             .preview_shown(fi, pi, &keys)
-            .map(|(v, _)| edit_text(&v, enum_asset))
+            .map(|(v, _)| edit_text(self.sources(), &v, enum_asset))
         else {
             return Ok(());
         };
         if edit.text == shown {
             return Ok(());
         }
-        match parse(kind, &default, &edit.text, enum_asset) {
+        match parse(
+            kind,
+            &default,
+            &edit.text,
+            enum_asset.and_then(|g| self.sources().enum_info(g)),
+        ) {
             Ok(v) => {
                 self.set_preview(fi, pi, Some(v));
                 Ok(())
@@ -1444,14 +1370,12 @@ impl Editor {
         probe.stop = Some(stop.clone());
         probe.running = true;
         let (install, asset) = (ui.install.clone(), ui.layout_root().clone());
+        let shared = ui.images.shared.clone();
         let (values, shown) = (ui.preview.values.clone(), ui.shown);
         cx.spawn(async move |this, cx| {
             let effects = cx
                 .background_executor()
-                .spawn(async move {
-                    load_scene_content(&install);
-                    probe_flags(&install, &asset, &values, shown, &stop)
-                })
+                .spawn(async move { probe_flags(&install, &shared, &asset, &values, shown, &stop) })
                 .await;
             this.update(cx, |this, cx| {
                 if let Some(ui) = &mut this.ui
@@ -1909,7 +1833,7 @@ impl Editor {
                         }))
                         .into_any_element()
                 } else {
-                    let text = edit_text(value, p.enum_asset);
+                    let text = edit_text(ui.sources(), value, p.enum_asset);
                     let editing = pv
                         .edit
                         .as_ref()
@@ -2005,7 +1929,8 @@ impl Editor {
 #[cfg(test)]
 mod tests {
     use super::{
-        BOOL, FLOAT, INT, Prop, SAMPLE_ICON, STRING, VEC2, edit_text, parse, sample, sample_value,
+        BOOL, FLOAT, INT, Prop, STRING, Sample, VEC2, edit_text, parse, sample, sample_value,
+        with_sample,
     };
     use crate::ui::UiEditor;
     use crate::ui::test_support::{BUTTON, ICON_ROW, install, key, open};
@@ -2088,6 +2013,9 @@ mod tests {
 
     #[test]
     fn rows_hold_still_while_flags_are_set_by_hand() {
+        let _flags = crate::ui::preview::FLAG_TESTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         use super::{FlagEffect, FlagProbe, live_rows, set_game_flag};
         let flag = |path: &str, shows: &[&str]| FlagEffect {
             path: path.into(),
@@ -2155,6 +2083,9 @@ mod tests {
 
     #[test]
     fn game_flags_set_by_hand_win_and_are_listed() {
+        let _flags = crate::ui::preview::FLAG_TESTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         use super::{game_data_generation, game_flags, set_game_flag};
         // Sampling lists the flag with what sample data says.
         let path = "GameFlagTest.Panel.IsPanelOpen";
@@ -2193,7 +2124,15 @@ mod tests {
             text("10")
         );
         assert_eq!(field("HUD_Island.Island_Name", STRING), text("Illiadunum"));
-        assert_eq!(field("Data.Icon", STRING), text(SAMPLE_ICON));
+        // Icons show the game's sample icon, and none for a game without.
+        let icon = Sample {
+            data: None,
+            icon: Some("data/ui/coin.png"),
+            ..Sample::default()
+        };
+        let shown = with_sample(icon, || field("Data.Icon", STRING));
+        assert_eq!(shown, text("data/ui/coin.png"));
+        assert_eq!(field("Data.Icon", STRING), None);
         assert_eq!(
             field("Content.IsVisible", BOOL),
             Some(DefaultValue::Bool(0))
@@ -2289,14 +2228,14 @@ mod tests {
             ui.take_keys(crate::ui::Keys::Canvas);
             assert!(ui.preview.edit.is_none());
         };
-        let shown = edit_text(&ui.preview.files[fi].props[pi].default, None);
+        let shown = edit_text(ui.sources(), &ui.preview.files[fi].props[pi].default, None);
         typed(&mut ui, &shown);
         assert_eq!(set(&ui), 0, "unchanged sets nothing");
         typed(&mut ui, "40");
         assert_eq!(set(&ui), 1);
         let p = &ui.preview.files[fi].props[pi];
         let v = ui.preview.values[&ui.preview.files[fi].guid][&p.uid].clone();
-        assert_eq!(edit_text(&v, None), "40");
+        assert_eq!(edit_text(ui.sources(), &v, None), "40");
         typed(&mut ui, "not a number");
         assert_eq!(set(&ui), 1);
         assert!(ui.message.as_ref().is_some_and(|m| m.1), "refused, said");
@@ -2402,11 +2341,15 @@ mod tests {
     #[test]
     fn enum_inputs_show_and_take_entry_names() {
         let Some(install) = install() else { return };
-        anno_formats::phx::register_sources(&install);
-        let layout = anno_formats::phx::enum_named("LayoutAlignment");
+        let sources =
+            anno_formats::phx::Sources::load(&install, &crate::ui::test_support::screens().sources);
+        let layout = sources.enum_named("LayoutAlignment");
         let begin = DefaultValue::U32(1403909053);
-        let enum_value = |text| parse(super::ENUM, &begin, text, layout);
-        assert_eq!(edit_text(&begin, layout), "Begin");
+        let enum_value = |text| {
+            let e = layout.and_then(|g| sources.enum_info(g));
+            parse(super::ENUM, &begin, text, e)
+        };
+        assert_eq!(edit_text(&sources, &begin, layout), "Begin");
         assert_eq!(enum_value("middle").unwrap(), DefaultValue::U32(1503000153));
         assert_eq!(
             enum_value("1378142755").unwrap(),
@@ -2415,9 +2358,9 @@ mod tests {
         let said = enum_value("sideways").unwrap_err().to_string();
         assert_eq!(said, "LayoutAlignment takes Inherited, Begin, Middle, End");
         // A small id needs its enum: AlignmentX's 1 is Center.
-        let x = anno_formats::phx::enum_named("AlignmentX");
-        assert_eq!(edit_text(&DefaultValue::U32(1), x), "Center");
-        assert_eq!(edit_text(&DefaultValue::U32(1), None), "1");
+        let x = sources.enum_named("AlignmentX");
+        assert_eq!(edit_text(&sources, &DefaultValue::U32(1), x), "Center");
+        assert_eq!(edit_text(&sources, &DefaultValue::U32(1), None), "1");
     }
 
     #[test]
@@ -2449,6 +2392,97 @@ mod tests {
 }
 
 #[cfg(test)]
+mod sample_tests {
+    use super::{INT, Sample, sample_value, with_sample};
+    use crate::games::GameExt;
+    use anno_core::game::Game;
+    use anno_core::ui::SampleData;
+    use anno_formats::phx::DefaultValue;
+    use std::sync::Arc;
+
+    const RING_LEN: &str = "MinimapRadialWheel.RadialButtonsBase#len";
+
+    fn ring_len() -> Option<DefaultValue> {
+        sample_value(RING_LEN, INT, &DefaultValue::None)
+    }
+
+    struct Ring(i32);
+
+    impl SampleData for Ring {
+        fn sample(&self, _: Option<(&str, usize)>, name: &str, _: &str) -> Option<DefaultValue> {
+            name.ends_with("radialbuttonsbase#len")
+                .then_some(DefaultValue::S32(self.0))
+        }
+    }
+
+    // The sample data is the install's, handed to the layout's thread for
+    // one layout: none before or after it, and an install without any
+    // (1800 read first) doesn't stop the next one's from showing.
+    #[test]
+    fn scene_content_does_not_stick_across_games() {
+        let without = ring_len();
+        assert_ne!(without, Some(DefaultValue::S32(3)));
+        let ring = |data| Sample {
+            data,
+            ..Sample::default()
+        };
+        let with = with_sample(ring(Some(Arc::new(Ring(3)))), || {
+            // A nested layout of a screen of an install without any.
+            assert_eq!(with_sample(ring(None), ring_len), without);
+            ring_len()
+        });
+        assert_eq!(with, Some(DefaultValue::S32(3)));
+        assert_eq!(ring_len(), without, "left behind on the thread");
+
+        let installs = [Game::Anno1800, Game::Anno117].map(|g| g.environment_dir());
+        let [Some(d1800), Some(d117)] = installs else {
+            eprintln!("skip the installed half: ANNO1800_DIR or ANNO117_DIR unset");
+            return;
+        };
+        let [i1800, i117] = [(Game::Anno1800, d1800), (Game::Anno117, d117)].map(|(g, d)| {
+            anno_formats::vfs::Install::open(d, g.profile().archive_families).unwrap()
+        });
+        let s1800 = crate::ui::test_support::shared(&i1800);
+        assert!(s1800.sample(&i1800).is_none());
+        let s117 = crate::ui::test_support::shared(&i117);
+        let ring = s117.sample(&i117).expect("117's minimap ring").clone();
+        assert_eq!(
+            with_sample(
+                Sample {
+                    data: Some(ring),
+                    ..Sample::default()
+                },
+                ring_len
+            ),
+            Some(DefaultValue::S32(18))
+        );
+    }
+
+    // 1800's assets hold no minimap ring: its preview says so where the
+    // switch is, and reads no assets for it.
+    #[test]
+    fn an_1800_preview_says_it_has_no_sample_data() {
+        let [s117, s1800] = [
+            &anno117::MODULE as &dyn anno_core::game::Module,
+            &anno1800::MODULE,
+        ]
+        .map(crate::ui::Shared::new);
+        assert!(s1800.screens.sample_data.is_none());
+        assert!(s1800.sample_note().contains("no screen content"));
+        assert!(!s117.sample_note().contains("no screen content"));
+        assert!(super::super::NO_SAMPLE_CONTENT.contains("no screen content"));
+        if let Some(dir) = Game::Anno1800.environment_dir() {
+            let families = crate::games::profile(anno_core::game::Game::Anno1800).archive_families;
+            let install = anno_formats::vfs::Install::open(dir, families).unwrap();
+            let t = std::time::Instant::now();
+            assert!(s1800.sample(&install).is_none());
+            // Reading 1800's assets takes seconds; saying none takes none.
+            assert!(t.elapsed() < std::time::Duration::from_millis(100));
+        }
+    }
+}
+
+#[cfg(test)]
 mod probe_tests {
     use super::{probe, probe_flags};
     use crate::ui::test_support::{install, open, path};
@@ -2458,8 +2492,11 @@ mod probe_tests {
     // a timing probe: PROBE_SCREENS picks the screens.
     #[test]
     fn incremental_probe_matches_full_layouts() {
+        // Flags the other tests flip (minimapscene's among them) would
+        // change one run's effects and not the other's.
+        let _flags = super::FLAG_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let Some(install) = install() else { return };
-        super::load_scene_content(&install);
+        let shared = crate::ui::test_support::shared(&install);
         let stop = std::sync::atomic::AtomicBool::new(false);
         let names = std::env::var("PROBE_SCREENS")
             .unwrap_or_else(|_| "questtrackerscene,minimapscene".into());
@@ -2470,6 +2507,7 @@ mod probe_tests {
                 let t = std::time::Instant::now();
                 let e = probe(
                     &install,
+                    &shared,
                     &asset,
                     &Default::default(),
                     true,
@@ -2517,7 +2555,15 @@ mod probe_tests {
         };
         let stop = std::sync::atomic::AtomicBool::new(false);
         let root = ui.layout_root();
-        let effects = probe_flags(&ui.install, root, &ui.preview.values, ui.shown, &stop).unwrap();
+        let effects = probe_flags(
+            &ui.install,
+            &ui.images.shared,
+            root,
+            &ui.preview.values,
+            ui.shown,
+            &stop,
+        )
+        .unwrap();
         let live: Vec<_> = effects.iter().filter(|e| e.any()).collect();
         assert!(!live.is_empty());
         for e in live {

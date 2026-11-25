@@ -5,25 +5,26 @@
 // sea only at those pads. Records are copied from the province's shipped
 // islands, since a new island has none to copy from; the same library
 // carries the River and Lake records the River tool copies.
+use super::doc::Doc;
+use anno_core::game::{IslandRules, Module};
+use anno_core::harbour::Piece;
+pub use anno_core::harbour::{BASE, CONSTRUCTION, Library, Resource, template_of};
+use anno_core::island::objects::{Object, Objects, PathPoint, Template};
 use anno_formats::{
-    a7minfo::{A7mInfo, RandomSlotGroup, RandomSlotObject, Slots, TypedSlotGroup, TypedSlotObject},
+    a7m::{
+        a7minfo::{RandomSlotGroup, RandomSlotObject},
+        grids::{Kind, Layer},
+    },
     adf::Adf,
     assets::Assets,
-    game::Game,
-    grids::Layer,
-    objects::{Object, Objects, PathPoint, Template},
     rda::Archive,
     vfs::Install,
 };
-use anyhow::{Context, Result};
+use anyhow::Result;
 use gpui_editor_kit::heightfield::Heightfield;
 use std::collections::{HashMap, VecDeque};
 use std::ops::Range;
 
-/// `AreaIDs` keys every shipped pool island uses: the construction area
-/// players build in, and the base area (cliffs, rims, nearby sea).
-pub const CONSTRUCTION: u32 = 0x2001;
-pub const BASE: u32 = 0x0001;
 /// Shipped pads reach 27–31 m from their curve into the sea.
 const PAD_RADIUS: f32 = 29.;
 /// Base-area band between construction land and sea outside the pads, in
@@ -34,395 +35,31 @@ const COAST_LENGTH: f32 = 48.;
 const COAST_STEP: f32 = 10.;
 /// Shipped curves sit on the waterline.
 const COAST_HEIGHT: [f32; 2] = [0.2, 0.8];
-/// Slots stand about 3 m from their work area.
-const WORK_AREA_OFFSET: f32 = 3.;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Piece {
-    Coast,
-    StartCoast,
-    Marker,
-    /// Random slot: the map generator makes some of them mines.
-    MineSlot,
-    /// `ActivateAll`: always a mine.
-    FixedMineSlot,
-    MineWorkArea,
-    ClaySlot,
-    OilSlot,
-    GasSlot,
-    NewWorldMineSlot,
-    NewWorldMineWorkArea,
-    RiverSlot,
-    FixedRiverSlot,
-    RiverWorkArea,
-    /// Celtic marsh drainage slot (5282, template `Slot_Marsh`): no work
-    /// area, no fixed variant, no generator slot count.
-    MarshSlot,
-    /// River and lake EditorObjects (`River` 1001608, `Lake` 1001607), for
-    /// their water look components.
-    River,
-    Lake,
-}
-
-impl Piece {
-    const ALL: [Piece; 17] = [
-        Piece::Coast,
-        Piece::StartCoast,
-        Piece::Marker,
-        Piece::MineSlot,
-        Piece::FixedMineSlot,
-        Piece::MineWorkArea,
-        Piece::ClaySlot,
-        Piece::OilSlot,
-        Piece::GasSlot,
-        Piece::NewWorldMineSlot,
-        Piece::NewWorldMineWorkArea,
-        Piece::RiverSlot,
-        Piece::FixedRiverSlot,
-        Piece::RiverWorkArea,
-        Piece::MarshSlot,
-        Piece::River,
-        Piece::Lake,
-    ];
-
-    /// Slots and harbours copy only pool islands, where the map generator
-    /// uses them. Rivers and lakes are just water, and celtic pool islands
-    /// have none, so any island of the province will do.
-    fn pool_only(self) -> bool {
-        !matches!(self, Piece::River | Piece::Lake)
-    }
-
-    /// Which asset plays this part, by template and internal name.
-    fn matches(self, template: &str, name: &str) -> bool {
-        match self {
-            Piece::Coast => template == "Coastline" && name == "Coastline",
-            Piece::StartCoast => template == "Coastline" && name.contains("StartCoast"),
-            Piece::Marker => template == "PositionMarker" && name.contains("Player Islands"),
-            Piece::MineSlot => {
-                template == "Slot"
-                    && ((name.contains("Mountain") && !name.contains("Fixed"))
-                        || name == "random slot mining"
-                        || name == "random slot mining arctic")
-            }
-            Piece::FixedMineSlot => {
-                template == "Slot"
-                    && ((name.contains("Mountain") && name.contains("Fixed"))
-                        || name.contains("(Coal Mine Slot)"))
-            }
-            Piece::MineWorkArea => {
-                template == "WorkAreaSlot"
-                    && name.to_ascii_lowercase().contains("mountain")
-                    && !name.contains("season4")
-            }
-            Piece::ClaySlot => template == "Slot" && name == "random slot clay",
-            Piece::OilSlot => template == "Slot" && name == "random slot oil pump",
-            Piece::GasSlot => template == "Slot" && name == "random slot gas arctic",
-            Piece::NewWorldMineSlot => {
-                template == "Slot" && name == "season4 random mining slot colony01"
-            }
-            Piece::NewWorldMineWorkArea => {
-                template == "WorkAreaSlot" && name == "season4 slot mining workarea mountain"
-            }
-            Piece::RiverSlot => {
-                template == "Slot"
-                    && ((name.contains("River") && !name.contains("Fixed"))
-                        || name == "random slot river")
-            }
-            Piece::FixedRiverSlot => {
-                template == "Slot" && name.contains("River") && name.contains("Fixed")
-            }
-            Piece::RiverWorkArea => {
-                (template == "WorkAreaSlot" && name.contains("River"))
-                    || template == "WorkAreaRiverSlot"
-            }
-            Piece::MarshSlot => template == "Slot_Marsh",
-            Piece::River => template == "River",
-            Piece::Lake => template == "Lake",
-        }
-    }
-}
-
-/// What the slot tool places: a slot and, for mines and rivers, its work
-/// area.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Resource {
-    Mine,
-    Clay,
-    Oil,
-    Gas,
-    NewWorldMine,
-    River,
-    /// Celtic only: no Roman island ships one, so the Roman library has no
-    /// record and the option bar hides it.
-    Marsh,
-}
-
-impl Resource {
-    pub const ALL: [(Resource, &'static str); 7] = [
-        (Resource::Mine, "Mine"),
-        (Resource::Clay, "Clay"),
-        (Resource::Oil, "Oil"),
-        (Resource::Gas, "Gas"),
-        (Resource::NewWorldMine, "DLC mine"),
-        (Resource::River, "River"),
-        (Resource::Marsh, "Marsh"),
-    ];
-
-    /// Slot and work area pieces; `fixed` slots are always active. Marsh
-    /// slots have neither a fixed variant nor a work area.
-    pub fn pieces(self, fixed: bool) -> (Piece, Option<Piece>) {
-        match (self, fixed) {
-            (Resource::Mine, false) => (Piece::MineSlot, Some(Piece::MineWorkArea)),
-            (Resource::Mine, true) => (Piece::FixedMineSlot, Some(Piece::MineWorkArea)),
-            (Resource::Clay, _) => (Piece::ClaySlot, None),
-            (Resource::Oil, _) => (Piece::OilSlot, None),
-            (Resource::Gas, _) => (Piece::GasSlot, Some(Piece::MineWorkArea)),
-            (Resource::NewWorldMine, _) => {
-                (Piece::NewWorldMineSlot, Some(Piece::NewWorldMineWorkArea))
-            }
-            (Resource::River, false) => (Piece::RiverSlot, Some(Piece::RiverWorkArea)),
-            (Resource::River, true) => (Piece::FixedRiverSlot, Some(Piece::RiverWorkArea)),
-            (Resource::Marsh, _) => (Piece::MarshSlot, None),
-        }
-    }
-
-    pub fn has_fixed(self) -> bool {
-        matches!(self, Resource::Mine | Resource::River)
-    }
-
-    /// `Fertility/NeedsSlot` of the deposits this slot kind serves.
-    pub fn slot_type(self) -> &'static str {
-        match self {
-            Resource::Mine => "Mountain",
-            Resource::Clay => "Clay",
-            Resource::Oil => "Oil",
-            Resource::Gas => "Gas",
-            Resource::NewWorldMine => "Mountain",
-            Resource::River => "River",
-            Resource::Marsh => "Marsh",
-        }
-    }
-}
-
-/// The pieces a region's library needs before it stops reading islands.
-/// 117 reads until it has every piece.
-fn required_pieces(game: Game, region: &str) -> &'static [Piece] {
-    match (game, region) {
-        (Game::Anno117, _) => &Piece::ALL,
-        (Game::Anno1800, "Moderate") => &[
-            Piece::Coast,
-            Piece::MineSlot,
-            Piece::MineWorkArea,
-            Piece::ClaySlot,
-            Piece::OilSlot,
-            Piece::River,
-            Piece::Lake,
-        ],
-        (Game::Anno1800, "Colony01") => &[
-            Piece::Coast,
-            Piece::MineSlot,
-            Piece::MineWorkArea,
-            Piece::ClaySlot,
-            Piece::OilSlot,
-            Piece::NewWorldMineSlot,
-            Piece::NewWorldMineWorkArea,
-            Piece::River,
-            Piece::Lake,
-        ],
-        (Game::Anno1800, "Arctic") => &[
-            Piece::Coast,
-            Piece::MineSlot,
-            Piece::MineWorkArea,
-            Piece::GasSlot,
-        ],
-        (Game::Anno1800, "Africa") => &[
-            Piece::Coast,
-            Piece::RiverSlot,
-            Piece::RiverWorkArea,
-            Piece::River,
-            Piece::Lake,
-        ],
-        (Game::Anno1800, _) => &[Piece::Coast],
-    }
-}
-
-/// Template records for each piece, from the province's shipped islands.
-pub struct Library {
-    templates: HashMap<Piece, Template>,
-    slot_kinds: HashMap<u32, u16>,
-}
-
-impl Library {
-    /// Reads the region's islands, pool islands first, until every piece
-    /// has a record. Only `gamedata.data` is decoded, ~50 ms per island.
-    pub fn load(install: &Install, assets: &Assets, region: &str) -> Result<Library> {
-        let mut paths: Vec<String> = install
-            .search(".a7m", 10_000)
-            .into_iter()
-            .map(|id| install.file_path(id).to_owned())
-            .filter(|p| p.ends_with(".a7m") && install.game().island_region(p) == region)
-            .collect();
-        // Large islands carry the start coast; try them first.
-        paths.sort_by_key(|p| {
-            (
-                !p.contains("/pool/"),
-                !(p.contains("large") || p.contains("_l_")),
-            )
-        });
-        let required = required_pieces(install.game(), region);
-        let mut templates = HashMap::new();
-        let mut slot_kinds = HashMap::new();
-        for path in paths {
-            if let Ok(info) = install.read(&format!("{path}info"))
-                && let Ok(info) = A7mInfo::parse(&info)
-                && let Slots::Typed(groups) = info.slots
-            {
-                for group in groups {
-                    for object in group.objects {
-                        slot_kinds.insert(object.guid, group.kind);
-                    }
-                }
-            }
-            let pool = path.contains("/pool/");
-            if !pool
-                && Piece::ALL
-                    .iter()
-                    .all(|p| p.pool_only() || templates.contains_key(p))
-            {
-                break;
-            }
-            let read = || -> Result<Objects> {
-                let archive = Archive::from_bytes(install.read(&path)?, &path)?;
-                let gamedata = Adf::decode(&archive.read_path("gamedata.data")?)?;
-                Objects::read(&gamedata).with_context(|| format!("{path}: objects"))
-            };
-            // One island the parser cannot read (a new DLC's records) must
-            // not take the whole tool down; the ensure below still fails
-            // loud when nothing usable was found.
-            let store = match read() {
-                Ok(store) => store,
-                Err(e) => {
-                    eprintln!("harbour records: skipping {e:#}");
-                    continue;
-                }
-            };
-            for (i, o) in store.objects.iter().enumerate() {
-                let Some(asset) = assets.get(o.guid) else {
-                    continue;
-                };
-                let template = template_of(assets, o.guid);
-                for piece in Piece::ALL {
-                    if region != "Colony01"
-                        && matches!(piece, Piece::NewWorldMineSlot | Piece::NewWorldMineWorkArea)
-                    {
-                        continue;
-                    }
-                    if !templates.contains_key(&piece)
-                        && (pool || !piece.pool_only())
-                        && piece.matches(&template, &asset.name)
-                    {
-                        templates.insert(piece, store.template(i));
-                    }
-                }
-            }
-            if required.iter().all(|p| templates.contains_key(p)) {
-                break;
-            }
-        }
-        anyhow::ensure!(
-            templates.contains_key(&Piece::Coast),
-            "no shipped {region} island has a coastline to copy"
-        );
-        // 1800 uses the same coastline asset for regular and starter coasts,
-        // which is why its regions do not require a start coast.
-        if !required.contains(&Piece::StartCoast)
-            && let Some(coast) = templates.get(&Piece::Coast).cloned()
-        {
-            templates.entry(Piece::StartCoast).or_insert(coast);
-        }
-        Ok(Library {
-            templates,
-            slot_kinds,
-        })
-    }
-
-    pub fn typed_slots(&self, objects: &[Object]) -> Vec<TypedSlotGroup> {
-        let mut groups = std::collections::BTreeMap::<u16, Vec<TypedSlotObject>>::new();
-        for o in objects {
-            if let Some(&kind) = self.slot_kinds.get(&o.guid) {
-                groups.entry(kind).or_default().push(TypedSlotObject {
-                    guid: o.guid,
-                    object: RandomSlotObject {
-                        object_id: o.id,
-                        position: o.position,
-                    },
-                });
-            }
-        }
-        groups
-            .into_iter()
-            .map(|(kind, objects)| TypedSlotGroup { kind, objects })
-            .collect()
-    }
-
-    pub fn guid(&self, piece: Piece) -> Option<u32> {
-        self.templates.get(&piece).map(|t| t.object.guid)
-    }
-
-    /// Whether `guid` is one of the slot assets the library places.
-    pub fn is_slot(&self, guid: u32) -> bool {
-        self.resource_of(guid).is_some()
-    }
-
-    /// Which kind of slot `guid` is, random or fixed.
-    pub fn resource_of(&self, guid: u32) -> Option<Resource> {
-        Resource::ALL.into_iter().map(|(r, _)| r).find(|r| {
-            [r.pieces(false).0, r.pieces(true).0]
-                .iter()
-                .any(|&p| self.guid(p) == Some(guid))
-        })
-    }
-
-    /// A new object of `piece` at `position`, in the area the grid says.
-    pub fn place(
-        &self,
-        store: &Objects,
-        piece: Piece,
-        areas: Option<&Layer>,
-        position: [f32; 3],
-    ) -> Option<Object> {
-        let t = self.templates.get(&piece)?;
-        let area = areas
-            .and_then(|a| {
-                a.cell_at(position[0], position[2])
-                    .map(|(x, y)| a.get(x, y))
-            })
-            .filter(|&a| a == CONSTRUCTION || a == BASE)
-            .unwrap_or(BASE) as u16;
-        Some(store.add_template(t, area, position))
-    }
-}
 
 /// Shipped records for `guids`, from the first island of any province that
 /// has each. For objects whose record carries nothing regional (sound spots,
 /// build blockers): large pool islands first, where most of them are, so a
 /// handful of islands are read (~50 ms each). Missing GUIDs are left out.
-pub fn find_records(install: &Install, guids: &[u32]) -> Result<HashMap<u32, Template>> {
+pub fn find_records(
+    rules: &IslandRules,
+    install: &Install,
+    guids: &[u32],
+) -> Result<HashMap<u32, Template>> {
     let mut paths: Vec<String> = install
         .search(".a7m", 10_000)
         .into_iter()
         .map(|id| install.file_path(id).to_owned())
         .filter(|p| p.ends_with(".a7m") && p.contains("/islands/"))
         .collect();
-    paths.sort_by_key(|p| (!p.contains("/pool/"), !p.contains("large"), p.clone()));
+    paths.sort_by_key(|p| (!rules.is_pool(p), !rules.is_large(p), p.clone()));
     let mut found: HashMap<u32, Template> = HashMap::new();
     for path in paths {
         if guids.iter().all(|g| found.contains_key(g)) {
             break;
         }
         let read = || -> Result<Objects> {
-            let archive = Archive::from_bytes(install.read(&path)?, &path)?;
-            Objects::read(&Adf::decode(&archive.read_path("gamedata.data")?)?)
+            let archive = Archive::parse(install.read(&path)?, &path)?;
+            Objects::read(&Adf::parse(&archive.read_path("gamedata.data")?)?)
         };
         let Ok(store) = read() else { continue };
         for (i, o) in store.objects.iter().enumerate() {
@@ -440,27 +77,12 @@ pub fn find_records(install: &Install, guids: &[u32]) -> Result<HashMap<u32, Tem
     Ok(found)
 }
 
-/// Template of an asset, following `BaseAssetGUID` for derived ones such as
-/// "Fixed Slot Roman Mountain".
-/// Which piece an object of `guid` plays, by its asset's template and
-/// name: how the island converter recognises slots, coasts and water on an
-/// island of the other game.
-pub fn piece_of(assets: &Assets, guid: u32) -> Option<Piece> {
+/// Which piece an object of `guid` plays on `module`'s islands, by its
+/// asset's template and name: how the island converter recognises slots,
+/// coasts and water on an island of the other game.
+pub fn piece_of(module: &dyn Module, assets: &Assets, guid: u32) -> Option<Piece> {
     let name = &assets.get(guid)?.name;
-    let template = template_of(assets, guid);
-    Piece::ALL.into_iter().find(|p| p.matches(&template, name))
-}
-
-pub fn template_of(assets: &Assets, guid: u32) -> String {
-    let mut at = assets.get(guid);
-    for _ in 0..8 {
-        let Some(a) = at else { break };
-        if !a.template.is_empty() {
-            return a.template.clone();
-        }
-        at = a.base.and_then(|b| assets.get(b));
-    }
-    String::new()
+    module.islands()?.piece_of(&template_of(assets, guid), name)
 }
 
 /// `.a7minfo` `RandomSlotObjects`: every slot object (template `Slot`,
@@ -694,11 +316,15 @@ fn snap_direction(x: f32, z: f32) -> [f32; 2] {
     [r(a.cos()), r(a.sin())]
 }
 
-/// An axis-aligned region of the island, in metres.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// A region of the island to auto-place in, in metres: a dragged
+/// rectangle, or a lasso outline traced along a ridge or a river bank.
+#[derive(Clone, Debug, PartialEq)]
 pub struct Region {
     pub min: [f32; 2],
     pub max: [f32; 2],
+    /// Lasso outline, closed back to its first point; `min`/`max` are its
+    /// bounds. `None` is the whole rectangle.
+    pub outline: Option<Vec<[f32; 2]>>,
 }
 
 impl Region {
@@ -706,21 +332,63 @@ impl Region {
         Region {
             min: [a[0].min(b[0]), a[1].min(b[1])],
             max: [a[0].max(b[0]), a[1].max(b[1])],
+            outline: None,
         }
     }
 
-    fn contains(&self, p: [f32; 2]) -> bool {
-        (self.min[0]..=self.max[0]).contains(&p[0]) && (self.min[1]..=self.max[1]).contains(&p[1])
+    /// The area inside a traced outline; `None` under three points, which
+    /// enclose nothing.
+    pub fn lasso(points: &[[f32; 2]]) -> Option<Region> {
+        if points.len() < 3 {
+            return None;
+        }
+        let mut min = [f32::MAX; 2];
+        let mut max = [f32::MIN; 2];
+        for p in points {
+            min = [min[0].min(p[0]), min[1].min(p[1])];
+            max = [max[0].max(p[0]), max[1].max(p[1])];
+        }
+        Some(Region {
+            min,
+            max,
+            outline: Some(points.to_vec()),
+        })
     }
 
-    /// Cell centres every `step` metres.
+    fn contains(&self, p: [f32; 2]) -> bool {
+        let in_box = (self.min[0]..=self.max[0]).contains(&p[0])
+            && (self.min[1]..=self.max[1]).contains(&p[1]);
+        in_box && self.outline.as_deref().is_none_or(|o| inside(o, p))
+    }
+
+    /// Cell centres every `step` metres inside the region.
     fn samples(&self, step: f32) -> impl Iterator<Item = [f32; 2]> + '_ {
         let nx = ((self.max[0] - self.min[0]) / step) as usize;
         let nz = ((self.max[1] - self.min[1]) / step) as usize;
-        (0..=nz).flat_map(move |j| {
-            (0..=nx).map(move |i| [self.min[0] + i as f32 * step, self.min[1] + j as f32 * step])
-        })
+        (0..=nz)
+            .flat_map(move |j| {
+                (0..=nx)
+                    .map(move |i| [self.min[0] + i as f32 * step, self.min[1] + j as f32 * step])
+            })
+            .filter(|&p| self.contains(p))
     }
+}
+
+/// Even-odd point in polygon; the outline closes itself. A lasso that
+/// crosses itself leaves its doubly-wrapped loops out, as paint programs do.
+fn inside(outline: &[[f32; 2]], p: [f32; 2]) -> bool {
+    let mut odd = false;
+    let mut j = outline.len() - 1;
+    for (i, a) in outline.iter().enumerate() {
+        let b = outline[j];
+        if (a[1] > p[1]) != (b[1] > p[1])
+            && p[0] < (b[0] - a[0]) * (p[1] - a[1]) / (b[1] - a[1]) + a[0]
+        {
+            odd = !odd;
+        }
+        j = i;
+    }
+    odd
 }
 
 /// Harbours must stand at least this far apart, centre to centre.
@@ -733,7 +401,7 @@ const HARBOUR_DEPTH: f32 = 2.;
 /// `existing` curves.
 pub fn auto_harbours(
     field: &Heightfield,
-    region: Region,
+    region: &Region,
     existing: &[&[PathPoint]],
     count: usize,
 ) -> Vec<Vec<PathPoint>> {
@@ -795,8 +463,126 @@ pub fn auto_harbours(
     out
 }
 
-/// Slots stand at least this far apart.
-const SLOT_GAP: f32 = 30.;
+/// How far apart auto placement keeps slots of `resource`. Shipped
+/// neighbours (both games' pool islands): mines 10–25 m apart (median
+/// about 20), 117 river slots 5–20 m, marsh slots 9–35 m.
+fn slot_gap(resource: Resource) -> f32 {
+    match resource {
+        Resource::Mine | Resource::NewWorldMine => 15.,
+        Resource::River => 12.,
+        Resource::Marsh => MARSH_GAP,
+        Resource::Clay | Resource::Oil | Resource::Gas => 30.,
+    }
+}
+
+/// Shipped mine slots stand at the foot of a slope: the ground 8 m on
+/// climbs 3–6 m (median 4.5) and falls at most 1–2 m behind.
+const MINE_RISE: [f32; 3] = [2.5, 4.5, 7.5];
+const MINE_DROP: f32 = 2.;
+/// Shipped river slots sit on the bank: river cells are 30–60% of the
+/// 13 × 13 m around them, one within 2 m.
+const RIVER_SHARE: [f32; 3] = [0.25, 0.45, 0.7];
+
+/// Height samples on 16 rays `reach` metres from `(x, z)`: the angle and
+/// height of the highest, and the lowest height.
+fn ring(field: &Heightfield, x: f32, z: f32, reach: f32) -> (f32, f32, f32) {
+    let mut top = (0., f32::MIN);
+    let mut low = f32::MAX;
+    for k in 0..16 {
+        let a = k as f32 / 16. * std::f32::consts::TAU;
+        let y = field.height([x + a.cos() * reach, z + a.sin() * reach]);
+        if y > top.1 {
+            top = (a, y);
+        }
+        low = low.min(y);
+    }
+    (top.0, top.1, low)
+}
+
+/// River cells among the 13 × 13 m around `(x, z)`: share, and the mean
+/// offset towards them.
+fn river_around(river: &Layer, x: f32, z: f32) -> (f32, [f32; 2]) {
+    let (mut n, mut sx, mut sz) = (0, 0., 0.);
+    for dz in -6..=6 {
+        for dx in -6..=6 {
+            let wet = river
+                .cell_at(x + dx as f32, z + dz as f32)
+                .is_some_and(|(i, j)| river.get(i, j) != 0);
+            if wet {
+                n += 1;
+                sx += dx as f32;
+                sz += dz as f32;
+            }
+        }
+    }
+    (n as f32 / 169., [sx, sz])
+}
+
+/// The yaw a slot of `resource` at `at` faces, as shipped ones do, snapped
+/// to `step`: mines face up the slope into the mountain; river slots stand
+/// with the river on their right (yaw 90° past it); marsh slots face the
+/// sea. `None` (clay, oil, gas, or nothing to face) keeps the record's.
+pub fn slot_yaw(
+    field: &Heightfield,
+    river: Option<&Layer>,
+    resource: Resource,
+    at: [f32; 2],
+    step: f32,
+) -> Option<f32> {
+    let [x, z] = at;
+    let yaw = match resource {
+        Resource::Mine | Resource::NewWorldMine => {
+            // Each of 16 rays 11.4 m out, where an 1800 mountain work area
+            // stands, pulls by the square of how far it climbs; falls
+            // don't pull. Against shipped mine slots this matches 87% in
+            // 1800 and 82% in 117. The highest ray 8 m out matched 63% and
+            // 58%: its 22.5° steps tie at 45° from a 90° snap and always
+            // rounded up, and a lone knoll outvoted the slope. A plain
+            // pull, falls and all, turned slots off a hill whenever the
+            // ground behind them fell to the sea.
+            const REACH: f32 = 11.4;
+            let h = field.height(at);
+            let (mut px, mut pz, mut top) = (0., 0., f32::MIN);
+            for k in 0..16 {
+                let a = k as f32 / 16. * std::f32::consts::TAU;
+                let rise = field.height([x + a.cos() * REACH, z + a.sin() * REACH]) - h;
+                top = top.max(rise);
+                let pull = rise.max(0.).powi(2);
+                px += a.cos() * pull;
+                pz += a.sin() * pull;
+            }
+            if top <= 0.5 {
+                return None;
+            }
+            pz.atan2(px)
+        }
+        Resource::River => {
+            let (share, [sx, sz]) = river_around(river?, x, z);
+            if share <= 0. || sx.hypot(sz) < 1e-3 {
+                return None;
+            }
+            sz.atan2(sx) + std::f32::consts::FRAC_PI_2
+        }
+        Resource::Marsh => {
+            let (mut sx, mut sz) = (0., 0.);
+            for reach in [4., 8., 16., 24.] {
+                for k in 0..16 {
+                    let a = k as f32 / 16. * std::f32::consts::TAU;
+                    if field.height([x + a.cos() * reach, z + a.sin() * reach]) <= 0. {
+                        sx += a.cos() / reach;
+                        sz += a.sin() / reach;
+                    }
+                }
+            }
+            if f32::hypot(sx, sz) < 1e-4 {
+                return None;
+            }
+            sz.atan2(sx)
+        }
+        Resource::Clay | Resource::Oil | Resource::Gas => return None,
+    };
+    Some(((yaw / step).round() * step).rem_euclid(std::f32::consts::TAU))
+}
 /// Shipped marsh slots (94 on 20 Celtic islands, `marsh_slots` example):
 /// 0.2–0.7 m above sea level, 2–57 m (median 8, 90% within 21) from open
 /// sea, never near rivers, 9 m apart at the closest tenth (median 31).
@@ -805,17 +591,18 @@ const MARSH_SEA_REACH: f32 = 24.;
 const MARSH_GAP: f32 = 20.;
 /// `EnvironmentGRid` value of the Marsh ambience; under 46% of shipped
 /// marsh slots (most of the rest sit on the default type 1).
-const MARSH_ENVIRONMENT: u32 = 7;
+pub const MARSH_ENVIRONMENT: u32 = 7;
 
-/// Up to `count` slot positions inside `region`: mines on high, steep
-/// ground; river slots on land next to river cells; marsh slots on flat
-/// ground just above sea level near the coast, Marsh ambience first. Keeps
-/// clear of `existing` slots and of each other.
+/// Up to `count` slot positions inside `region`: mines at the foot of a
+/// slope, where shipped ones stand; river slots on the bank; marsh slots on
+/// flat ground just above sea level near the coast, Marsh ambience first.
+/// Keeps clear of `existing` slots and of each other by the shipped
+/// spacing. `slot_yaw` turns each to face the way shipped ones do.
 pub fn auto_slots(
     field: &Heightfield,
     river: Option<&Layer>,
     environment: Option<&Layer>,
-    region: Region,
+    region: &Region,
     resource: Resource,
     existing: &[[f32; 2]],
     count: usize,
@@ -842,8 +629,9 @@ pub fn auto_slots(
                 })
             })
     };
+    // 2 m: a mine's foot or a river's edge is a few metres wide.
     let mut candidates: Vec<([f32; 3], f32)> = region
-        .samples(4.)
+        .samples(2.)
         .filter_map(|[x, z]| {
             let y = h(x, z);
             let slope = (h(x + 2., z) - h(x - 2., z)).hypot(h(x, z + 2.) - h(x, z - 2.)) / 4.;
@@ -866,15 +654,35 @@ pub fn auto_slots(
                         return None;
                     }
                     match resource {
-                        Resource::Mine | Resource::NewWorldMine => y + slope * 8.,
+                        Resource::Mine | Resource::NewWorldMine => {
+                            let (_, top, low) = ring(field, x, z, 8.);
+                            let (rise, drop) = (top - y, y - low);
+                            if !(MINE_RISE[0]..=MINE_RISE[2]).contains(&rise) || drop > MINE_DROP {
+                                return None;
+                            }
+                            // A mountain that goes on beyond 8 m, not a bump.
+                            let (_, far, _) = ring(field, x, z, 16.);
+                            -(rise - MINE_RISE[1]).abs() - drop + (far - top).clamp(0., 8.) * 0.25
+                        }
                         Resource::Clay | Resource::Oil | Resource::Gas => {
                             -slope * 20. + y.min(20.) * 0.1
                         }
                         Resource::River | Resource::Marsh => {
-                            match cells_near(river, x, z, &|v| v != 0) {
-                                0 => return None,
-                                n => n as f32 - slope * 4.,
+                            let (share, _) = river_around(river?, x, z);
+                            let near = (-2..=2).any(|dz| {
+                                (-2..=2).any(|dx| {
+                                    river
+                                        .and_then(|r| {
+                                            r.cell_at(x + dx as f32, z + dz as f32)
+                                                .map(|(i, j)| r.get(i, j))
+                                        })
+                                        .is_some_and(|v| v != 0)
+                                })
+                            });
+                            if !near || !(RIVER_SHARE[0]..=RIVER_SHARE[2]).contains(&share) {
+                                return None;
                             }
+                            -(share - RIVER_SHARE[1]).abs() * 10. - slope * 4.
                         }
                     }
                 }
@@ -883,11 +691,7 @@ pub fn auto_slots(
         })
         .collect();
     candidates.sort_by(|a, b| b.1.total_cmp(&a.1));
-    let gap = if resource == Resource::Marsh {
-        MARSH_GAP
-    } else {
-        SLOT_GAP
-    };
+    let gap = slot_gap(resource);
     let mut out: Vec<[f32; 3]> = Vec::new();
     for (p, _) in candidates {
         if out.len() >= count {
@@ -917,6 +721,34 @@ pub enum Interior<'a> {
     /// What the grid already says (hand-painted), land without an area
     /// becoming buildable.
     Keep,
+}
+
+/// Rederives `doc`'s `AreaIDs` from its `Water` grid and the curves of its
+/// objects of `coasts` (the coastline GUIDs): the coast and pads always,
+/// and with `from_slope` buildable land from the slope too, replacing what
+/// was painted. The land grids must already follow the heights.
+pub fn refresh_areas(doc: &mut Doc, coasts: &[u32], from_slope: bool) {
+    let paths: Vec<Vec<PathPoint>> = (doc.objects.iter())
+        .filter(|o| coasts.contains(&o.guid))
+        .filter_map(|o| o.path.clone())
+        .collect();
+    let Some(grids) = &mut doc.grids else {
+        return;
+    };
+    let grids = std::sync::Arc::make_mut(grids);
+    let Some(ground) = grids.layer(Kind::Water).cloned() else {
+        return;
+    };
+    let Some(areas) = grids.layer_mut(Kind::AreaIds) else {
+        return;
+    };
+    let refs: Vec<&[PathPoint]> = paths.iter().map(Vec::as_slice).collect();
+    let interior = if from_slope {
+        Interior::Slope(&doc.field)
+    } else {
+        Interior::Keep
+    };
+    derive_areas(&ground, areas, &refs, interior, None);
 }
 
 /// Rewrites `areas` from `ground` (the `Water` grid: island ground, 0 is
@@ -1113,50 +945,138 @@ fn segment_distance(p: [f32; 2], a: [f32; 3], b: [f32; 3]) -> f32 {
     (p[0] - ax - t * dx).hypot(p[1] - az - t * dz)
 }
 
-/// Points a placed work area at its slot. Shipped work areas carry a
-/// two-point path from themselves to the slot they serve (2–4.5 m), both
-/// points with tangents of a sixth of the span, and face roughly along it;
-/// a template copied from another island would still point at that
-/// island's slot.
-pub fn link_work_area(work: &mut Object, slot: [f32; 3]) {
-    let at = work.position;
-    let span: [f32; 3] = std::array::from_fn(|k| (at[k] - slot[k]) / 6.);
-    let point = |p| PathPoint {
-        p,
-        i: Some(span),
-        o: Some(span.map(|v| -v)),
-        ..Default::default()
-    };
-    work.path = Some(vec![point(at), point(slot)]);
-    work.set_direction(
-        (slot[2] - at[2])
-            .atan2(slot[0] - at[0])
-            .rem_euclid(std::f32::consts::TAU),
-    );
+/// How far a work area's path may end from the slot it serves. On shipped
+/// 1800 islands the end sits within 1 m of a slot; on 117 islands half the
+/// paths end on their slot and all but two of the rest within 9 m, as if
+/// the slot moved after the path was drawn (`slot_paths` example).
+const LINK_REACH: f32 = 10.;
+
+/// Which end of a slot link an asset is: a resource slot, or the work area
+/// whose `BezierPath` runs to it. Slots carry no path of their own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinkEnd {
+    Slot,
+    WorkArea,
 }
 
-/// Where a slot's work area goes: a few metres downhill from it.
-pub fn work_area_position(field: &Heightfield, at: [f32; 3]) -> [f32; 3] {
-    let h = |x: f32, z: f32| field.height([x, z]);
-    let (gx, gz) = (
-        h(at[0] + 1., at[2]) - h(at[0] - 1., at[2]),
-        h(at[0], at[2] + 1.) - h(at[0], at[2] - 1.),
-    );
-    let l = gx.hypot(gz);
-    let (dx, dz) = if l < 1e-3 {
-        (1., 0.)
-    } else {
-        (-gx / l, -gz / l)
+pub fn link_end(assets: &Assets, guid: u32) -> Option<LinkEnd> {
+    match template_of(assets, guid).as_str() {
+        "Slot" => Some(LinkEnd::Slot),
+        "WorkAreaSlot" | "WorkAreaRiverSlot" => Some(LinkEnd::WorkArea),
+        _ => None,
+    }
+}
+
+/// A work area and the slot its path runs to, as they stood before an edit.
+pub struct Link {
+    pub work: u64,
+    pub slot: u64,
+    work_at: [f32; 3],
+    path: Vec<PathPoint>,
+}
+
+/// The links touching an object `touches` accepts. A work area belongs to
+/// the slot nearest its path's last point, within `LINK_REACH`.
+pub fn links(
+    objects: &[Object],
+    end: impl Fn(u32) -> Option<LinkEnd>,
+    touches: impl Fn(u64) -> bool,
+) -> Vec<Link> {
+    let ends: Vec<(&Object, LinkEnd)> = objects
+        .iter()
+        .filter_map(|o| Some((o, end(o.guid)?)))
+        .collect();
+    let slots = || {
+        ends.iter()
+            .filter(|(_, e)| *e == LinkEnd::Slot)
+            .map(|(o, _)| o)
     };
-    let (x, z) = (at[0] + dx * WORK_AREA_OFFSET, at[2] + dz * WORK_AREA_OFFSET);
-    [x, h(x, z), z]
+    let ground = |a: [f32; 3], b: [f32; 3]| (a[0] - b[0]).hypot(a[2] - b[2]);
+    ends.iter()
+        .filter(|(_, e)| *e == LinkEnd::WorkArea)
+        .filter_map(|(work, _)| {
+            let last = work.path.as_deref()?.last()?.p;
+            let slot = slots()
+                .map(|s| (s, ground(s.position, last)))
+                .filter(|&(_, d)| d <= LINK_REACH)
+                .min_by(|a, b| a.1.total_cmp(&b.1))?
+                .0;
+            (touches(work.id) || touches(slot.id)).then(|| Link {
+                work: work.id,
+                slot: slot.id,
+                work_at: work.position,
+                path: work.path.clone().unwrap_or_default(),
+            })
+        })
+        .collect()
+}
+
+impl Link {
+    /// The path redrawn from where the work area is now to where the slot
+    /// is now, or None when neither moved. Each point moves by a blend of
+    /// the two ends' moves, by its share of the path's ground length, so a
+    /// winding 1800 road keeps its shape. The end lands on the slot even
+    /// when it started a few metres off. Two-point paths get the shipped
+    /// tangents again (`link_work_area`); longer ones keep theirs.
+    pub fn follow(&self, work_at: [f32; 3], slot_at: [f32; 3]) -> Option<Vec<PathPoint>> {
+        let last = self.path.last()?.p;
+        let start: [f32; 3] = std::array::from_fn(|k| work_at[k] - self.work_at[k]);
+        let end: [f32; 3] = std::array::from_fn(|k| slot_at[k] - last[k]);
+        if start.iter().chain(&end).all(|v| v.abs() < 1e-4) {
+            return None;
+        }
+        let mut along = Vec::with_capacity(self.path.len());
+        let mut total = 0.;
+        for (k, p) in self.path.iter().enumerate() {
+            if k > 0 {
+                let q = self.path[k - 1].p;
+                total += (p.p[0] - q[0]).hypot(p.p[2] - q[2]);
+            }
+            along.push(total);
+        }
+        let n = self.path.len();
+        let mut path = self.path.clone();
+        for (k, p) in path.iter_mut().enumerate() {
+            let t = if total > 1e-4 {
+                along[k] / total
+            } else if n > 1 {
+                k as f32 / (n - 1) as f32
+            } else {
+                1.
+            };
+            p.p = std::array::from_fn(|x| p.p[x] + start[x] * (1. - t) + end[x] * t);
+        }
+        if n == 2 {
+            let span: [f32; 3] = std::array::from_fn(|k| (path[0].p[k] - path[1].p[k]) / 6.);
+            for p in &mut path {
+                p.i = Some(span);
+                p.o = Some(span.map(|v| -v));
+            }
+        }
+        Some(path)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::island::test_support::{assets, install, install_1800};
+    use anno_core::game::Game;
     use gpui_editor_kit::heightfield::Grid;
+
+    // A game the registry doesn't know names its own pieces: its survey
+    // marker is the islands' marker, which 117's names (a PositionMarker
+    // of "Player Islands") never call it.
+    #[test]
+    fn a_skeleton_asset_plays_the_piece_its_own_game_names() {
+        use crate::games::fixtures::{SKELETON, SKELETON_FILES, install};
+        let dir = tempfile::tempdir().unwrap();
+        let install = install(dir.path(), SKELETON_FILES);
+        let assets = crate::games::assets(&SKELETON, &install).unwrap();
+        assert_eq!(piece_of(&SKELETON, &assets, 910_003), Some(Piece::Marker));
+        assert_eq!(piece_of(&SKELETON, &assets, 910_001), None);
+        assert_eq!(piece_of(&anno117::MODULE, &assets, 910_003), None);
+    }
 
     /// A round island of radius 40 m in a 128 m square, 0.5 m samples.
     fn round_island() -> Heightfield {
@@ -1285,7 +1205,7 @@ mod tests {
     fn auto_harbours_stay_apart_inside_the_region() {
         let field = round_island();
         let all = Region::spanning([0., 0.], [128., 128.]);
-        let curves = auto_harbours(&field, all, &[], 10);
+        let curves = auto_harbours(&field, &all, &[], 10);
         assert!(
             curves.len() >= 2 && curves.len() < 10,
             "{} harbours",
@@ -1311,34 +1231,135 @@ mod tests {
         }
         // Only the top half: every harbour there, none below.
         let top = Region::spanning([0., 0.], [128., 50.]);
-        let some = auto_harbours(&field, top, &[], 4);
+        let some = auto_harbours(&field, &top, &[], 4);
         assert!(!some.is_empty());
         assert!(some.iter().all(|c| mid(c)[2] <= 50.));
         // Existing harbours are kept clear of.
-        let again = auto_harbours(&field, top, &[&some[0]], 4);
+        let again = auto_harbours(&field, &top, &[&some[0]], 4);
         assert!(again.iter().all(|c| {
             (mid(c)[0] - mid(&some[0])[0]).hypot(mid(c)[2] - mid(&some[0])[2]) >= HARBOUR_GAP / 2.
         }));
     }
 
+    /// A round island like `round_island`, flat at 3 m out to 40 m with
+    /// a steep mountain inside 20 m: the foot shipped mines stand on.
+    fn mountain_island() -> Heightfield {
+        let mut field = round_island();
+        let grid = field.grid;
+        for z in 0..grid.depth {
+            for x in 0..grid.width {
+                let [wx, wz] = grid.world(x, z);
+                let r = (wx - 64.).hypot(wz - 64.);
+                if r < 40. {
+                    field.heights[z * grid.width + x] = 3. + ((20. - r) * 0.8).max(0.);
+                }
+            }
+        }
+        field
+    }
+
     #[test]
-    fn auto_mines_take_the_high_ground() {
-        let field = hilly_island();
+    fn auto_mines_stand_at_the_foot_facing_the_mountain() {
+        let field = mountain_island();
         let all = Region::spanning([0., 0.], [128., 128.]);
-        let mines = auto_slots(&field, None, None, all, Resource::Mine, &[], 3);
-        assert_eq!(mines.len(), 3);
+        let mines = auto_slots(&field, None, None, &all, Resource::Mine, &[], 4);
+        assert_eq!(mines.len(), 4);
         for m in &mines {
-            assert!(m[1] > 5., "mine at height {}", m[1]);
+            let r = (m[0] - 64.).hypot(m[2] - 64.);
+            assert!((18. ..=28.).contains(&r), "mine {r:.1} m from the peak");
+            // Facing the peak, to the 45° step.
+            let yaw = slot_yaw(
+                &field,
+                None,
+                Resource::Mine,
+                [m[0], m[2]],
+                crate::games::rules(Game::Anno117).slot_yaw_step,
+            )
+            .unwrap();
+            let to_peak = (64. - m[2]).atan2(64. - m[0]);
+            let off = (yaw - to_peak).rem_euclid(std::f32::consts::TAU);
+            let off = off.min(std::f32::consts::TAU - off);
+            assert!(off <= std::f32::consts::FRAC_PI_4, "yaw {off} off the peak");
+            assert_eq!(
+                (yaw / std::f32::consts::FRAC_PI_4).fract().abs() < 1e-4,
+                true
+            );
         }
         for (i, a) in mines.iter().enumerate() {
             for b in &mines[i + 1..] {
-                assert!((a[0] - b[0]).hypot(a[2] - b[2]) >= SLOT_GAP);
+                assert!((a[0] - b[0]).hypot(a[2] - b[2]) >= slot_gap(Resource::Mine));
             }
         }
+        // A uniform cone has no foot inland: nothing fits there.
         assert!(
-            auto_slots(&field, None, None, all, Resource::River, &[], 3).is_empty(),
+            auto_slots(&field, None, None, &all, Resource::River, &[], 3).is_empty(),
             "no rivers, no river slots"
         );
+    }
+
+    #[test]
+    fn river_slots_take_the_bank_with_the_river_on_their_right() {
+        let Some((_, editor)) = crate::island::test_support::open(
+            "data/base/provinces/roman/islands/pool/roman_island_extralarge_01/roman_island_extralarge_01.a7m",
+        ) else {
+            return;
+        };
+        let field = &editor.island.doc.field;
+        let grids = editor.island.doc.grids.as_ref().unwrap();
+        let river = grids.layer(anno_formats::a7m::grids::Kind::River);
+        let size = field.grid.width as f32 * field.grid.spacing;
+        let all = Region::spanning([0., 0.], [size, size]);
+        let spots = auto_slots(field, river, None, &all, Resource::River, &[], 8);
+        assert_eq!(spots.len(), 8);
+        let river = river.unwrap();
+        for p in &spots {
+            let (share, [sx, sz]) = river_around(river, p[0], p[2]);
+            assert!(
+                (RIVER_SHARE[0]..=RIVER_SHARE[2]).contains(&share),
+                "share {share}"
+            );
+            // The river to the right: yaw is 90° past the way to it.
+            let step = crate::games::rules(Game::Anno117).slot_yaw_step;
+            let yaw = slot_yaw(field, Some(river), Resource::River, [p[0], p[2]], step).unwrap();
+            let want = ((sz.atan2(sx) + std::f32::consts::FRAC_PI_2) / step).round() * step;
+            let off = (yaw - want).rem_euclid(std::f32::consts::TAU);
+            assert!(off.min(std::f32::consts::TAU - off) < 1e-3);
+        }
+    }
+
+    #[test]
+    fn marsh_slots_face_the_sea() {
+        let field = round_island();
+        // On the east shore the sea is +x.
+        let yaw = slot_yaw(
+            &field,
+            None,
+            Resource::Marsh,
+            [100., 64.],
+            crate::games::rules(Game::Anno117).slot_yaw_step,
+        )
+        .unwrap();
+        let off = yaw.min(std::f32::consts::TAU - yaw);
+        assert!(off < 1e-4, "yaw {yaw}");
+        assert_eq!(
+            slot_yaw(&field, None, Resource::Clay, [100., 64.], 1.),
+            None
+        );
+    }
+
+    #[test]
+    fn a_lasso_keeps_auto_slots_inside_its_outline() {
+        let field = mountain_island();
+        let size = 128.;
+        // A triangle over the left half: every slot lands inside it.
+        let outline = [[0., 0.], [size / 2., size / 2.], [0., size]];
+        let lasso = Region::lasso(&outline).unwrap();
+        let picked = auto_slots(&field, None, None, &lasso, Resource::Mine, &[], 12);
+        assert!(!picked.is_empty());
+        assert!(picked.iter().all(|p| inside(&outline, [p[0], p[2]])));
+        assert!(Region::lasso(&outline[..2]).is_none());
+        assert!(lasso.contains([size / 8., size / 2.]));
+        assert!(!lasso.contains([size * 0.45, size * 0.1]));
     }
 
     #[test]
@@ -1357,7 +1378,7 @@ mod tests {
             }
         }
         let all = Region::spanning([0., 0.], [128., 128.]);
-        let marsh = auto_slots(&field, None, None, all, Resource::Marsh, &[], 4);
+        let marsh = auto_slots(&field, None, None, &all, Resource::Marsh, &[], 4);
         assert_eq!(marsh.len(), 4);
         for m in &marsh {
             let r = (m[0] - 64.).hypot(m[2] - 64.);
@@ -1370,7 +1391,7 @@ mod tests {
             }
         }
         assert!(
-            auto_slots(&hilly_island(), None, None, all, Resource::Marsh, &[], 4).is_empty(),
+            auto_slots(&hilly_island(), None, None, &all, Resource::Marsh, &[], 4).is_empty(),
             "a 3 m cliff above the sea is no marsh"
         );
     }
@@ -1408,6 +1429,339 @@ mod tests {
         assert_eq!(kept[64 * 128 + 64], BASE);
     }
 
+    // 1800 mountain work areas go up the hill with a rail ramp down to the
+    // slot, cave ones stay close; 117 ones go down it, linked by two points.
+    fn harbours(game: Game) -> &'static dyn anno_core::game::Harbours {
+        crate::games::module(game)
+            .islands()
+            .and_then(|i| i.harbours())
+            .expect("the shared pieces")
+    }
+
+    /// A new work area at `at`, linked to the slot at `slot` by `shape`.
+    fn linked(
+        shape: &anno_core::harbour::RoadShape,
+        field: &Heightfield,
+        at: [f32; 3],
+        slot: [f32; 3],
+    ) -> Object {
+        use anno_core::island::objects::{Record, Section};
+        let mut work = Object::of_record(Record::Source(0), Section::GameObject, 1, 1);
+        work.position = at;
+        shape.link(&mut work, field, slot);
+        work
+    }
+
+    fn wrapped(a: f32) -> f32 {
+        use std::f32::consts::{PI, TAU};
+        (a + PI).rem_euclid(TAU) - PI
+    }
+
+    #[test]
+    fn roads_take_each_games_shipped_shape() {
+        let field = mountain_island();
+        let ground = |a: [f32; 3], b: [f32; 3]| (a[0] - b[0]).hypot(a[2] - b[2]);
+        // At the mountain's foot, 24 m east of its peak, facing it.
+        let slot = [88., field.height([88., 64.]), 64.];
+        let step = crate::games::rules(Game::Anno1800).slot_yaw_step;
+        let yaw = slot_yaw(&field, None, Resource::Mine, [slot[0], slot[2]], step).unwrap();
+        assert!(
+            wrapped(yaw - std::f32::consts::PI).abs() < 1e-4,
+            "yaw {yaw}"
+        );
+
+        let mountain = harbours(Game::Anno1800).road_shape(Some(Piece::MineWorkArea));
+        let work = mountain.work_area_position(&field, slot, yaw);
+        assert!((ground(work, slot) - 11.4).abs() < 1e-3);
+        assert!(work[1] > slot[1] + 3., "uphill: {work:?} over {slot:?}");
+        let placed = linked(&mountain, &field, work, slot);
+        let rail = placed.path.unwrap();
+        assert!((6..=10).contains(&rail.len()), "{} points", rail.len());
+        // The rail leaves the model's dummy, 0.62 m behind its centre,
+        // and runs through it to the slot.
+        let start = rail[0].p;
+        assert!((ground(start, work) - 0.62).abs() < 1e-3);
+        assert!(ground(start, slot) > ground(work, slot));
+        assert!((start[1] - work[1] - 0.18).abs() < 1e-4);
+        assert_eq!(rail.last().unwrap().p, slot);
+        for w in rail.windows(2) {
+            let chord = ground(w[0].p, w[1].p);
+            assert!((1.2..=2.).contains(&chord), "spacing {chord}");
+        }
+        for p in &rail[1..rail.len() - 1] {
+            assert!(
+                p.p[1] >= field.height([p.p[0], p.p[2]]) + 0.2 - 1e-4,
+                "{p:?} under ground"
+            );
+        }
+
+        let cave = harbours(Game::Anno1800).road_shape(Some(Piece::CaveWorkArea));
+        let by = cave.work_area_position(&field, slot, yaw);
+        assert!((ground(by, slot) - 5.3).abs() < 1e-3);
+        let angle = |p: [f32; 3]| (p[2] - slot[2]).atan2(p[0] - slot[0]);
+        assert!(
+            wrapped(angle(by) - angle(work)).abs() < 0.5,
+            "same side of the slot"
+        );
+        // Its dummy, where the rail leaves the cave, is 1.3 m on into the
+        // hill and 1.5 m up.
+        let rail = linked(&cave, &field, by, slot).path.unwrap();
+        assert!(ground(rail[0].p, slot) > ground(by, slot));
+        assert!((rail[0].p[1] - by[1] - 1.54).abs() < 1e-4);
+
+        // 117's mountain work areas stand in front of their slot, which
+        // faces up the slope: towards the peak, on a two-point path.
+        let shape = harbours(Game::Anno117).road_shape(Some(Piece::MineWorkArea));
+        let step = crate::games::rules(Game::Anno117).slot_yaw_step;
+        let yaw = slot_yaw(&field, None, Resource::Mine, [slot[0], slot[2]], step).unwrap();
+        let work = shape.work_area_position(&field, slot, yaw);
+        let peak = [64., 0., 64.];
+        assert!(
+            ground(work, peak) < ground(slot, peak) - 2.,
+            "uphill: {work:?}"
+        );
+        let link = linked(&shape, &field, work, slot).path.unwrap();
+        assert_eq!(link.len(), 2);
+        let span: [f32; 3] = std::array::from_fn(|k| (work[k] - slot[k]) / 6.);
+        for p in &link {
+            for (k, v) in span.iter().enumerate() {
+                assert!((p.i.unwrap()[k] - v).abs() < 1e-4);
+                assert!((p.o.unwrap()[k] + v).abs() < 1e-4);
+            }
+        }
+        assert_eq!([link[0].p, link[1].p], [work, slot]);
+    }
+
+    // Each kind's shipped work areas, measured on every shipped island of
+    // both games (2026-11-22): the yaw against the direction to the slot,
+    // and the side of the slot against its yaw, as a median with the
+    // 25th and 75th percentile around it, in degrees; then the span's 25th
+    // and 75th percentile in metres. The 1800 cave ones turn their back on
+    // the slot's direction, since the model opens along its -x; rivers
+    // keep to their slot's frame within a degree.
+    #[test]
+    fn placed_work_areas_face_and_stand_as_shipped_ones_do() {
+        type Spread = (f32, f32, f32);
+        let shipped: [(Game, Piece, Spread, Spread, [f32; 2]); 6] = [
+            (
+                Game::Anno1800,
+                Piece::MineWorkArea,
+                (-5.5, -8.5, 10.9),
+                (2.3, -17.9, 14.5),
+                [10.14, 12.84],
+            ),
+            (
+                Game::Anno1800,
+                Piece::CaveWorkArea,
+                (-179.9, -11.2, 15.0),
+                (2.9, -7.3, 7.1),
+                [4.98, 5.55],
+            ),
+            (
+                Game::Anno1800,
+                Piece::NewWorldMineWorkArea,
+                (-2.8, -21.4, 18.9),
+                (-2.4, -19.3, 13.3),
+                [9.44, 11.96],
+            ),
+            (
+                Game::Anno1800,
+                Piece::RiverWorkArea,
+                (-97.1, -1.0, 0.0),
+                (-82.9, 0.0, 1.0),
+                [7.07, 8.06],
+            ),
+            (
+                Game::Anno117,
+                Piece::MineWorkArea,
+                (-6.6, -8.3, 8.4),
+                (9.1, -5.5, 6.6),
+                [2.07, 3.08],
+            ),
+            (
+                Game::Anno117,
+                Piece::RiverWorkArea,
+                (171.7, -0.7, 0.7),
+                (-81.7, -0.7, 0.7),
+                [2.41, 2.74],
+            ),
+        ];
+        let field = round_island();
+        let slot = [70., field.height([70., 60.]), 60.];
+        // Shipped slots turn every way; any yaw will do.
+        let slot_yaw = 0.7f32;
+        let within = |what: &str, got: f32, (median, low, high): Spread| {
+            let off = wrapped(got - median.to_radians()).to_degrees();
+            // A tenth of a degree for the rounded medians.
+            assert!(
+                (low - 0.1..=high + 0.1).contains(&off),
+                "{what}: {off:.1}° off the shipped median {median}°, spread {low}..{high}"
+            );
+        };
+        for (game, piece, facing, side, span) in shipped {
+            let shape = harbours(game).road_shape(Some(piece));
+            let at = shape.work_area_position(&field, slot, slot_yaw);
+            let work = linked(&shape, &field, at, slot);
+            let to_slot = (slot[2] - at[2]).atan2(slot[0] - at[0]);
+            within(
+                &format!("{game:?} {piece:?} yaw"),
+                work.direction - to_slot,
+                facing,
+            );
+            let bearing = (at[2] - slot[2]).atan2(at[0] - slot[0]);
+            within(
+                &format!("{game:?} {piece:?} side"),
+                bearing - slot_yaw,
+                side,
+            );
+            let d = (at[0] - slot[0]).hypot(at[2] - slot[2]);
+            assert!(
+                (span[0] - 1e-3..=span[1] + 1e-3).contains(&d),
+                "{game:?} {piece:?}: {d:.2} m from the slot, shipped {span:?}"
+            );
+        }
+    }
+
+    // A slope rising 0.3 m a metre to +x, with a thin wall 5 m high
+    // running out at 67.5°. The highest ray alone took the wall and
+    // snapped to 90°; shipped mine slots face the slope.
+    #[test]
+    fn a_mine_slot_faces_the_slope_not_a_wall_on_it() {
+        let mut field = round_island();
+        let grid = field.grid;
+        let (sx, sz) = (60., 64.);
+        let (s, c) = 67.5f32.to_radians().sin_cos();
+        for z in 0..grid.depth {
+            for x in 0..grid.width {
+                let [wx, wz] = grid.world(x, z);
+                let (dx, dz) = (wx - sx, wz - sz);
+                let (along, across) = (dx * c + dz * s, (dz * c - dx * s).abs());
+                let wall = (6. ..14.).contains(&along) && across < 0.6;
+                field.heights[z * grid.width + x] = 3. + 0.3 * dx + if wall { 5. } else { 0. };
+            }
+        }
+        let step = crate::games::rules(Game::Anno1800).slot_yaw_step;
+        let yaw = slot_yaw(&field, None, Resource::Mine, [sx, sz], step).unwrap();
+        assert!(wrapped(yaw).abs() < 1e-4, "yaw {:.1}°", yaw.to_degrees());
+    }
+
+    // A mine rail laid from a plateau over its brink: the ground falls
+    // 0.5 (x - 70)² m past x 70 to a floor at 1 m. Points alone kept 0.2 m
+    // clear, but the bent track between two of them ran 0.26 m under the
+    // brink, where the ground, in the editor as in the game, hides it.
+    // The track keeps its clearance along the whole curve the rail bends
+    // along, between its first and last spans, which meet the work area's
+    // dummy and the slot's ground.
+    #[test]
+    fn a_rail_over_a_brink_keeps_its_track_over_the_ground() {
+        let mut field = round_island();
+        let grid = field.grid;
+        for z in 0..grid.depth {
+            for x in 0..grid.width {
+                let [wx, _] = grid.world(x, z);
+                field.heights[z * grid.width + x] = if wx <= 70. {
+                    10.
+                } else {
+                    (10. - 0.5 * (wx - 70.) * (wx - 70.)).max(1.)
+                };
+            }
+        }
+        let shape = harbours(Game::Anno1800).road_shape(Some(Piece::MineWorkArea));
+        let (work, slot) = ([60., 10., 64.], [84., 1., 64.]);
+        let rail = linked(&shape, &field, work, slot).path.unwrap();
+        let (first, last) = (rail[1].p[0], rail[rail.len() - 2].p[0]);
+        let curve = super::super::rail::Samples::new(&rail);
+        let (mut low, mut at) = (f32::MAX, 0.);
+        let mut d = 0.;
+        while d < curve.length() {
+            let (p, _) = curve.frame(d);
+            if (first..last).contains(&p[0]) {
+                let over = p[1] - field.height([p[0], p[2]]);
+                if over < low {
+                    (low, at) = (over, p[0]);
+                }
+            }
+            d += 0.05;
+        }
+        assert!(
+            low >= shape.clearance - 0.01,
+            "track {low:.2} m over the ground at x {at:.2}"
+        );
+    }
+
+    // A cave work area on a 56° slope: its dummy, 1.3 m on into the hill,
+    // starts 0.4 m inside the ground, as a tenth of shipped cave rails
+    // do. Asking for the full clearance beside that fixed end lifted the
+    // next point 4.8 m over the ground (Moderate s 02, 2026-11-22); the
+    // rail ramps down to its slot instead.
+    #[test]
+    fn a_cave_rail_from_inside_the_hill_ramps_down_to_its_slot() {
+        let mut field = round_island();
+        let grid = field.grid;
+        for z in 0..grid.depth {
+            for x in 0..grid.width {
+                let [wx, _] = grid.world(x, z);
+                field.heights[z * grid.width + x] = 3. + 1.5 * (70. - wx).max(0.);
+            }
+        }
+        let cave = harbours(Game::Anno1800).road_shape(Some(Piece::CaveWorkArea));
+        let slot = [70., 3., 64.];
+        let at = cave.work_area_position(&field, slot, std::f32::consts::PI);
+        let rail = linked(&cave, &field, at, slot).path.unwrap();
+        let start = rail[0].p;
+        assert!(
+            start[1] < field.height([start[0], start[2]]),
+            "{start:?} not buried"
+        );
+        for p in &rail[1..rail.len() - 1] {
+            let over = p.p[1] - field.height([p.p[0], p.p[2]]);
+            assert!(over < 1.5, "{over:.2} m over the ground at {:?}", p.p);
+        }
+        for w in rail.windows(2) {
+            assert!(
+                w[1].p[1] <= w[0].p[1] + 1e-4,
+                "climbs: {:?}",
+                [w[0].p, w[1].p]
+            );
+        }
+    }
+
+    #[test]
+    fn a_link_bends_its_road_to_meet_both_ends() {
+        let point = |x: f32, z: f32| PathPoint {
+            p: [x, 0., z],
+            i: Some([0.1, 0., 0.]),
+            o: Some([-0.1, 0., 0.]),
+            ..Default::default()
+        };
+        let link = Link {
+            work: 1,
+            slot: 2,
+            work_at: [0., 0., 0.],
+            path: vec![point(0., 0.), point(5., 0.), point(10., 0.)],
+        };
+        assert!(link.follow([0., 0., 0.], [10., 0., 0.]).is_none());
+        // The slot moved 4 m north: the middle goes halfway, the start stays.
+        let road = link.follow([0., 0., 0.], [10., 0., 4.]).unwrap();
+        let z: Vec<f32> = road.iter().map(|p| p.p[2]).collect();
+        assert_eq!(z, [0., 2., 4.]);
+        assert_eq!(
+            road[1].i,
+            Some([0.1, 0., 0.]),
+            "long roads keep their tangents"
+        );
+
+        // A two-point link gets shipped tangents: a sixth of the span.
+        let short = Link {
+            path: vec![point(0., 0.), point(3., 0.)],
+            ..link
+        };
+        let road = short.follow([0., 0., 0.], [6., 0., 0.]).unwrap();
+        assert_eq!(road[1].p, [6., 0., 0.]);
+        assert_eq!(road[0].i, Some([-1., 0., 0.]));
+        assert_eq!(road[1].o, Some([1., 0., 0.]));
+    }
+
     #[test]
     fn library_finds_every_piece_on_shipped_islands() {
         let Some(install) = install() else {
@@ -1415,7 +1769,13 @@ mod tests {
         };
         let assets = assets(&install);
         for region in ["Roman", "Celtic"] {
-            let lib = Library::load(&install, &assets, region).unwrap();
+            let lib = Library::load(
+                crate::games::module(crate::games::of(&install)),
+                &install,
+                &assets,
+                region,
+            )
+            .unwrap();
             let missing: Vec<_> = Piece::ALL
                 .iter()
                 .filter(|p| lib.guid(**p).is_none())
@@ -1443,7 +1803,13 @@ mod tests {
             ("Arctic", &[116037, 113750][..]),
             ("Africa", &[117741][..]),
         ] {
-            let lib = Library::load(&install, &assets, region).unwrap();
+            let lib = Library::load(
+                crate::games::module(crate::games::of(&install)),
+                &install,
+                &assets,
+                region,
+            )
+            .unwrap();
             for &guid in guids {
                 assert!(
                     lib.resource_of(guid).is_some(),

@@ -37,9 +37,9 @@ use gpui_util::post_inc;
 use gpui_util::{ResultExt, measure};
 use itertools::FoldWhile::{Continue, Done};
 use itertools::Itertools;
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[cfg(target_os = "ios")]
 use objc2_core_foundation::CFRetained;
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[cfg(target_os = "ios")]
 use objc2_core_video::CVPixelBuffer;
 use parking_lot::{RwLock, RwLockUpgradableReadGuard};
 use raw_window_handle::{HandleError, HasDisplayHandle, HasWindowHandle};
@@ -1277,6 +1277,9 @@ pub struct Window {
         SingleSubscriberSet<Box<dyn FnMut(WindowVisibility, &mut Window, &mut App) -> bool>>,
     hovered: Rc<Cell<bool>>,
     pub(crate) needs_present: Rc<Cell<bool>>,
+    /// Textures asked for a frame in this frame (`paint_gpu_texture`).
+    #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+    asked_textures: Vec<Arc<crate::TextureHandoff>>,
     /// Tracks recent input event timestamps to determine if input is arriving at a high rate.
     /// Used to selectively enable VRR optimization only when input rate exceeds 60fps.
     pub(crate) input_rate_tracker: Rc<RefCell<InputRateTracker>>,
@@ -2029,6 +2032,14 @@ impl Window {
                 let needs_present = request_frame_options.require_presentation
                     || needs_present.get()
                     || high_rate_input;
+                // Texture producers start on this frame now, with the input
+                // and next-frame callbacks so far, while it lays out.
+                #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+                if should_draw || needs_present {
+                    handle
+                        .update(&mut cx, |_, window, _| window.ask_textures())
+                        .log_err();
+                }
                 if should_draw {
                     measure("frame duration", || {
                         handle
@@ -2065,6 +2076,14 @@ impl Window {
 
                 handle
                     .update(&mut cx, |_, window, _| {
+                        #[cfg(any(
+                            target_os = "linux",
+                            target_os = "windows",
+                            target_os = "macos"
+                        ))]
+                        if should_draw || needs_present {
+                            window.follow_late_textures();
+                        }
                         if window.invalidator.is_dirty()
                             || !window.next_frame_callbacks.borrow().is_empty()
                         {
@@ -2402,6 +2421,8 @@ impl Window {
             visibility_observers: SingleSubscriberSet::new(),
             hovered,
             needs_present,
+            #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+            asked_textures: Vec::new(),
             input_rate_tracker,
             #[cfg(feature = "profiler")]
             window_profiler: profiler::WindowProfiler::new(handle.window_id())?,
@@ -3662,6 +3683,7 @@ impl Window {
     /// the contents of the new [`Scene`], use [`Self::present`].
     #[profiling::function]
     pub fn draw(&mut self, cx: &mut App) -> ArenaClearNeeded {
+        let draw_start = std::time::Instant::now();
         // Drain every draw in profiler builds so a previous frame's
         // first-invalidation timestamp can't be attributed to this one.
         #[cfg(feature = "profiler")]
@@ -3745,9 +3767,11 @@ impl Window {
                 });
         }
 
+        let finish_start = std::time::Instant::now();
         self.layout_engine.as_mut().unwrap().clear();
         self.text_system().finish_frame();
         self.next_frame.finish(&mut self.rendered_frame);
+        time_draw_phase("gpui finish frame", finish_start);
 
         self.invalidator.set_phase(DrawPhase::Focus);
         let previous_focus_path = self.rendered_frame.focus_path();
@@ -3793,6 +3817,7 @@ impl Window {
 
         debug_assert!(self.rendered_entity_stack.is_empty());
         self.record_entities_accessed(cx);
+        time_draw_phase("gpui draw", draw_start);
         self.reset_cursor_style(cx);
         self.refreshing = false;
         self.invalidator.set_phase(DrawPhase::None);
@@ -3846,7 +3871,9 @@ impl Window {
         let _foreground_turn = profiler::journal::foreground_turn();
         #[cfg(feature = "profiler")]
         let present_start = Instant::now();
+        let draw_start = std::time::Instant::now();
         self.platform_window.draw(&self.rendered_frame.scene);
+        time_draw_phase("gpui present", draw_start);
         #[cfg(feature = "profiler")]
         self.window_profiler.record_present(
             present_start,
@@ -3947,8 +3974,11 @@ impl Window {
         let scale_factor = self.scale_factor();
         #[cfg(feature = "profiler")]
         let request_layout_start = Instant::now();
+        let phase_start = std::time::Instant::now();
         let mut root_element = self.root.as_ref().unwrap().clone().into_any_element();
         let root_layout_id = root_element.request_layout(self, cx);
+        time_draw_phase("gpui request layout", phase_start);
+        let phase_start = std::time::Instant::now();
         #[cfg(feature = "profiler")]
         let prepaint_start = Instant::now();
         self.layout_engine
@@ -3986,6 +4016,8 @@ impl Window {
         }
 
         self.mouse_hit_test = self.next_frame.hit_test(self.mouse_position);
+        time_draw_phase("gpui layout + prepaint", phase_start);
+        let phase_start = std::time::Instant::now();
 
         // Now actually paint the elements.
         #[cfg(feature = "profiler")]
@@ -4017,6 +4049,8 @@ impl Window {
                 paint: Instant::now().duration_since(paint_start),
             });
 
+        time_draw_phase("gpui paint", phase_start);
+        let phase_start = std::time::Instant::now();
         // a11y may have been activated/deactivated halfway through the frame
         let a11y_active_start_of_frame = self.a11y.is_active();
         self.a11y.sync_active_flag();
@@ -4042,6 +4076,7 @@ impl Window {
                 );
                 self.platform_window.a11y_tree_update(tree_update);
             }
+            time_draw_phase("gpui a11y", phase_start);
         }
     }
 
@@ -5092,32 +5127,9 @@ impl Window {
         self.invalidator.debug_assert_paint();
 
         let element_opacity = self.element_opacity();
-        let scale_factor = self.scale_factor();
-        let glyph_origin = origin.scale(scale_factor);
-
-        let quantized_origin = Point::new(
-            round_half_toward_zero(glyph_origin.x.0 * SUBPIXEL_VARIANTS_X as f32)
-                / SUBPIXEL_VARIANTS_X as f32,
-            round_half_toward_zero(glyph_origin.y.0 * SUBPIXEL_VARIANTS_Y as f32)
-                / SUBPIXEL_VARIANTS_Y as f32,
-        );
-        let subpixel_variant = Point::new(
-            (quantized_origin.x.fract() * SUBPIXEL_VARIANTS_X as f32) as u8,
-            (quantized_origin.y.fract() * SUBPIXEL_VARIANTS_Y as f32) as u8,
-        );
-        let integer_origin = quantized_origin.map(|c| ScaledPixels(c.trunc()));
         let subpixel_rendering = self.should_use_subpixel_rendering(font_id, font_size);
-        let dilation = self.text_system().glyph_dilation_for_color(color);
-        let params = RenderGlyphParams {
-            font_id,
-            glyph_id,
-            font_size,
-            subpixel_variant,
-            scale_factor,
-            is_emoji: false,
-            subpixel_rendering,
-            dilation,
-        };
+        let (params, integer_origin) =
+            self.place_glyph(origin, font_id, glyph_id, font_size, color, subpixel_rendering);
 
         let raster_bounds = self.text_system().raster_bounds(&params)?;
         if !raster_bounds.is_zero() {
@@ -5157,6 +5169,61 @@ impl Window {
             }
         }
         Ok(())
+    }
+
+    /// How [`Self::paint_glyph`] would draw a glyph in grayscale: the
+    /// parameters to rasterize it with ([`TextSystem::rasterize_glyph`]),
+    /// and the device pixel its raster bounds
+    /// ([`TextSystem::raster_bounds`]) start from. For text an application
+    /// draws into a texture of its own that must match GPUI's labels (added
+    /// for gpui-editor-kit; see `vendor/zed/PATCH.md`).
+    pub fn glyph_raster(
+        &self,
+        origin: Point<Pixels>,
+        font_id: FontId,
+        glyph_id: GlyphId,
+        font_size: Pixels,
+        color: Hsla,
+    ) -> (RenderGlyphParams, Point<ScaledPixels>) {
+        self.place_glyph(origin, font_id, glyph_id, font_size, color, false)
+    }
+
+    /// A glyph's rasterization and the device pixel it is placed at: the
+    /// origin snapped to a quarter pixel across, a whole pixel down.
+    fn place_glyph(
+        &self,
+        origin: Point<Pixels>,
+        font_id: FontId,
+        glyph_id: GlyphId,
+        font_size: Pixels,
+        color: Hsla,
+        subpixel_rendering: bool,
+    ) -> (RenderGlyphParams, Point<ScaledPixels>) {
+        let scale_factor = self.scale_factor();
+        let glyph_origin = origin.scale(scale_factor);
+        let quantized_origin = Point::new(
+            round_half_toward_zero(glyph_origin.x.0 * SUBPIXEL_VARIANTS_X as f32)
+                / SUBPIXEL_VARIANTS_X as f32,
+            round_half_toward_zero(glyph_origin.y.0 * SUBPIXEL_VARIANTS_Y as f32)
+                / SUBPIXEL_VARIANTS_Y as f32,
+        );
+        let subpixel_variant = Point::new(
+            (quantized_origin.x.fract() * SUBPIXEL_VARIANTS_X as f32) as u8,
+            (quantized_origin.y.fract() * SUBPIXEL_VARIANTS_Y as f32) as u8,
+        );
+        let integer_origin = quantized_origin.map(|c| ScaledPixels(c.trunc()));
+        let dilation = self.text_system().glyph_dilation_for_color(color);
+        let params = RenderGlyphParams {
+            font_id,
+            glyph_id,
+            font_size,
+            subpixel_variant,
+            scale_factor,
+            is_emoji: false,
+            subpixel_rendering,
+            dilation,
+        };
+        (params, integer_origin)
     }
 
     fn should_use_subpixel_rendering(&self, font_id: FontId, font_size: Pixels) -> bool {
@@ -5414,7 +5481,7 @@ impl Window {
     /// Paint a surface into the scene for the next frame at the current z-index.
     ///
     /// This method should only be called as part of the paint phase of element drawing.
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[cfg(target_os = "ios")]
     pub fn paint_surface(
         &mut self,
         bounds: Bounds<Pixels>,
@@ -5434,28 +5501,101 @@ impl Window {
         });
     }
 
-    /// Draws an application wgpu viewport at the current z-index and
-    /// content mask (Linux and Windows). See [`GpuCanvas`].
+    /// Draws `texture`'s latest frame at the current z-index and content
+    /// mask (Linux, Windows and macOS), its top left corner at `bounds`'
+    /// origin. A frame that draws it asks its producer for a new frame
+    /// before layout, and the renderer waits for that frame just before
+    /// drawing (see [`crate::TextureHandoff`]).
     ///
     /// This method should only be called as part of the paint phase of element drawing.
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
-    pub fn paint_gpu_canvas(
+    #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+    pub fn paint_gpu_texture(
         &mut self,
         bounds: Bounds<Pixels>,
-        canvas: std::sync::Arc<dyn crate::GpuCanvas>,
+        texture: std::sync::Arc<crate::TextureHandoff>,
     ) {
         use crate::PaintSurface;
 
         self.invalidator.debug_assert_paint();
 
+        // First painted this frame: no ask went out at its start.
+        if !self.asked_textures.iter().any(|t| Arc::ptr_eq(t, &texture)) {
+            texture.ask();
+            self.asked_textures.push(texture.clone());
+        }
         let bounds = self.snap_bounds(bounds);
         let content_mask = self.snapped_content_mask();
         self.next_frame.scene.insert_primitive(PaintSurface {
             order: 0,
             bounds,
             content_mask,
-            canvas,
+            #[cfg(target_os = "macos")]
+            image_buffer: Self::empty_surface_buffer(),
+            texture,
         });
+    }
+
+    /// At the start of a frame that draws or presents: asks every texture
+    /// the last frame drew for a new frame, so producers record while this
+    /// one lays out.
+    #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+    fn ask_textures(&mut self) {
+        self.asked_textures.clear();
+        for surface in &self.rendered_frame.scene.surfaces {
+            let texture = &surface.texture;
+            if !self.asked_textures.iter().any(|t| Arc::ptr_eq(t, texture))
+            {
+                texture.ask();
+                self.asked_textures.push(texture.clone());
+            }
+        }
+    }
+
+    /// After presenting: a texture that drew an older frame than asked
+    /// gets another frame, which shows the late one.
+    #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+    fn follow_late_textures(&mut self) {
+        let mut late = false;
+        for texture in &self.asked_textures {
+            late |= texture.take_late();
+        }
+        if late {
+            self.needs_present.set(true);
+            self.platform_window.schedule_frame();
+        }
+    }
+
+    /// A 1×1 buffer so `PaintSurface` can carry the field `gpui_apple`
+    /// reads. Created once on the thread that paints. The wgpu renderer
+    /// does not sample it.
+    #[cfg(target_os = "macos")]
+    fn empty_surface_buffer() -> objc2_core_foundation::CFRetained<objc2_core_video::CVPixelBuffer>
+    {
+        use objc2_core_foundation::CFRetained;
+        use objc2_core_video::{
+            CVPixelBuffer, CVPixelBufferCreate, kCVPixelFormatType_32BGRA, kCVReturnSuccess,
+        };
+
+        thread_local! {
+            static BUFFER: CFRetained<CVPixelBuffer> = {
+                let mut buffer = std::ptr::null_mut();
+                let status = unsafe {
+                    CVPixelBufferCreate(
+                        None,
+                        1,
+                        1,
+                        kCVPixelFormatType_32BGRA,
+                        None,
+                        std::ptr::NonNull::from(&mut buffer),
+                    )
+                };
+                assert_eq!(status, kCVReturnSuccess, "empty surface buffer");
+                let buffer = std::ptr::NonNull::new(buffer).expect("surface buffer");
+                // SAFETY: CVPixelBufferCreate transferred ownership of this pointer.
+                unsafe { CFRetained::from_raw(buffer) }
+            };
+        }
+        BUFFER.with(|buffer| buffer.clone())
     }
 
     /// Removes an image from the sprite atlas.
@@ -10629,5 +10769,23 @@ mod inspector_tests {
             }
         })
         .expect("closed inspector has no bookkeeping and no style overrides");
+    }
+}
+
+/// A host's timer for the draw's phases (request layout, layout and
+/// prepaint, paint, a11y, finish, present), for finding where a frame's CPU
+/// time goes outside the host's own code. Set once; unset, timing a phase is
+/// a clock read and a load. Kit patch (vendor/zed/PATCH.md).
+static DRAW_TIMER: std::sync::OnceLock<fn(&'static str, std::time::Duration)> =
+    std::sync::OnceLock::new();
+
+/// Has `timer` called with each draw phase's name and duration.
+pub fn set_draw_timer(timer: fn(&'static str, std::time::Duration)) {
+    let _ = DRAW_TIMER.set(timer);
+}
+
+fn time_draw_phase(name: &'static str, since: std::time::Instant) {
+    if let Some(timer) = DRAW_TIMER.get() {
+        timer(name, since.elapsed());
     }
 }

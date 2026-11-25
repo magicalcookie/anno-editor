@@ -9,57 +9,189 @@ use std::collections::HashMap;
 
 use anyhow::{Context, Result, bail, ensure};
 
+use crate::varint;
+
 /// Handle to a node or value inside one [`Adf`]. Handles stay valid across
 /// edits and clones of the same tree; removed items simply become unreachable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ItemId(u32);
 
-/// Record ids at and above this mark value leaves; below are node openers.
-pub const VALUE_ID_BASE: u16 = 0x8000;
+// ------------------------------------------------------------------ layout
+//
+// Every dialect: the record stream, the node dictionary, the value
+// dictionary, then a trailer of u32 words. A record opens a node, closes
+// one (id 0) or holds a value; dictionaries map ids to names.
 
-// Unnamed nodes and values use the first id of each space (never listed in
-// the dictionaries), e.g. `Instances` entries are id 1 and `FileNames`
-// entries id 0x8000. The engine seeds its allocators at the same values.
-const UNNAMED_NODE_ID: u16 = 1;
-const UNNAMED_VALUE_ID: u16 = VALUE_ID_BASE;
-
-const NONE: u32 = u32::MAX;
-
+/// The ADF dialects, told apart by the file's last word.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Trailer {
-    // [u32 w0][u32 items][u32 dictAOff][u32 dictBOff][u32 w5][i32 -3]
-    V3 { w0: u32, w5: u32 },
-    // [u32 dictAOff][u32 dictBOff][u32 word][i32 -2]. 1800 stores 8,
-    // not an item count, in `word`; its meaning is not established.
-    V2 { word: u32 },
-    // Packed u16-id records and varint dictionaries, then [u32 dictAOff].
+enum Version {
+    /// 117's and 1800's canonical files.
+    V3,
+    /// 1800's older canonical files.
+    V2,
+    /// 1800's legacy packed files.
     Packed,
 }
 
-fn read_varint(data: &[u8], pos: &mut usize) -> Result<u32> {
-    let mut value = 0;
-    for shift in (0..35).step_by(7) {
-        let byte = *data.get(*pos).context("ADF: truncated varint")?;
-        *pos += 1;
-        ensure!(shift < 28 || byte <= 15, "ADF: varint overflows u32");
-        value |= u32::from(byte & 127) << shift;
-        if byte & 128 == 0 {
-            ensure!(shift == 0 || byte != 0, "ADF: noncanonical varint");
-            return Ok(value);
+impl Version {
+    fn layout(self) -> &'static Layout {
+        match self {
+            Version::V3 => &Layout::V3,
+            Version::V2 => &Layout::V2,
+            Version::Packed => &Layout::PACKED,
         }
     }
-    unreachable!("the fifth byte must fit four bits")
 }
 
-fn write_varint(out: &mut Vec<u8>, mut value: u32) {
-    loop {
-        let byte = (value & 127) as u8;
-        value >>= 7;
-        out.push(byte | if value != 0 { 128 } else { 0 });
-        if value == 0 {
-            break;
+/// What one word of a trailer holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Slot {
+    /// A word whose meaning is not established, kept as read. 1800 stores
+    /// 8 in V2's, not an item count.
+    Kept,
+    /// Records written, plus one; recomputed on encode.
+    Items,
+    /// The node dictionary's offset.
+    Nodes,
+    /// The value dictionary's offset.
+    Values,
+    /// The dialect's [`Layout::marker`].
+    Marker,
+}
+
+/// Where one dialect's bytes differ from the others'.
+#[derive(Debug)]
+struct Layout {
+    trailer: &'static [Slot],
+    /// The last word of a canonical file. A packed file ends in its node
+    /// dictionary's offset instead.
+    marker: Option<i32>,
+    /// Records as a u16 id, then a varint length for values, and varint
+    /// dictionaries; else records are [`RECORD_HEADER`] and a payload
+    /// padded to [`ALIGN`], and dictionaries are aligned too.
+    packed: bool,
+}
+
+impl Layout {
+    const V3: Layout = Layout {
+        trailer: &[
+            Slot::Kept,
+            Slot::Items,
+            Slot::Nodes,
+            Slot::Values,
+            Slot::Kept,
+            Slot::Marker,
+        ],
+        marker: Some(-3),
+        packed: false,
+    };
+    const V2: Layout = Layout {
+        trailer: &[Slot::Nodes, Slot::Values, Slot::Kept, Slot::Marker],
+        marker: Some(-2),
+        packed: false,
+    };
+    const PACKED: Layout = Layout {
+        trailer: &[Slot::Nodes],
+        marker: None,
+        packed: true,
+    };
+
+    fn trailer_len(&self) -> usize {
+        self.trailer.len() * WORD
+    }
+}
+
+/// Every trailer, dictionary count and canonical record header field.
+const WORD: usize = size_of::<u32>();
+/// A canonical record's payload size and id, before the payload.
+const RECORD_HEADER: usize = 2 * WORD;
+/// Canonical records, payloads and dictionaries end on this.
+const ALIGN: usize = 8;
+/// The most [`Slot::Kept`] words any trailer has (V3's two).
+const MAX_KEPT: usize = 2;
+
+/// A file's trailer, read: its dialect, the words kept as they were and
+/// where its dictionaries start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Trailer {
+    version: Version,
+    kept: [u32; MAX_KEPT],
+    // Recomputed on encode.
+    items: u32,
+    nodes: usize,
+    /// The value dictionary's offset; packed files have none in the
+    /// trailer, their value dictionary follows the node one.
+    values: Option<usize>,
+}
+
+impl Trailer {
+    fn read(bytes: &[u8]) -> Result<Trailer> {
+        let size = bytes.len();
+        let word = |off: usize| u32::from_le_bytes(bytes[off..off + WORD].try_into().unwrap());
+        let last = word(size - WORD) as i32;
+        let marked = [Version::V3, Version::V2]
+            .into_iter()
+            .find(|v| v.layout().marker == Some(last));
+        let version = match marked {
+            Some(v) => v,
+            // A packed file ends in its node dictionary's offset.
+            None if (last as u32 as usize) <= size - WORD => Version::Packed,
+            None => bail!("ADF: unknown trailer marker {last:#x}"),
+        };
+        let l = version.layout();
+        let len = l.trailer_len();
+        ensure!(
+            size >= len,
+            "ADF: {size} bytes is too small for a {version:?} trailer"
+        );
+        let mut t = Trailer {
+            version,
+            kept: [0; MAX_KEPT],
+            items: 0,
+            nodes: 0,
+            values: None,
+        };
+        let mut kept = 0;
+        for (i, slot) in l.trailer.iter().enumerate() {
+            let w = word(size - len + i * WORD);
+            match slot {
+                Slot::Kept => {
+                    t.kept[kept] = w;
+                    kept += 1;
+                }
+                Slot::Items => t.items = w,
+                Slot::Nodes => t.nodes = w as usize,
+                Slot::Values => t.values = Some(w as usize),
+                Slot::Marker => {}
+            }
+        }
+        Ok(t)
+    }
+
+    /// Appends the trailer for dictionaries at `nodes` and `values` and
+    /// `items` records.
+    fn write(&self, out: &mut Vec<u8>, items: u32, nodes: u32, values: u32) {
+        let l = self.version.layout();
+        let mut kept = self.kept.iter();
+        for slot in l.trailer {
+            let w = match slot {
+                Slot::Kept => *kept.next().expect("MAX_KEPT covers every layout"),
+                Slot::Items => items,
+                Slot::Nodes => nodes,
+                Slot::Values => values,
+                Slot::Marker => l.marker.expect("canonical layouts have a marker") as u32,
+            };
+            out.extend_from_slice(&w.to_le_bytes());
         }
     }
+}
+
+// A varint at `*pos`, moving `*pos` past it.
+fn read_varint(data: &[u8], pos: &mut usize) -> Result<u32> {
+    let (v, end) = varint::read(data, *pos)
+        .with_context(|| format!("ADF: truncated, padded or overflowing varint at {pos:#x}"))?;
+    *pos = end;
+    Ok(v)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -67,7 +199,7 @@ struct Item {
     // Payload span in `Adf::data`.
     off: u32,
     len: u32,
-    // Close record payload span; `close_off == NONE` means the stream ended
+    // Close record payload span; `close_off == Item::NONE` means the stream ended
     // before this node was closed.
     close_off: u32,
     close_len: u32,
@@ -78,15 +210,27 @@ struct Item {
 }
 
 impl Item {
+    /// Record ids at and above this mark value leaves; below are node openers.
+    const VALUE_ID_BASE: u16 = 0x8000;
+
+    // Unnamed nodes and values use the first id of each space (never listed in
+    // the dictionaries), e.g. `Instances` entries are id 1 and `FileNames`
+    // entries id 0x8000. The engine seeds its allocators at the same values.
+    const UNNAMED_NODE_ID: u16 = 1;
+
+    const UNNAMED_VALUE_ID: u16 = Item::VALUE_ID_BASE;
+
+    const NONE: u32 = u32::MAX;
+
     fn new(id: u16, off: u32, len: u32) -> Item {
         Item {
             off,
             len,
-            close_off: NONE,
+            close_off: Item::NONE,
             close_len: 0,
-            first: NONE,
-            last: NONE,
-            next: NONE,
+            first: Item::NONE,
+            last: Item::NONE,
+            next: Item::NONE,
             id,
         }
     }
@@ -99,15 +243,18 @@ struct Dict {
     by_id: HashMap<u16, u32>,
     by_name: HashMap<Box<[u8]>, u16>,
     // Zero fill after the names. Every shipped file aligns the dictionary end
-    // to 8; the decoded value is kept until the dictionary grows.
+    // to `ALIGN`; the decoded value is kept until the dictionary grows.
     pad: Option<usize>,
 }
 
 impl Dict {
+    // Packed entries: the name, its NUL, then the u16 id.
     fn parse_packed(data: &[u8], pos: &mut usize) -> Result<Dict> {
+        const ID: usize = size_of::<u16>();
+        const SHORTEST: usize = 1 + ID;
         let count = read_varint(data, pos)? as usize;
         ensure!(
-            count <= (data.len() - *pos) / 3,
+            count <= (data.len() - *pos) / SHORTEST,
             "ADF: packed dictionary count overruns"
         );
         let mut dict = Dict::default();
@@ -116,17 +263,20 @@ impl Dict {
                 .iter()
                 .position(|b| *b == 0)
                 .context("ADF: unterminated packed dictionary name")?;
-            let end = *pos + len;
-            ensure!(end + 3 <= data.len(), "ADF: truncated packed dictionary id");
-            let id = u16::from_le_bytes(data[end + 1..end + 3].try_into().unwrap());
+            let (end, id_at) = (*pos + len, *pos + len + 1);
+            ensure!(
+                id_at + ID <= data.len(),
+                "ADF: truncated packed dictionary id"
+            );
+            let id = u16::from_le_bytes(data[id_at..id_at + ID].try_into().unwrap());
             dict.push(id, &data[*pos..end]);
-            *pos = end + 3;
+            *pos = id_at + ID;
         }
         Ok(dict)
     }
 
     fn write_packed(&self, out: &mut Vec<u8>) {
-        write_varint(out, self.entries.len() as u32);
+        varint::write(out, self.entries.len() as u32);
         for (id, name) in &self.entries {
             out.extend_from_slice(name);
             out.push(0);
@@ -135,16 +285,18 @@ impl Dict {
     }
 
     fn parse(data: &[u8], off: usize, end: usize) -> Result<Dict> {
-        ensure!(off + 4 <= end, "dictionary at {off:#x} truncated");
-        let count = u32::from_le_bytes(data[off..off + 4].try_into().unwrap()) as usize;
+        const ID: usize = size_of::<u16>();
+        let ids = off + WORD;
+        ensure!(ids <= end, "dictionary at {off:#x} truncated");
+        let count = u32::from_le_bytes(data[off..ids].try_into().unwrap()) as usize;
         ensure!(
-            off + 4 + count * 2 <= end,
+            ids + count * ID <= end,
             "dictionary at {off:#x}: count {count} overruns"
         );
         let mut dict = Dict::default();
-        let mut p = off + 4 + count * 2;
+        let mut p = ids + count * ID;
         for i in 0..count {
-            let id_at = off + 4 + i * 2;
+            let id_at = ids + i * ID;
             let id = u16::from_le_bytes([data[id_at], data[id_at + 1]]);
             let nul = data[p..end]
                 .iter()
@@ -185,7 +337,7 @@ impl Dict {
         }
         let pad = self
             .pad
-            .unwrap_or_else(|| (8 - (out.len() - start) % 8) % 8);
+            .unwrap_or_else(|| (ALIGN - (out.len() - start) % ALIGN) % ALIGN);
         out.resize(out.len() + pad, 0);
     }
 }
@@ -205,49 +357,76 @@ pub struct Adf {
 }
 
 impl Adf {
+    /// An empty canonical (`-3`) file, as the engine's writer starts one:
+    /// only the root's close and two empty dictionaries. Names take ids in
+    /// first-use order as records are added.
+    pub(crate) fn new() -> Adf {
+        let mut root = Item::new(0, 0, 0);
+        root.close_off = 0;
+        Adf {
+            data: Vec::new(),
+            items: vec![root],
+            nodes: Dict::default(),
+            values: Dict::default(),
+            // Both kept words as every shipped canonical file has them.
+            trailer: Trailer {
+                version: Version::V3,
+                kept: [0, 8],
+                items: 0,
+                nodes: 0,
+                values: None,
+            },
+            max_node_id: Item::UNNAMED_NODE_ID,
+            max_value_id: Item::UNNAMED_VALUE_ID,
+        }
+    }
+
+    /// The names of the node and value dictionaries, in listing order.
+    pub(crate) fn listing(&self) -> [Vec<String>; 2] {
+        [&self.nodes, &self.values].map(|d| {
+            (d.entries.iter())
+                .map(|(_, n)| String::from_utf8_lossy(n).into_owned())
+                .collect()
+        })
+    }
+
+    /// Lists each dictionary's names in the order given (ids stay as they
+    /// are). Names not given keep their order, after those that are; the
+    /// engine's listing order is not id order, so a writer that allocates
+    /// ids afresh takes it from the file or the format's shipped files.
+    pub(crate) fn set_listing<S: AsRef<str>>(&mut self, nodes: &[S], values: &[S]) {
+        for (dict, order) in [(&mut self.nodes, nodes), (&mut self.values, values)] {
+            let rank = |name: &[u8]| {
+                (order.iter())
+                    .position(|o| o.as_ref().as_bytes() == name)
+                    .unwrap_or(usize::MAX)
+            };
+            dict.entries.sort_by_key(|(_, name)| rank(name));
+            dict.by_id.clear();
+            for (i, &(id, _)) in dict.entries.iter().enumerate() {
+                dict.by_id.entry(id).or_insert(i as u32);
+            }
+        }
+    }
+
     /// Decodes canonical `-3`/`-2` streams and 1800's older packed streams.
-    pub fn decode(bytes: &[u8]) -> Result<Adf> {
+    pub fn parse(bytes: &[u8]) -> Result<Adf> {
         let size = bytes.len();
         ensure!(size < u32::MAX as usize, "ADF: file exceeds 4 GiB");
-        ensure!(size >= 6, "ADF: {size} bytes is too small");
-        let word = |off: usize| u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
-        let marker = word(size - 4) as i32;
-        let (trailer, trailer_len, dict_a, dict_b) = match marker {
-            -3 => {
-                ensure!(
-                    size >= 24,
-                    "ADF: {size} bytes is too small for a -3 trailer"
-                );
-                let t = Trailer::V3 {
-                    w0: word(size - 24),
-                    w5: word(size - 8),
-                };
-                (t, 24, word(size - 16) as usize, word(size - 12) as usize)
-            }
-            -2 => {
-                ensure!(size >= 16, "ADF: file too short for a -2 trailer");
-                (
-                    Trailer::V2 {
-                        word: word(size - 8),
-                    },
-                    16,
-                    word(size - 16) as usize,
-                    word(size - 12) as usize,
-                )
-            }
-            m if (m as u32 as usize) <= size - 4 => {
-                (Trailer::Packed, 4, m as u32 as usize, size - 4)
-            }
-            m => bail!("ADF: unknown trailer marker {m:#x}"),
-        };
-        let dict_end = size - trailer_len;
+        // The shortest file: an empty packed one, two empty varint
+        // dictionaries and their offset.
+        ensure!(size >= 2 + WORD, "ADF: {size} bytes is too small");
+        let trailer = Trailer::read(bytes)?;
+        let layout = trailer.version.layout();
+        let dict_end = size - layout.trailer_len();
+        let (dict_a, dict_b) = (trailer.nodes, trailer.values.unwrap_or(dict_end));
         ensure!(
-            (matches!(trailer, Trailer::Packed) || dict_a % 8 == 0)
+            (layout.packed || dict_a.is_multiple_of(ALIGN))
                 && dict_a <= dict_b
                 && dict_b <= dict_end,
             "ADF: bad dictionary offsets {dict_a:#x}/{dict_b:#x} (size {size:#x})"
         );
-        let (nodes, values) = if matches!(trailer, Trailer::Packed) {
+        let (nodes, values) = if layout.packed {
             let mut pos = dict_a;
             let nodes = Dict::parse_packed(&bytes[..dict_end], &mut pos)?;
             let values = Dict::parse_packed(&bytes[..dict_end], &mut pos)?;
@@ -269,8 +448,8 @@ impl Adf {
             nodes,
             values,
             trailer,
-            max_node_id: UNNAMED_NODE_ID,
-            max_value_id: UNNAMED_VALUE_ID,
+            max_node_id: Item::UNNAMED_NODE_ID,
+            max_value_id: Item::UNNAMED_VALUE_ID,
         };
         adf.items.push(Item::new(0, 0, 0));
         adf.parse_records()?;
@@ -288,11 +467,12 @@ impl Adf {
         let mut stack: Vec<u32> = vec![0];
         let mut pos = 0usize;
         while pos < end {
-            let (id, off, len, next) = if matches!(self.trailer, Trailer::Packed) {
-                ensure!(pos + 2 <= end, "ADF: truncated packed record id");
-                let id = u16::from_le_bytes(self.data[pos..pos + 2].try_into().unwrap());
-                let mut payload = pos + 2;
-                let len = if id >= VALUE_ID_BASE {
+            let (id, off, len, next) = if self.trailer.version.layout().packed {
+                const ID: usize = size_of::<u16>();
+                ensure!(pos + ID <= end, "ADF: truncated packed record id");
+                let id = u16::from_le_bytes(self.data[pos..pos + ID].try_into().unwrap());
+                let mut payload = pos + ID;
+                let len = if id >= Item::VALUE_ID_BASE {
                     read_varint(&self.data, &mut payload)?
                 } else {
                     0
@@ -301,25 +481,28 @@ impl Adf {
                 ensure!(next <= end, "ADF: packed record at {pos:#x} overruns");
                 (id, payload as u32, len, next)
             } else {
-                ensure!(pos + 8 <= end, "ADF: record header at {pos:#x} overruns");
-                let size = u32::from_le_bytes(self.data[pos..pos + 4].try_into().unwrap()) as usize;
-                let tag = u32::from_le_bytes(self.data[pos + 4..pos + 8].try_into().unwrap());
+                // [u32 payload size][u32 id], the payload, zeros to ALIGN.
+                let payload = pos + RECORD_HEADER;
+                ensure!(payload <= end, "ADF: record header at {pos:#x} overruns");
+                let word =
+                    |at: usize| u32::from_le_bytes(self.data[at..at + WORD].try_into().unwrap());
+                let (size, tag) = (word(pos) as usize, word(pos + WORD));
                 ensure!(
-                    tag >> 16 == 0,
+                    u16::try_from(tag).is_ok(),
                     "ADF: record at {pos:#x} has reserved id bits {tag:#x}"
                 );
-                let padded = (size + 7) & !7;
+                let padded = size.next_multiple_of(ALIGN);
                 ensure!(
-                    pos + 8 + padded <= end,
+                    payload + padded <= end,
                     "ADF: record at {pos:#x} (size {size}) overruns the stream"
                 );
                 ensure!(
-                    self.data[pos + 8 + size..pos + 8 + padded]
+                    self.data[payload + size..payload + padded]
                         .iter()
                         .all(|&b| b == 0),
                     "ADF: record at {pos:#x} has non-zero padding"
                 );
-                (tag as u16, (pos + 8) as u32, size as u32, pos + 8 + padded)
+                (tag as u16, payload as u32, size as u32, payload + padded)
             };
             let Some(&cur) = stack.last() else {
                 bail!("ADF: record at {pos:#x} follows the root close");
@@ -331,7 +514,7 @@ impl Adf {
                 stack.pop();
             } else {
                 let new = self.push_item(cur, Item::new(id, off, len));
-                if id < VALUE_ID_BASE {
+                if id < Item::VALUE_ID_BASE {
                     self.max_node_id = self.max_node_id.max(id);
                     stack.push(new.0);
                 } else {
@@ -345,12 +528,12 @@ impl Adf {
 
     fn push_item(&mut self, parent: u32, item: Item) -> ItemId {
         let index = self.items.len() as u32;
-        assert!(index != NONE, "ADF: item count overflow");
+        assert!(index != Item::NONE, "ADF: item count overflow");
         self.items.push(item);
         let p = &mut self.items[parent as usize];
         let last = p.last;
         p.last = index;
-        if last == NONE {
+        if last == Item::NONE {
             p.first = index;
         } else {
             self.items[last as usize].next = index;
@@ -366,7 +549,7 @@ impl Adf {
         // Iterative walk; `true` entries emit the close of a finished node.
         let mut stack: Vec<(u32, bool)> = Vec::new();
         let root = &self.items[0];
-        if root.close_off != NONE {
+        if root.close_off != Item::NONE {
             stack.push((0, true));
         }
         self.push_children_rev(0, &mut stack);
@@ -378,51 +561,34 @@ impl Adf {
             }
             count += 1;
             self.write_record(&mut out, item.id, item.off, item.len);
-            if item.id < VALUE_ID_BASE {
-                if item.close_off != NONE {
+            if item.id < Item::VALUE_ID_BASE {
+                if item.close_off != Item::NONE {
                     stack.push((index, true));
                 }
                 self.push_children_rev(index, &mut stack);
             }
         }
+        let packed = self.trailer.version.layout().packed;
         let dict_a = out.len() as u32;
-        if matches!(self.trailer, Trailer::Packed) {
+        if packed {
             self.nodes.write_packed(&mut out);
         } else {
             self.nodes.write(&mut out);
         }
         let dict_b = out.len() as u32;
-        if matches!(self.trailer, Trailer::Packed) {
+        if packed {
             self.values.write_packed(&mut out);
         } else {
             self.values.write(&mut out);
         }
-        let items = count + 1;
-        let mut put = |v: u32| out.extend_from_slice(&v.to_le_bytes());
-        match self.trailer {
-            Trailer::V3 { w0, w5 } => {
-                put(w0);
-                put(items);
-                put(dict_a);
-                put(dict_b);
-                put(w5);
-                put(-3i32 as u32);
-            }
-            Trailer::V2 { word } => {
-                put(dict_a);
-                put(dict_b);
-                put(word);
-                put(-2i32 as u32);
-            }
-            Trailer::Packed => put(dict_a),
-        }
+        self.trailer.write(&mut out, count + 1, dict_a, dict_b);
         out
     }
 
     fn push_children_rev(&self, parent: u32, stack: &mut Vec<(u32, bool)>) {
         let start = stack.len();
         let mut c = self.items[parent as usize].first;
-        while c != NONE {
+        while c != Item::NONE {
             stack.push((c, false));
             c = self.items[c as usize].next;
         }
@@ -430,10 +596,10 @@ impl Adf {
     }
 
     fn write_record(&self, out: &mut Vec<u8>, id: u16, off: u32, len: u32) {
-        if matches!(self.trailer, Trailer::Packed) {
+        if self.trailer.version.layout().packed {
             out.extend_from_slice(&id.to_le_bytes());
-            if id >= VALUE_ID_BASE {
-                write_varint(out, len);
+            if id >= Item::VALUE_ID_BASE {
+                varint::write(out, len);
                 out.extend_from_slice(&self.data[off as usize..off as usize + len as usize]);
             } else {
                 assert!(len == 0, "packed ADF nodes cannot carry payloads");
@@ -444,7 +610,7 @@ impl Adf {
         out.extend_from_slice(&u32::from(id).to_le_bytes());
         let (off, len) = (off as usize, len as usize);
         out.extend_from_slice(&self.data[off..off + len]);
-        out.resize(out.len() + ((8 - len % 8) % 8), 0);
+        out.resize(out.len() + (len.next_multiple_of(ALIGN) - len), 0);
     }
 
     pub fn root(&self) -> ItemId {
@@ -461,7 +627,7 @@ impl Adf {
     pub fn children(&self, node: ItemId) -> impl Iterator<Item = ItemId> + '_ {
         let mut c = self.items[node.0 as usize].first;
         std::iter::from_fn(move || {
-            (c != NONE).then(|| {
+            (c != Item::NONE).then(|| {
                 let id = ItemId(c);
                 c = self.items[c as usize].next;
                 id
@@ -469,20 +635,20 @@ impl Adf {
         })
     }
 
-    /// Raw record id: below [`VALUE_ID_BASE`] for nodes, at or above for values.
-    pub fn record_id(&self, item: ItemId) -> u16 {
+    /// Raw record id: below [`Item::VALUE_ID_BASE`] for nodes, at or above for values.
+    pub(crate) fn record_id(&self, item: ItemId) -> u16 {
         self.items[item.0 as usize].id
     }
 
-    pub fn is_node(&self, item: ItemId) -> bool {
-        self.record_id(item) < VALUE_ID_BASE
+    pub(crate) fn is_node(&self, item: ItemId) -> bool {
+        self.record_id(item) < Item::VALUE_ID_BASE
     }
 
     /// Field name from the file's dictionaries; `None` for unnamed records
     /// and the root.
-    pub fn name(&self, item: ItemId) -> Option<&str> {
+    pub(crate) fn name(&self, item: ItemId) -> Option<&str> {
         let id = self.record_id(item);
-        let dict = if id < VALUE_ID_BASE {
+        let dict = if id < Item::VALUE_ID_BASE {
             &self.nodes
         } else {
             &self.values
@@ -510,7 +676,7 @@ impl Adf {
     }
 
     /// All children (nodes or values) sharing `name`, in file order.
-    pub fn children_named<'a>(
+    pub(crate) fn children_named<'a>(
         &'a self,
         parent: ItemId,
         name: &str,
@@ -522,14 +688,14 @@ impl Adf {
     }
 
     /// Follows a `/`-separated path of node names from `from`.
-    pub fn node(&self, from: ItemId, path: &str) -> Option<ItemId> {
+    pub(crate) fn node(&self, from: ItemId, path: &str) -> Option<ItemId> {
         path.split('/')
             .filter(|s| !s.is_empty())
             .try_fold(from, |at, seg| self.child_node(at, seg))
     }
 
     /// Like [`Adf::node`], but the last segment names a value.
-    pub fn value(&self, from: ItemId, path: &str) -> Option<ItemId> {
+    pub(crate) fn value(&self, from: ItemId, path: &str) -> Option<ItemId> {
         let (nodes, leaf) = path.rsplit_once('/').unwrap_or(("", path));
         self.child_value(self.node(from, nodes)?, leaf)
     }
@@ -550,11 +716,11 @@ impl Adf {
         })
     }
 
-    pub fn read_u8(&self, item: ItemId) -> Result<u8> {
+    pub(crate) fn read_u8(&self, item: ItemId) -> Result<u8> {
         Ok(self.fixed::<1>(item)?[0])
     }
 
-    pub fn read_u16(&self, item: ItemId) -> Result<u16> {
+    pub(crate) fn read_u16(&self, item: ItemId) -> Result<u16> {
         Ok(u16::from_le_bytes(self.fixed(item)?))
     }
 
@@ -562,11 +728,11 @@ impl Adf {
         Ok(u32::from_le_bytes(self.fixed(item)?))
     }
 
-    pub fn read_f32(&self, item: ItemId) -> Result<f32> {
+    pub(crate) fn read_f32(&self, item: ItemId) -> Result<f32> {
         Ok(f32::from_le_bytes(self.fixed(item)?))
     }
 
-    pub fn read_u64(&self, item: ItemId) -> Result<u64> {
+    pub(crate) fn read_u64(&self, item: ItemId) -> Result<u64> {
         Ok(u64::from_le_bytes(self.fixed(item)?))
     }
 
@@ -600,7 +766,7 @@ impl Adf {
 
     /// Replaces a payload. Same-length writes overwrite in place, so
     /// repeatedly saving large maps does not grow the arena.
-    pub fn set_payload(&mut self, item: ItemId, bytes: &[u8]) {
+    pub(crate) fn set_payload(&mut self, item: ItemId, bytes: &[u8]) {
         let it = self.items[item.0 as usize];
         if it.len as usize == bytes.len() {
             let off = it.off as usize;
@@ -616,7 +782,7 @@ impl Adf {
     fn append(&mut self, bytes: &[u8]) -> u32 {
         let off = self.data.len();
         assert!(
-            off + bytes.len() < NONE as usize,
+            off + bytes.len() < Item::NONE as usize,
             "ADF: payload arena exceeds 4 GiB"
         );
         self.data.extend_from_slice(bytes);
@@ -628,9 +794,9 @@ impl Adf {
     fn intern(&mut self, name: Option<&str>, value: bool) -> Result<u16> {
         let Some(name) = name else {
             let (id, dict) = if value {
-                (UNNAMED_VALUE_ID, &self.values)
+                (Item::UNNAMED_VALUE_ID, &self.values)
             } else {
-                (UNNAMED_NODE_ID, &self.nodes)
+                (Item::UNNAMED_NODE_ID, &self.nodes)
             };
             ensure!(
                 dict.name(id).is_none(),
@@ -648,7 +814,11 @@ impl Adf {
         let (max, limit, dict) = if value {
             (&mut self.max_value_id, u16::MAX, &mut self.values)
         } else {
-            (&mut self.max_node_id, VALUE_ID_BASE - 1, &mut self.nodes)
+            (
+                &mut self.max_node_id,
+                Item::VALUE_ID_BASE - 1,
+                &mut self.nodes,
+            )
         };
         ensure!(*max < limit, "ADF: id space exhausted adding {name:?}");
         *max += 1;
@@ -659,7 +829,7 @@ impl Adf {
 
     /// Appends a value leaf to `parent`. `None` adds an unnamed entry (array
     /// element), as in `FileNames`.
-    pub fn add_value(
+    pub(crate) fn add_value(
         &mut self,
         parent: ItemId,
         name: Option<&str>,
@@ -675,7 +845,7 @@ impl Adf {
     }
 
     /// Appends an empty node (opener + close) to `parent`.
-    pub fn add_node(&mut self, parent: ItemId, name: Option<&str>) -> Result<ItemId> {
+    pub(crate) fn add_node(&mut self, parent: ItemId, name: Option<&str>) -> Result<ItemId> {
         ensure!(
             self.is_node(parent),
             "ADF: nodes can only be added to nodes"
@@ -687,18 +857,18 @@ impl Adf {
     }
 
     /// Unlinks `item` from `parent`. Returns false when it is not a child.
-    pub fn remove(&mut self, parent: ItemId, item: ItemId) -> bool {
-        let mut prev = NONE;
+    pub(crate) fn remove(&mut self, parent: ItemId, item: ItemId) -> bool {
+        let mut prev = Item::NONE;
         let mut c = self.items[parent.0 as usize].first;
-        while c != NONE && c != item.0 {
+        while c != Item::NONE && c != item.0 {
             prev = c;
             c = self.items[c as usize].next;
         }
-        if c == NONE {
+        if c == Item::NONE {
             return false;
         }
         let next = self.items[c as usize].next;
-        if prev == NONE {
+        if prev == Item::NONE {
             self.items[parent.0 as usize].first = next;
         } else {
             self.items[prev as usize].next = next;
@@ -710,23 +880,15 @@ impl Adf {
     }
 
     /// Drops every child of `node`, keeping the node itself.
-    pub fn clear_children(&mut self, node: ItemId) {
+    pub(crate) fn clear_children(&mut self, node: ItemId) {
         let it = &mut self.items[node.0 as usize];
-        it.first = NONE;
-        it.last = NONE;
+        it.first = Item::NONE;
+        it.last = Item::NONE;
     }
 }
 
-/// FNV-1a 32-bit, the engine's field-name hash (matching is hash-only).
-pub fn fnv1a32(name: &[u8]) -> u32 {
-    name.iter().fold(0x811C_9DC5u32, |h, &b| {
-        // The engine hashes signed chars; bytes >= 0x80 sign-extend.
-        (h ^ (b as i8 as i32 as u32)).wrapping_mul(0x0100_0193)
-    })
-}
-
 /// UTF-16LE payload bytes for a path or name, without terminator.
-pub fn utf16_bytes(text: &str) -> Vec<u8> {
+pub(crate) fn utf16_bytes(text: &str) -> Vec<u8> {
     text.encode_utf16().flat_map(u16::to_le_bytes).collect()
 }
 
@@ -755,26 +917,46 @@ mod tests {
     }
 
     fn roundtrip(bytes: &[u8]) -> Adf {
-        let adf = Adf::decode(bytes).unwrap();
+        let adf = Adf::parse(bytes).unwrap();
         let out = adf.encode();
         assert_eq!(out.len(), bytes.len());
         assert!(out == bytes, "re-encode differs");
         adf
     }
 
+    // Each dialect through the writer: a tree built in it reads back in
+    // it, with the trailer words it keeps (1800's V2 stores 8) and its item
+    // count, and re-encodes the same.
     #[test]
-    fn anno1800_v2_trailer_word_is_preserved() {
-        let mut bytes = Vec::new();
-        for word in [4u32, 0x8001, 42, 0, 0, 0] {
-            bytes.extend_from_slice(&word.to_le_bytes());
+    fn each_dialect_writes_and_reads_back() {
+        for version in [Version::V3, Version::V2, Version::Packed] {
+            let kept = [8, 5];
+            let mut adf = Adf::new();
+            adf.trailer = Trailer {
+                version,
+                kept,
+                ..adf.trailer
+            };
+            let root = adf.add_node(adf.root(), Some("Root")).unwrap();
+            adf.add_value(root, Some("Value"), &42u32.to_le_bytes())
+                .unwrap();
+            adf.add_value(root, None, b"abc").unwrap();
+            let bytes = adf.encode();
+            let t = Trailer::read(&bytes).unwrap();
+            assert_eq!(t.version, version);
+            let slots = version.layout().trailer;
+            let n = slots.iter().filter(|&&s| s == Slot::Kept).count();
+            assert_eq!(t.kept[..n], kept[..n], "{version:?}");
+            if slots.contains(&Slot::Items) {
+                assert_eq!(t.items, 4, "root, Root, Value, the unnamed value");
+            }
+            let back = roundtrip(&bytes);
+            let value = back.value(back.root(), "Root/Value").unwrap();
+            assert_eq!(back.read_u32(value).unwrap(), 42);
+            let root = back.node(back.root(), "Root").unwrap();
+            let unnamed = back.children(root).nth(1).unwrap();
+            assert_eq!(back.payload(unnamed), b"abc");
         }
-        bytes.extend_from_slice(&1u32.to_le_bytes());
-        bytes.extend_from_slice(&0x8001u16.to_le_bytes());
-        bytes.extend_from_slice(b"Value\0\0\0\0\0");
-        for word in [16u32, 24, 8, -2i32 as u32] {
-            bytes.extend_from_slice(&word.to_le_bytes());
-        }
-        roundtrip(&bytes);
     }
 
     #[test]
@@ -787,10 +969,14 @@ mod tests {
         let item = adf.value(adf.root(), "Root/Value").unwrap();
         assert_eq!(adf.read_u32(item).unwrap(), 42);
         adf.set_payload(item, &99u32.to_le_bytes());
+        // Only the value's bytes change.
         let edited = adf.encode();
-        assert_eq!(&edited[..5], &bytes[..5]);
-        assert_eq!(&edited[9..], &bytes[9..]);
-        let back = Adf::decode(&edited).unwrap();
+        let old = 42u32.to_le_bytes();
+        let at = bytes.windows(old.len()).position(|w| w == old).unwrap();
+        let mut want = bytes.to_vec();
+        want[at..at + old.len()].copy_from_slice(&99u32.to_le_bytes());
+        assert_eq!(edited, want);
+        let back = Adf::parse(&edited).unwrap();
         assert_eq!(
             back.read_u32(back.value(back.root(), "Root/Value").unwrap())
                 .unwrap(),
@@ -799,7 +985,7 @@ mod tests {
         adf.set_payload(item, &[7; 140]);
         let root = adf.node(adf.root(), "Root").unwrap();
         adf.add_value(root, Some("Extra"), b"abc").unwrap();
-        let back = Adf::decode(&adf.encode()).unwrap();
+        let back = Adf::parse(&adf.encode()).unwrap();
         assert_eq!(
             back.payload(back.value(back.root(), "Root/Value").unwrap()),
             &[7; 140]
@@ -810,31 +996,44 @@ mod tests {
         );
     }
 
+    // A packed value's length padded to two bytes (`84 00` for 4) is refused,
+    // though it reads as the same value: the codec reads only what it writes
+    // back byte for byte.
+    #[test]
+    fn padded_packed_length_is_refused() {
+        let bytes =
+            b"\x02\0\x01\x80\x84\x00\x2a\0\0\0\0\0\0\0\x01Root\0\x02\0\x01Value\0\x01\x80\x0e\0\0\0";
+        let err = format!("{:#}", Adf::parse(bytes).unwrap_err());
+        assert!(err.contains("varint at 0x4"), "{err}");
+    }
+
     #[test]
     fn empty_packed_file_and_truncated_trailers() {
         roundtrip(&[0; 6]);
         for len in 0..6 {
-            assert!(Adf::decode(&vec![0; len]).is_err());
+            assert!(Adf::parse(&vec![0; len]).is_err());
         }
-        let mut invalid = [0u8; 8];
-        for marker in [-3i32, -2] {
-            invalid[4..].copy_from_slice(&marker.to_le_bytes());
-            assert!(Adf::decode(&invalid).is_err());
+        // A canonical marker with no room for its trailer.
+        let mut invalid = [0u8; 2 * WORD];
+        let last = invalid.len() - WORD;
+        for layout in [&Layout::V3, &Layout::V2] {
+            invalid[last..].copy_from_slice(&layout.marker.unwrap().to_le_bytes());
+            assert!(Adf::parse(&invalid).is_err());
         }
     }
 
     #[test]
     fn installed_1800_island_adf_roundtrips() {
-        let Some(dir) = std::env::var_os("ANNO1800_DIR") else {
+        let Some(dir) = crate::vfs::install_dir("ANNO1800_DIR") else {
             return;
         };
-        let install = crate::vfs::Install::open(dir).unwrap();
+        let install = crate::vfs::Install::open(dir, crate::vfs::Install::DATA_FIRST).unwrap();
         let mut checked = 0;
         for id in install.search(".a7m", 100_000) {
             let path = install.file_path(id);
             let bytes = install.read_file(id).unwrap();
             let members = if path.ends_with(".a7m") {
-                let archive = crate::rda::Archive::from_bytes(bytes, path).unwrap();
+                let archive = crate::rda::Archive::parse(bytes, &path).unwrap();
                 vec![
                     ("gamedata.data", archive.read_path("gamedata.data").unwrap()),
                     ("rd3d.data", archive.read_path("rd3d.data").unwrap()),
@@ -845,7 +1044,7 @@ mod tests {
                 continue;
             };
             for (member, bytes) in members {
-                let adf = Adf::decode(&bytes).unwrap_or_else(|e| panic!("{path}/{member}: {e:#}"));
+                let adf = Adf::parse(&bytes).unwrap_or_else(|e| panic!("{path}/{member}: {e:#}"));
                 assert_eq!(adf.encode(), bytes, "{path}/{member}");
                 checked += 1;
             }
@@ -892,7 +1091,7 @@ mod tests {
         let Ok(bytes) = std::fs::read(extract_dir().join("a7m_test/rd3d.data")) else {
             return;
         };
-        let adf = Adf::decode(&bytes).unwrap();
+        let adf = Adf::parse(&bytes).unwrap();
         let t = adf.child_node(adf.root(), "Terrain").unwrap();
         assert_eq!(
             adf.read_u32(adf.child_value(t, "GridWidth").unwrap())
@@ -936,7 +1135,7 @@ mod tests {
         let Some(f) = files.first() else {
             return;
         };
-        let mut adf = Adf::decode(&std::fs::read(f).unwrap()).unwrap();
+        let mut adf = Adf::parse(&std::fs::read(f).unwrap()).unwrap();
         let root = adf.root();
         let map_size = adf.child_value(root, "MapSize").unwrap();
         adf.set_payload(map_size, &((7u64 << 32) | 9).to_le_bytes());
@@ -954,7 +1153,7 @@ mod tests {
         assert!(adf.remove(root, adf.child_node(root, "MapSource").unwrap()));
 
         let bytes = adf.encode();
-        let back = Adf::decode(&bytes).unwrap();
+        let back = Adf::parse(&bytes).unwrap();
         let r = back.root();
         assert_eq!(
             back.read_u64(back.child_value(r, "MapSize").unwrap())
@@ -977,7 +1176,7 @@ mod tests {
             "hi"
         );
         let kids: Vec<_> = back.children(extra).collect();
-        assert_eq!(back.record_id(kids[1]), VALUE_ID_BASE);
+        assert_eq!(back.record_id(kids[1]), Item::VALUE_ID_BASE);
         assert_eq!(back.record_id(kids[2]), 1);
         assert_eq!(
             back.read_u8(back.child_value(kids[2], "Flag").unwrap())
@@ -987,11 +1186,7 @@ mod tests {
         assert!(back.child_node(r, "MapSource").is_none());
         // Trailer items = 1 + every opener and value; re-encode is stable.
         assert_eq!(back.encode(), bytes);
-        let items = u32::from_le_bytes(
-            bytes[bytes.len() - 20..bytes.len() - 16]
-                .try_into()
-                .unwrap(),
-        );
+        let items = Trailer::read(&bytes).unwrap().items;
         let mut n = 0;
         let mut stack = vec![r];
         while let Some(i) = stack.pop() {
@@ -1005,24 +1200,18 @@ mod tests {
 
     #[test]
     fn rejects_garbage() {
-        assert!(Adf::decode(&[0; 8]).is_err());
-        let mut b = vec![0u8; 24];
-        b[20..].copy_from_slice(&(-1i32).to_le_bytes());
+        assert!(Adf::parse(&[0; 8]).is_err());
+        let mut b = vec![0u8; Layout::V3.trailer_len()];
+        let last = b.len() - WORD;
+        b[last..].copy_from_slice(&(-1i32).to_le_bytes());
         assert!(
-            Adf::decode(&b)
+            Adf::parse(&b)
                 .unwrap_err()
                 .to_string()
                 .contains("unknown trailer marker")
         );
-        b[20..].copy_from_slice(&7i32.to_le_bytes());
-        assert!(Adf::decode(&b).is_err());
-    }
-
-    #[test]
-    fn hashes_like_the_engine() {
-        assert_eq!(fnv1a32(b"Terrain"), 0xA7FF_0CAE);
-        assert_eq!(fnv1a32(b"ArchiveMap"), 0xAD97_8431);
-        assert_eq!(fnv1a32(b""), 0x811C_9DC5);
+        b[last..].copy_from_slice(&7i32.to_le_bytes());
+        assert!(Adf::parse(&b).is_err());
     }
 
     // Flattened pre-order (kind, id, name, payload) of nodes and values.
@@ -1098,7 +1287,7 @@ mod tests {
         let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
         let mut theirs = Flat::new();
         flatten_python(&doc["tree"], &mut theirs);
-        let adf = Adf::decode(&std::fs::read(file).unwrap()).unwrap();
+        let adf = Adf::parse(&std::fs::read(file).unwrap()).unwrap();
         let mut ours = Flat::new();
         flatten_ours(&adf, adf.root(), &mut ours);
         assert!(!ours.is_empty());
@@ -1108,13 +1297,13 @@ mod tests {
     // file_h.db: ~90 MB, ~600k nodes. Needs the installed game.
     #[test]
     fn roundtrips_file_h_db() {
-        let Ok(dir) = std::env::var("ANNO117_DIR") else {
+        let Some(dir) = crate::vfs::install_dir("ANNO117_DIR") else {
             eprintln!("skip: ANNO117_DIR unset");
             return;
         };
         let bytes = std::fs::read(Path::new(&dir).join("maindata/file_h.db")).unwrap();
         let t = std::time::Instant::now();
-        let adf = Adf::decode(&bytes).unwrap();
+        let adf = Adf::parse(&bytes).unwrap();
         eprintln!(
             "file_h.db: decoded {} MB in {:?}",
             bytes.len() >> 20,

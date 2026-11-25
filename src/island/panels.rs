@@ -3,7 +3,8 @@
 // scene layers, the ground-material palette and the inspector.
 use super::*;
 use crate::editor::{Editor, Workspace, empty_pane};
-use anno_formats::{assets::Assets, game::ResourceSlots, session::SessionSettings};
+use anno_core::game::{AssetWords, IslandRules, ResourceSlots};
+use anno_formats::{a7m::session::SessionSettings, assets::Assets};
 use gpui_editor_kit::{
     field::{clear_search, text_field},
     tree,
@@ -149,33 +150,61 @@ fn object_name(assets: Option<&Assets>, guid: u32) -> String {
 const THUMB: f32 = 72.;
 
 impl Editor {
+    /// Opens the island at `path`, asking first when the open one has
+    /// edits (`Editor::leave`); the same island just shows.
     pub fn open_island(&mut self, path: &str, cx: &mut Context<Self>) {
+        self.leave(crate::editor::Leave::Island(path.to_owned()), cx);
+    }
+
+    /// Loads the island at `path` off the UI thread. `discarded`: see
+    /// `Editor::go`.
+    pub(crate) fn load_island(&mut self, path: &str, discarded: bool, cx: &mut Context<Self>) {
+        let words = self.asset_words();
+        if !self.require_workspace(Workspace::Island) {
+            return;
+        }
         let Some(install) = self.install.clone() else {
             return self.message("No install is open", true);
         };
-        if let Some(island) = &self.island
-            && island.dirty()
-        {
-            // The same island is already open with its edits; another one
-            // asks before they are dropped.
-            if island.path != path {
-                self.leaving = Some(crate::editor::Leave::Island(path.to_owned()));
-            }
-            return;
-        }
         self.message(format!("Loading {path}…"), false);
         let path = path.to_owned();
         // With assets.xml in, the models load alongside the island.
         let shared = self.assets.clone().map(|a| (install.clone(), a));
+        let module = self.module;
+        // A clean island left closes now and is dropped on the worker
+        // before the next one reads anything: kept on screen until the next
+        // arrived, both held their memory at the load's peak, 2.36 GB
+        // instead of 1.88 reopening 117's continental island. Its file
+        // opens again as it was if this load fails. An edited one, whose
+        // edits the modder chose to discard, stays until the next is in,
+        // so a failed load still has it. Either way only its last frames
+        // stay on screen past it, one view-sized texture each.
+        let left = match self.island.as_ref().is_some_and(|i| i.dirty()) {
+            true => None,
+            false => self.island.take(),
+        };
+        if let Some(left) = &left {
+            self.island_stills = left.views.each_ref().map(|v| v.viewport.still());
+        }
         cx.spawn(async move |this, cx| {
             let loaded = cx
                 .background_executor()
                 .spawn({
                     let path = path.clone();
-                    async move { IslandEditor::load_with(&install, &path, shared) }
+                    async move {
+                        drop(left);
+                        IslandEditor::load_with(module, &install, &path, shared)
+                    }
                 })
                 .await;
             this.update(cx, |this, cx| {
+                // One opened while this loaded and edited since, not by a
+                // choice to discard: ask again instead of dropping it.
+                if loaded.is_ok() && !discarded && this.island.as_ref().is_some_and(|i| i.dirty()) {
+                    this.leaving = Some(crate::editor::Leave::Island(path.clone()));
+                    cx.notify();
+                    return;
+                }
                 match loaded {
                     Ok(mut island) => {
                         // An island this project made opens as a new one
@@ -186,9 +215,20 @@ impl Editor {
                         // The name only: region and size head the
                         // Inspector, and a second copy here listed them in
                         // another order.
-                        this.message(format!("Opened {}", island_title(&path)), false);
+                        this.message(format!("Opened {}", island_title(words, &path)), false);
                         island.fit_island();
-                        this.island = Some(island);
+                        // One opened while this loaded frees its document,
+                        // meshes and models off the UI thread, 2 to 11 ms;
+                        // its GPU memory goes on a thread of its own anyway
+                        // (gpu::Renderer's drop).
+                        if let Some(left) = this.island.replace(island) {
+                            // A discarded one drew until now; its last
+                            // frames stand in until the new views draw.
+                            this.island_stills = left.views.each_ref().map(|v| v.viewport.still());
+                            cx.background_executor()
+                                .spawn(async move { drop(left) })
+                                .detach();
+                        }
                         this.switch(Workspace::Island);
                         // Finish the trip Place on island started.
                         if let (Some(cfg), Some(island)) =
@@ -197,7 +237,10 @@ impl Editor {
                             island.choose_prop(&cfg);
                         }
                     }
-                    Err(e) => this.message(format!("Could not open {path}: {e:#}"), true),
+                    Err(e) => {
+                        this.island_stills = [None, None];
+                        this.message(format!("Could not open {path}: {e:#}"), true)
+                    }
                 }
                 cx.notify();
             })
@@ -262,7 +305,7 @@ impl Editor {
         let Some(i) = &mut self.island else {
             return self.message("No island open", true);
         };
-        let baked = tint::bake(&i.doc.field, i.world());
+        let baked = tint::bake(&i.island.doc.field, i.world());
         i.replace_tint(Ok(baked), "Baked tint from the terrain".to_owned());
         cx.notify();
     }
@@ -286,7 +329,7 @@ impl Editor {
             };
             this.update(cx, |this, cx| {
                 if let Some(i) = &mut this.island {
-                    match i.doc.tint.as_deref().map(|t| tint::export(t, &path)) {
+                    match i.island.doc.tint.as_deref().map(|t| tint::export(t, &path)) {
                         Some(Ok(())) => i.say(format!("Tint written to {}", path.display()), false),
                         Some(Err(e)) => i.say(format!("Export failed: {e:#}"), true),
                         None => i.say("This island has no tint", true),
@@ -362,9 +405,16 @@ impl Editor {
     /// Strokes that land while a bake runs mark it stale again, so the last
     /// stroke always gets a bake.
     pub fn island_background_work(&mut self, cx: &mut Context<Self>) {
+        if let Some(i) = &mut self.island {
+            i.background_scene = true;
+        }
         self.island_models_work(cx);
         self.start_harbour_library(cx);
         self.island_land_work(cx);
+        self.island_sky_work(cx);
+        self.island_inland_work(cx);
+        self.island_placement_work(cx);
+        self.island_rails_work(cx);
         let Some(job) = self
             .island
             .as_mut()
@@ -385,6 +435,101 @@ impl Editor {
                         Ok(texture) => i.set_ground(texture),
                         Err(e) => i.say(format!("Ground bake failed: {e:#}"), true),
                     }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Builds the planned placement rows off the UI thread
+    /// (`IslandEditor::placement_job`), one build at a time.
+    fn island_placement_work(&mut self, cx: &mut Context<Self>) {
+        let Some(job) = self.island.as_mut().and_then(|i| i.placement_job()) else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let built = cx.background_executor().spawn(async move { job() }).await;
+            this.update(cx, |this, cx| {
+                if let Some(i) = &mut this.island {
+                    i.placement_built(built);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Builds the rivers and lakes' surface off the UI thread
+    /// (`IslandEditor::inland_job`), one build at a time.
+    fn island_inland_work(&mut self, cx: &mut Context<Self>) {
+        let Some(job) = self.island.as_mut().and_then(|i| i.inland_job()) else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let built = cx.background_executor().spawn(async move { job() }).await;
+            this.update(cx, |this, cx| {
+                if let Some(i) = &mut this.island {
+                    i.inland_built(built);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Bends the work areas' rails off the UI thread
+    /// (`IslandEditor::rails_job`), one bend at a time.
+    fn island_rails_work(&mut self, cx: &mut Context<Self>) {
+        let Some(job) = self.island.as_mut().and_then(|i| i.rails_job()) else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let built = cx.background_executor().spawn(async move { job() }).await;
+            this.update(cx, |this, cx| {
+                if let Some(i) = &mut this.island {
+                    i.rails_built(built);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Bakes the island's sky off the UI thread (`IslandEditor::sky_job`).
+    fn island_sky_work(&mut self, cx: &mut Context<Self>) {
+        let Some(job) = self.island.as_mut().and_then(|i| i.sky_job()) else {
+            // Drifting clouds want a bake every step even while nothing
+            // else redraws the panels: one wake-up at a time.
+            let Some(island) = self.island.as_mut().filter(|i| !i.sky_ticking) else {
+                return;
+            };
+            let Some(wait) = island.sky_due_in() else {
+                return;
+            };
+            island.sky_ticking = true;
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(wait).await;
+                this.update(cx, |this, cx| {
+                    if let Some(i) = &mut this.island {
+                        i.sky_ticking = false;
+                    }
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let baked = cx.background_executor().spawn(async move { job() }).await;
+            this.update(cx, |this, cx| {
+                if let Some(i) = &mut this.island {
+                    i.sky_baked(baked);
                 }
                 cx.notify();
             })
@@ -441,6 +586,7 @@ impl Editor {
     /// The floating tool panel over the viewport: tool icons, and
     /// underneath the active tool's options.
     fn island_tool_bar(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        let words = self.asset_words();
         let island = self
             .island
             .as_ref()
@@ -501,24 +647,7 @@ impl Editor {
             if n > 0 {
                 icons = icons.child(widgets::toolbar_separator().mt(px(18.)));
             }
-            icons = icons.child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(1.))
-                    .child(
-                        // Quieter than the tool names under them (at one
-                        // size the strip read as two rows of labels), but
-                        // muted rather than disabled: they name real groups.
-                        div()
-                            .pl_1()
-                            .text_size(px(10.))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme::get().muted)
-                            .child(caption),
-                    )
-                    .child(row),
-            );
+            icons = icons.child(widgets::tool_group(caption, row));
         }
         // Camera commands with names, not only F: the island, or what is
         // selected.
@@ -670,12 +799,12 @@ impl Editor {
                     && island.library_tab == super::catalog::Kind::Mod
                     && self.model_entries().is_empty();
                 let name = match &island.place_object {
-                    Some((_, Some(config))) => Some(pretty(mesh_name(config))),
+                    Some((_, Some(config))) => Some(pretty(words, mesh_name(config))),
                     Some((t, None)) => Some(object_name(self.assets.as_deref(), t.object.guid)),
                     None => island
                         .place
-                        .and_then(|f| island.doc.meshes.get(f as usize))
-                        .map(|m| pretty(mesh_name(m))),
+                        .and_then(|f| island.island.doc.meshes.get(f as usize))
+                        .map(|m| pretty(words, mesh_name(m))),
                 };
 
                 options = match name {
@@ -860,21 +989,9 @@ impl Editor {
         // the right edge.
         // Fit and Frame end the icon row, after a rule: camera commands,
         // not tool settings, and fixed in place whichever tool is active.
-        icons = icons.child(widgets::toolbar_separator().mt(px(18.))).child(
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(1.))
-                .child(
-                    div()
-                        .pl_1()
-                        .text_size(px(10.))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(theme::get().muted)
-                        .child("View"),
-                )
-                .child(camera),
-        );
+        icons = icons
+            .child(widgets::toolbar_separator().mt(px(18.)))
+            .child(widgets::tool_group("View", camera));
         // One panel floating over the viewport: icons, then the settings
         // across its full width.
         div().flex().child(
@@ -893,7 +1010,33 @@ impl Editor {
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let island = self.island.as_ref().expect("options render with an island");
-        if island.doc.grids.is_none() {
+        if island.edits_blockers() {
+            let mut edits = div().flex().flex_wrap().gap_1().max_w(px(560.));
+            for edit in grids::BlockerEdit::ALL {
+                edits = edits.child(
+                    button(edit.label(), island.blocker == edit)
+                        .text_size(px(11.))
+                        .h(px(25.))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(i) = &mut this.island {
+                                i.blocker = edit;
+                                i.drop_outline();
+                            }
+                            cx.notify();
+                        })),
+                );
+            }
+            let hint = match island.blocker {
+                grids::BlockerEdit::Paths(_) => "Blocks movement in 0.5 m cells; Shift clears",
+                grids::BlockerEdit::Shapes => {
+                    "The game fills its no-build cells from these at load"
+                }
+            };
+            return options
+                .child(edits)
+                .child(div().px_1().text_size(px(11.)).child(hint));
+        }
+        if island.island.doc.grids.is_none() {
             return options.child(
                 div()
                     .px_1()
@@ -904,6 +1047,7 @@ impl Editor {
         let mut layers = div().flex().flex_wrap().gap_1().max_w(px(560.));
         for kind in grids::PAINTABLE {
             if island
+                .island
                 .doc
                 .grids
                 .as_ref()
@@ -919,9 +1063,9 @@ impl Editor {
                         if let Some(i) = &mut this.island {
                             i.grid = kind;
                             // Two-entry legends paint their "on" value.
-                            i.grid_value = match kind.legend(i.game).as_slice() {
+                            i.grid_value = match grids::legend(i.rules(), kind).as_slice() {
                                 [_, (on, _)] => *on,
-                                _ => i.grid_value.min(grids::max_value(i.game, kind)).max(1),
+                                _ => i.grid_value.min(grids::max_value(i.rules(), kind)).max(1),
                             };
                         }
                         cx.notify();
@@ -929,7 +1073,7 @@ impl Editor {
             );
         }
         options = options.child(layers);
-        if island.grid == anno_formats::grids::Kind::WaterFlow {
+        if island.grid == anno_formats::a7m::grids::Kind::WaterFlow {
             return options.child(
                 div()
                     .px_1()
@@ -937,7 +1081,7 @@ impl Editor {
                     .child("Drag to comb the current along the stroke; Shift calms it"),
             );
         }
-        if island.grid == anno_formats::grids::Kind::AreaIds {
+        if island.grid == anno_formats::a7m::grids::Kind::AreaIds {
             return options
                 .child(
                     div()
@@ -1016,7 +1160,26 @@ impl Editor {
                     .on_click(derive(None)),
             ),
         );
-        let legend = island.grid.legend(island.game);
+        if island.grid == Kind::Marsh {
+            let on = island.marsh_shape;
+            options = options.child(
+                button("Shape marsh", on)
+                    .text_size(px(11.))
+                    .h(px(25.))
+                    .tooltip(Tooltip::text(
+                        "Shape marsh",
+                        "",
+                        "Also lays the ground the way shipped marshes are: flat at 0.5 m, the Marsh environment, marsh floor and reeds. Shift only clears the marsh cells",
+                    ))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(i) = &mut this.island {
+                            i.marsh_shape = !i.marsh_shape;
+                        }
+                        cx.notify();
+                    })),
+            );
+        }
+        let legend = grids::legend(island.rules(), island.grid);
         if legend.len() > 2 {
             // Long legends (environment types): a numbered field plus the name.
             let name = legend
@@ -1053,6 +1216,7 @@ impl Editor {
             .max_w(px(620.));
         for (k, &file) in island.scatter.files.iter().enumerate() {
             let path = island
+                .island
                 .doc
                 .meshes
                 .get(file as usize)
@@ -1293,6 +1457,10 @@ impl Editor {
             .map(|e| e.display());
         let value = match (field, island.level) {
             (Field::Level, None) => "stroke".to_owned(),
+            (Field::TimeOfDay, _) => {
+                let minutes = (island.time_of_day * 60.).round() as u32 % (24 * 60);
+                format!("{:02}:{:02}", minutes / 60, minutes % 60)
+            }
             _ => {
                 let v = island.field_value(field);
                 // Fewer decimals where they are noise. Positions keep one,
@@ -1397,7 +1565,37 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let words = self.asset_words();
         self.island_background_work(cx);
+        // The island before this one, until this one has a frame of its own.
+        if self
+            .island
+            .as_ref()
+            .is_some_and(|i| i.views[view].viewport.has_frame())
+        {
+            self.island_stills[view] = None;
+        }
+        let still = self.island_stills[view].clone();
+        if self.island.is_none()
+            && let Some(still) = still.clone()
+        {
+            return div()
+                .id(("island-still", view))
+                .size_full()
+                .bg(theme::get().viewport)
+                .child(
+                    canvas(
+                        |_, _, _| {},
+                        move |bounds, _, window, _| {
+                            window.with_content_mask(Some(ContentMask { bounds }), |window| {
+                                still.paint(bounds, window)
+                            });
+                        },
+                    )
+                    .size_full(),
+                )
+                .into_any_element();
+        }
         let Some(island) = &mut self.island else {
             return widgets::empty_state_icon(
                 gpui_editor_kit::icon::Icon::ISLAND,
@@ -1429,7 +1627,7 @@ impl Editor {
                             },
                         )
                         .on_click(cx.listener(|this, _, _, cx| {
-                            this.open_wizard();
+                            this.open_wizard(cx);
                             cx.notify();
                         })),
                     )
@@ -1446,6 +1644,11 @@ impl Editor {
         };
         island.refresh_scene();
         island.push_overlay();
+        // The refresh may have planned rows or asked for a new river
+        // surface or rails just now.
+        self.island_inland_work(cx);
+        self.island_placement_work(cx);
+        self.island_rails_work(cx);
         let entity = cx.entity();
         let paint_entity = entity.clone();
         let tools = self.island_tool_bar(window, cx);
@@ -1479,32 +1682,79 @@ impl Editor {
                         let this = paint_entity.read(cx);
                         let Some(island) = &this.island else { return };
                         window.with_content_mask(Some(ContentMask { bounds }), |window| {
+                            // Until the new view hands over its first frame;
+                            // a present after that reuses this paint.
+                            if let Some(still) = &still
+                                && !island.views[view].viewport.has_frame()
+                            {
+                                still.paint(bounds, window);
+                            }
                             island.paint_view(view, bounds, window);
                         });
                     },
                 )
                 .size_full(),
             );
+        // The kit draws placements only through its arena; where the window's
+        // GPU lacks it, the pane stays empty (gpu::supported).
+        if island.views[view].viewport.unsupported() {
+            root = root.child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_color(theme::get().muted)
+                    .child("This GPU can't draw the 3D view: it lacks binding arrays with non-uniform indexing."),
+            );
+        }
         // Assigned test-map resources next to their slots. Positions use the
         // bounds of the last paint, so they trail a camera move by a frame.
+        // Every slot keeps a marker while placing, so new ones go where
+        // there are none yet: a dot on the spot in the kind's colour, square
+        // when fixed. Only the kind being placed is named; every name at
+        // once piled up along a mine ridge.
         if island.tool == Tool::Slot {
             let v = &island.views[view];
             let extent = island.extent();
-            for (at, label) in island.slot_labels() {
-                let p = v
-                    .camera
-                    .project([at[0], at[1] + 2., at[2]], v.bounds, extent);
+            for mark in island.slot_marks() {
+                let p = v.camera.project(mark.at, v.bounds, extent);
+                let (x, y) = (p.x - v.bounds.origin.x, p.y - v.bounds.origin.y);
+                if x < px(0.) || y < px(0.) || x > v.bounds.size.width || y > v.bounds.size.height {
+                    continue;
+                }
+                let hue = slot_hue(mark.resource);
                 root = root.child(
                     div()
                         .absolute()
-                        .left(p.x - v.bounds.origin.x + px(6.))
-                        .top(p.y - v.bounds.origin.y - px(8.))
-                        .px_1()
-                        .rounded(px(3.))
-                        .bg(rgba(crate::colors::LABEL_BG))
-                        .text_size(px(10.))
-                        .text_color(rgb(crate::colors::PICK))
-                        .child(label),
+                        .left(x - px(6.))
+                        .top(y - px(6.))
+                        .flex()
+                        .items_center()
+                        .gap(px(4.))
+                        .when(!mark.current, |d| d.opacity(0.7))
+                        .child(
+                            div()
+                                .size(px(12.))
+                                .when(mark.fixed, |d| d.rounded(px(2.)))
+                                .when(!mark.fixed, |d| d.rounded_full())
+                                .border_2()
+                                .border_color(rgb(crate::colors::CASING))
+                                .bg(rgb(hue)),
+                        )
+                        .when(mark.current, |d| {
+                            d.child(
+                                div()
+                                    .px_1()
+                                    .rounded(px(3.))
+                                    .bg(rgba(crate::colors::LABEL_BG))
+                                    .text_size(px(10.))
+                                    .text_color(rgb(hue))
+                                    .whitespace_nowrap()
+                                    .child(mark.label),
+                            )
+                        }),
                 );
             }
         }
@@ -1537,7 +1787,11 @@ impl Editor {
             // backs is the one the gizmo never covers.
             let ceiling = corners.iter().map(|c| c[1]).fold(f32::MIN, f32::max);
             let top = project([mid(0), ceiling, mid(2)]);
-            let pivot = island.doc.matrix(item).map(|m| math::translation(&m));
+            let pivot = island
+                .island
+                .doc
+                .matrix(item)
+                .map(|m| math::translation(&m));
             let p = match pivot {
                 Some(o) if color != crate::colors::HANDLE => {
                     let at = project(o);
@@ -1577,7 +1831,7 @@ impl Editor {
                 .item_cfg(item)
                 .filter(|_| color == crate::colors::HANDLE)
             {
-                Some(cfg) => format!("{} · #{id}", pretty(mesh_name(&cfg))),
+                Some(cfg) => format!("{} · #{id}", pretty(words, mesh_name(&cfg))),
                 None => format!("#{id}"),
             };
             root = root.child(
@@ -1598,7 +1852,7 @@ impl Editor {
         if !self.stats {
             let ours = self.project.islands.iter().any(|i| i.path == island.path);
             let file = island.path.rsplit('/').next().unwrap_or("").to_owned();
-            let name = island_title(&island.path);
+            let name = island_title(words, &island.path);
             root = root.child(
                 widgets::floating_surface(("island-document", view))
                     .tooltip(Tooltip::text(
@@ -1629,12 +1883,8 @@ impl Editor {
                     // names the prop, and "Medium 01" alone is three
                     // islands. Its game name, as the Inspector heading says it.
                     .when_some(
-                        island
-                            .path
-                            .split("/provinces/")
-                            .nth(1)
-                            .and_then(|r| r.split('/').next())
-                            .map(wizard::province_short),
+                        Some(island.rules().province_short(&island.region()))
+                            .filter(|r| !r.is_empty()),
                         |d, region| {
                             d.child(widgets::middot())
                                 .child(div().text_color(theme::get().muted).child(region))
@@ -1891,10 +2141,11 @@ impl Editor {
             && let (Some(install), Some(assets)) = (self.install.clone(), self.assets.clone())
         {
             self.island_list_loading = true;
+            let module = self.module;
             cx.spawn(async move |this, cx| {
                 let list = cx
                     .background_executor()
-                    .spawn(async move { islands(&install, Some(&assets)) })
+                    .spawn(async move { islands(module, &install, Some(&assets)) })
                     .await;
                 this.update(cx, |this, cx| {
                     this.island_list = Some(Arc::new(list));
@@ -1905,27 +2156,24 @@ impl Editor {
             })
             .detach();
         }
+        let asset_words = self.asset_words();
         let words: Vec<String> = (self.island_filter.split_whitespace())
             .map(str::to_ascii_lowercase)
             .collect();
         // The path, plus the names the list shows: "Albion" or "Medium 01"
         // find islands whose files say celtic and medium_01.
-        let game = self.game;
+        let rules = self.island_rules();
         let matches = |path: &str| {
-            let region = game.island_region(path).to_ascii_lowercase();
             let p = format!(
                 "{path} {} {}",
-                island_title(path),
-                super::wizard::province(&region)
+                island_title(asset_words, path),
+                rules.province(rules.island_region(path))
             )
             .to_ascii_lowercase();
             words.iter().all(|w| p.contains(w.as_str()))
         };
         let open = self.island.as_ref().map(|i| i.path.clone());
-        let stem = |path: &str| {
-            let name = path.rsplit('/').next().unwrap_or(path);
-            name.strip_suffix(".a7m").unwrap_or(name).to_owned()
-        };
+        let stem = |path: &str| crate::project::island_name(path).to_owned();
         // Rows go through the virtualized tree list: only the visible ones
         // are built, and the game ships hundreds. Headers fold their group.
         #[derive(Clone)]
@@ -1961,7 +2209,7 @@ impl Editor {
         let header = |rows: &mut Vec<_>, key: &str, label: String, count: usize| {
             heading_at(rows, key, label, count.to_string(), 0)
         };
-        let shipped_label = |path: &str| island_title(path);
+        let shipped_label = |path: &str| island_title(asset_words, path);
         let island = |path: &str, detail: String, label: String| {
             (
                 Row::Island(path.to_owned()),
@@ -2003,7 +2251,11 @@ impl Editor {
                     &i.path,
                     // One name per region in compact places: "Albion", as
                     // the viewport chip says it, not the project's "Celtic".
-                    format!("{} · {}", super::province_short(&i.region), i.size),
+                    format!(
+                        "{} · {}",
+                        self.island_rules().province_short(&i.region),
+                        i.size
+                    ),
                     stem(&i.path),
                 ));
             }
@@ -2024,7 +2276,7 @@ impl Editor {
                 let mut by_region: BTreeMap<&str, Vec<&Skeleton>> = BTreeMap::new();
                 for s in all
                     .iter()
-                    .filter(|s| matches(&s.path) && kind.admits(&s.path))
+                    .filter(|s| matches(&s.path) && kind.admits(s.kind))
                 {
                     by_region.entry(&s.region).or_default().push(s);
                 }
@@ -2037,12 +2289,16 @@ impl Editor {
                     // order readable ("Deco 08" is 64 m, apart from Deco 01).
                     // The path last: base game before a DLC's namesake.
                     islands.sort_by_cached_key(|s| {
-                        (s.world[0], island_title(&s.path), s.path.clone())
+                        (
+                            s.world[0],
+                            island_title(asset_words, &s.path),
+                            s.path.clone(),
+                        )
                     });
                     let shown = header(
                         &mut rows,
                         region,
-                        format!("Game · {}", super::wizard::province(region)),
+                        format!("Game · {}", self.island_rules().province(region)),
                         islands.len(),
                     );
                     if !shown {
@@ -2074,7 +2330,8 @@ impl Editor {
                             let twin = islands.iter().any(|o| {
                                 o.path != s.path
                                     && o.world[0] == s.world[0]
-                                    && island_title(&o.path) == island_title(&s.path)
+                                    && island_title(asset_words, &o.path)
+                                        == island_title(asset_words, &s.path)
                             });
                             rows.push(island(
                                 &s.path,
@@ -2090,16 +2347,14 @@ impl Editor {
         }
         // Each island's outline from its map image, so islands are told
         // apart by shape, not only by number.
-        if self.thumbs.is_none()
-            && let Some(install) = self.install.clone()
-        {
-            let dir = self.config.join("thumbnails");
-            self.thumbs = Some(super::catalog::Thumbs::start(install, dir));
-        }
+        self.start_thumbs();
         let icons: Vec<Option<Arc<RenderImage>>> = match &mut self.thumbs {
             Some(thumbs) => {
+                // Outlines come from an a7m island's map image.
+                // TODO: 2070's islands ship none; draw theirs
+                // from the terrain's heights.
                 thumbs.request(rows.iter().filter_map(|(r, _)| match r {
-                    Row::Island(path) => Some(path.as_str()),
+                    Row::Island(path) if path.ends_with(".a7m") => Some(path.as_str()),
                     _ => None,
                 }));
                 rows.iter()
@@ -2135,7 +2390,7 @@ impl Editor {
                         this.island_regions_closed.insert(key.clone());
                     }
                 }
-                Row::NewIsland => this.open_wizard(),
+                Row::NewIsland => this.open_wizard(cx),
                 Row::Note => {}
             },
         )
@@ -2230,9 +2485,12 @@ impl Editor {
             // Said before it left, the reason was gone by the time the list
             // was up.
             .when_some(
-                self.place_pending
-                    .as_ref()
-                    .map(|cfg| format!("Open an island to place {}", pretty(mesh_name(cfg)))),
+                self.place_pending.as_ref().map(|cfg| {
+                    format!(
+                        "Open an island to place {}",
+                        pretty(asset_words, mesh_name(cfg))
+                    )
+                }),
                 |d, says| {
                     d.child(
                         div()
@@ -2276,13 +2534,9 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let words = self.asset_words();
         let assets = self.assets.clone();
-        if self.thumbs.is_none()
-            && let Some(install) = self.install.clone()
-        {
-            let dir = self.config.join("thumbnails");
-            self.thumbs = Some(super::catalog::Thumbs::start(install, dir));
-        }
+        self.start_thumbs();
         let Some(island) = &self.island else {
             return crate::editor::pane_note("Open an island to list its objects and props.");
         };
@@ -2305,9 +2559,9 @@ impl Editor {
         // Inspector's "68 on this island", so a filtered count says "of".
         let mut totals: BTreeMap<(u8, u32), usize> = BTreeMap::new();
         let mut section_totals = [0usize; 2];
-        for o in island.doc.objects.iter() {
+        for o in island.island.doc.objects.iter() {
             // Keyed by the shown name, so the groups sort as they read.
-            let name = pretty(&object_name(assets.as_deref(), o.guid));
+            let name = pretty(words, &object_name(assets.as_deref(), o.guid));
             *totals.entry((0, o.guid)).or_default() += 1;
             section_totals[0] += 1;
             if keep(&name, o.id) && chosen(Item::Object(o.id)) {
@@ -2317,9 +2571,10 @@ impl Editor {
                     .push((Item::Object(o.id), o.position));
             }
         }
-        for p in island.doc.props.iter() {
+        for p in island.island.doc.props.iter() {
             let raw = mesh_name(
                 island
+                    .island
                     .doc
                     .meshes
                     .get(p.source.file as usize)
@@ -2328,7 +2583,7 @@ impl Editor {
             // Keyed and searched by the shown name, as objects are: by the
             // file name, "06a" found nothing and "01a" sorted above "01".
             // The file name still matches ("marshveg").
-            let name = pretty(raw);
+            let name = pretty(words, raw);
             *totals.entry((1, p.source.file)).or_default() += 1;
             section_totals[1] += 1;
             if (keep(&name, p.id) || keep(raw, p.id)) && chosen(Item::Prop(p.id)) {
@@ -2343,7 +2598,7 @@ impl Editor {
         // Keyed by the name as shown: two raw names can format alike.
         let mut seen: BTreeMap<(u8, String), u32> = BTreeMap::new();
         for (kind, name, _) in groups.keys() {
-            *seen.entry((*kind, pretty(name))).or_default() += 1;
+            *seen.entry((*kind, pretty(words, name))).or_default() += 1;
         }
         // "1 of 68" while filtered, the bare count otherwise.
         let filtered = selected_only || !filter.is_empty();
@@ -2430,7 +2685,7 @@ impl Editor {
             };
             // An id search opens the groups it found, or its hits stay hidden.
             let open = by_id.is_some() || selected_only || island.open_groups.is_expanded(group);
-            let name = &pretty(name);
+            let name = &pretty(words, name);
             let shared = seen.get(&(*kind, name.clone())).is_some_and(|n| *n > 1);
             // Two assets with one name are numbered; which GUID or file
             // each is shows on hover.
@@ -2619,6 +2874,7 @@ impl Editor {
             .iter()
             .map(|r| match r.action {
                 RowAction::Group(Group::Prop(file)) => island
+                    .island
                     .doc
                     .meshes
                     .get(file as usize)
@@ -3094,6 +3350,53 @@ impl Editor {
                     cx.notify();
                 }))
         };
+        // Islands have no owner: which player's colour dyed flags, banners
+        // and trim show. The game's own colours, as swatches.
+        let players = island.module().model_look().player_colors;
+        let picked = layers.player.min(players.len().saturating_sub(1));
+        let player = div()
+            .px_2()
+            .pt_1()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(hint(format!(
+                "Player colour · {}",
+                players.get(picked).map_or("", |c| c.name)
+            )))
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_1()
+                    .children(players.iter().enumerate().map(|(k, c)| {
+                        let [r, g, b] = c.rgb.map(u32::from);
+                        div()
+                            .id(("player-colour", k))
+                            .size(px(16.))
+                            .rounded_sm()
+                            .bg(rgb(r << 16 | g << 8 | b))
+                            .border_2()
+                            .border_color(if k == picked {
+                                theme::get().accent
+                            } else {
+                                theme::get().border
+                            })
+                            .cursor_pointer()
+                            .tooltip(Tooltip::text(
+                                c.name,
+                                "",
+                                "Dye masks show this colour, as on a player's buildings",
+                            ))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if let Some(i) = &mut this.island {
+                                    i.layers.player = k;
+                                    i.scene_stale = true;
+                                }
+                                cx.notify();
+                            }))
+                    })),
+            );
         let shipped_tris = island.shipped.triangles();
         let scene_layers = div()
             .w_full()
@@ -3116,18 +3419,58 @@ impl Editor {
             .child(toggle(
                 "Objects",
                 layers.objects,
-                crate::project::count(island.doc.objects.len()),
+                crate::project::count(island.island.doc.objects.len()),
                 |l| l.objects = !l.objects,
             ))
+            .when(layers.objects, |d| {
+                d.child(
+                    toggle("Editor-only models", layers.editor_only, String::new(), |l| {
+                        l.editor_only = !l.editor_only
+                    })
+                    .tooltip(Tooltip::text(
+                        "Editor-only models",
+                        "",
+                        "Build blockers, herds, flocks, sound spots and markers the game draws only in its own editor",
+                    )),
+                )
+            })
             .child(toggle(
                 "Props",
                 layers.props,
-                crate::project::count(island.doc.props.len()),
+                crate::project::count(island.island.doc.props.len()),
                 |l| l.props = !l.props,
             ))
+            // The game's own way of seeing this island (2070 under water).
+            .children(island.view.as_ref().map(|view| {
+                toggle(view.name, layers.under_water, String::new(), |l| {
+                    l.under_water = !l.under_water
+                })
+            }))
             .child(toggle("Water", layers.water, String::new(), |l| {
                 l.water = !l.water
             }))
+            // The ocean redraws every frame while its waves move.
+            .when(island.has_ocean() && layers.water, |d| {
+                d.child(toggle("Waves", layers.waves, String::new(), |l| {
+                    l.waves = !l.waves
+                }))
+                // Only 117's water draws rain.
+                .when(island.module().scene().is_some_and(|s| s.rain()), |d| {
+                    d.child(toggle("Rain", layers.rain, String::new(), |l| {
+                        l.rain = !l.rain
+                    }))
+                })
+                // Egypt's rivers change look and waves with the Nile flood.
+                .when(
+                    (island.module().scene())
+                        .is_some_and(|s| s.seasons(&island.path, None).is_some()),
+                    |d| {
+                        d.child(toggle("Flood season", layers.flood, String::new(), |l| {
+                            l.flood = !l.flood
+                        }))
+                    },
+                )
+            })
             .children(island.prop_sets.as_ref().map(|_| {
                 // "plants": the grass in view is the terrain's texture, and
                 // "Ground cover" off beside it read as a wrong state.
@@ -3159,7 +3502,7 @@ impl Editor {
             .child(toggle(
                 "Ground tint",
                 layers.tint,
-                if island.doc.tint.is_some() {
+                if island.island.doc.tint.is_some() {
                     String::new()
                 } else {
                     "none".into()
@@ -3169,6 +3512,20 @@ impl Editor {
             .child(toggle("Shadows", layers.shadows, String::new(), |l| {
                 l.shadows = !l.shadows
             }))
+            // Only ground whose materials ship height maps has relief.
+            .when(island.has_relief(), |d| {
+                d.child(
+                    toggle("Rock relief", layers.relief, String::new(), |l| {
+                        l.relief = !l.relief
+                    })
+                    .tooltip(Tooltip::text(
+                        "Rock relief",
+                        "",
+                        "Raise and light the ground by its materials' heights, as the game does",
+                    )),
+                )
+            })
+            .when(!players.is_empty(), |d| d.child(player))
             // The base look of the ground belongs with how it is drawn.
             .child(shading)
             // Guides drawn over the scene, not what the game shows.
@@ -3224,43 +3581,158 @@ impl Editor {
             .into_any_element()
     }
 
-    /// The island's material set as clickable thumbnails.
+    /// Opens the Ground material pane's browser of the game's sets: to add
+    /// a material, or with `replacing`, to put one in place of that id.
+    fn open_set_browser(&mut self, replacing: Option<u8>) {
+        let (Some(island), Some(install)) = (&mut self.island, &self.install) else {
+            return;
+        };
+        island.removing = None;
+        island.set_browser = Some(materials::SetBrowser {
+            sets: materials::shipped_sets(install),
+            replacing,
+            ..Default::default()
+        });
+    }
+
+    /// Removes material `id` from the island's set, its ground painted with
+    /// `into`.
+    fn remove_island_material(&mut self, id: u8, into: u8) {
+        let (Some(island), Some(install)) = (&mut self.island, self.install.clone()) else {
+            return;
+        };
+        let name = (island.palette.as_ref())
+            .and_then(|p| p.materials.get(&id))
+            .map(|m| mesh_name(&m.file).to_owned())
+            .unwrap_or_default();
+        island.removing = None;
+        match island.remove_material(&install, id, into) {
+            Ok(()) => self.message(
+                format!("Removed {name} (material {id}) from the island’s own set; its ground shows material {into}. Undo history starts here"),
+                false,
+            ),
+            Err(e) => self.message(format!("Could not remove the material: {e:#}"), true),
+        }
+    }
+
+    /// Reads set `path` with its textures, off the UI thread, and shows its
+    /// materials in the browser.
+    fn browse_set(&mut self, path: String, cx: &mut Context<Self>) {
+        let (Some(island), Some(install)) = (&mut self.island, self.install.clone()) else {
+            return;
+        };
+        let Some(b) = &mut island.set_browser else {
+            return;
+        };
+        b.busy = Some(format!("Reading {}…", mesh_name(&path)));
+        cx.spawn(async move |this, cx| {
+            let view = cx
+                .background_executor()
+                .spawn(async move { materials::SetView::load(&install, &path) })
+                .await;
+            this.update(cx, |this, cx| {
+                let Some(b) = this.island.as_mut().and_then(|i| i.set_browser.as_mut()) else {
+                    return;
+                };
+                b.busy = None;
+                match view {
+                    Ok(view) => b.open = Some(Arc::new(view)),
+                    Err(e) => this.message(format!("Could not read the set: {e:#}"), true),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Adds `entry` to the open island's set, its texture read off the UI
+    /// thread; the island paints with it next.
+    fn add_set_material(&mut self, entry: materials::SetEntry, cx: &mut Context<Self>) {
+        let (Some(island), Some(install)) = (&mut self.island, self.install.clone()) else {
+            return;
+        };
+        let replacing = island.set_browser.as_ref().and_then(|b| b.replacing);
+        let job = match replacing {
+            Some(id) => island.replace_job(&install, id, &entry),
+            None => island.material_job(&install, &entry),
+        };
+        let job = match job {
+            Ok(job) => job,
+            Err(e) => return self.message(format!("Could not add the material: {e:#}"), true),
+        };
+        if let Some(b) = &mut island.set_browser {
+            b.busy = Some(format!("Adding {}…", mesh_name(&entry.file)));
+        }
+        let path = island.path.clone();
+        cx.spawn(async move |this, cx| {
+            let added = cx
+                .background_executor()
+                .spawn(async move { job.run(&install) })
+                .await;
+            this.update(cx, |this, cx| {
+                // The island may have closed or changed meanwhile.
+                let Some(island) = this.island.as_mut().filter(|i| i.path == path) else {
+                    return;
+                };
+                if let Some(b) = &mut island.set_browser {
+                    b.busy = None;
+                }
+                match added {
+                    Ok(added) => {
+                        let id = added.id;
+                        island.apply_material(added);
+                        let name = mesh_name(&entry.file);
+                        let done = match replacing {
+                            Some(_) => {
+                                // One replacement per pick: back to the set.
+                                island.set_browser = None;
+                                format!("Material {id} is now {name}")
+                            }
+                            None => format!("Added {name} as material {id}"),
+                        };
+                        this.message(
+                            format!("{done}; the island has its own material set, saved with it"),
+                            false,
+                        );
+                    }
+                    Err(e) => this.message(format!("Could not add the material: {e:#}"), true),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The island's material set as clickable thumbnails, and a browser of
+    /// every set the game ships to add materials from.
     pub fn render_island_materials(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let Some(island) = &self.island else {
             return crate::editor::pane_note("Open an island to paint with its ground materials.");
         };
-        if island.thumbs.is_empty() {
+        if island.thumbs.is_empty() && island.set_browser.is_none() {
             return empty_pane("This island has no material set or material maps");
         }
         let names = island.palette.as_ref();
-        let mut grid = div()
-            .id("material-palette")
-            .flex()
-            .flex_wrap()
-            .gap_1()
-            .p_1()
-            .w_full();
-        for (id, image) in &island.thumbs {
-            let id = *id;
-            let selected = island.paint == id;
-            let name = names
-                .and_then(|p| p.materials.get(&id))
-                .map_or(String::new(), |m| mesh_name(&m.file).to_owned());
-            grid = grid.child(
+        let set_name = mesh_name(&island.island.material_set).to_owned();
+        let tile =
+            |id: ElementId, image: Arc<RenderImage>, label: String, highlight: bool, dim: bool| {
                 div()
-                    .id(("material", u32::from(id)))
+                    .id(id)
                     .relative()
                     .size(px(THUMB))
                     .rounded(px(3.))
                     .overflow_hidden()
                     .border_2()
-                    .border_color(if selected {
+                    .border_color(if highlight {
                         theme::get().highlight
                     } else {
                         theme::get().border
                     })
-                    .cursor_pointer()
-                    .child(img(image.clone()).size_full())
+                    .when(dim, |d| d.opacity(0.4))
+                    .when(!dim, |d| d.cursor_pointer())
+                    .child(img(image).size_full())
                     .child(
                         div()
                             .absolute()
@@ -3269,26 +3741,294 @@ impl Editor {
                             .bg(theme::get().overlay)
                             .text_size(px(10.))
                             .text_center()
-                            .child(id.to_string()),
+                            .truncate()
+                            .child(label),
                     )
-                    .tooltip(Tooltip::text(
-                        name,
-                        id.to_string(),
-                        "Click to paint with this material",
+            };
+        let header = |left: AnyElement, right: AnyElement| {
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_1()
+                .py(px(2.))
+                .child(div().flex_1().min_w_0().truncate().child(left))
+                .child(right)
+        };
+        // The selected material, with Replace and Remove. Removing a used
+        // material first asks what to paint its ground with.
+        let paint = island.paint;
+        let paint_name = names
+            .and_then(|p| p.materials.get(&paint))
+            .map(|m| mesh_name(&m.file).to_owned());
+        let selected: AnyElement = match (paint_name, island.removing) {
+            (None, _) => div().into_any_element(),
+            (Some(_), Some(id)) => {
+                let name = names
+                    .and_then(|p| p.materials.get(&id))
+                    .map_or(String::new(), |m| mesh_name(&m.file).to_owned());
+                let mut pick = div().flex().flex_wrap().gap_1().p_1().w_full();
+                for (other, image) in island.thumbs.iter().filter(|t| t.0 != id) {
+                    let other = *other;
+                    pick = pick.child(
+                        tile(("material-into", u32::from(other)).into(), image.clone(), other.to_string(), false, false)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.remove_island_material(id, other);
+                                cx.notify();
+                            })),
+                    );
+                }
+                div()
+                    .flex()
+                    .flex_col()
+                    .border_b_1()
+                    .border_color(theme::get().border)
+                    .child(header(
+                        hint(format!(
+                            "Remove {name} (material {id}): {:.1}% of the island shows it. Paint its ground with:",
+                            island.material_share(id) * 100.
+                        ))
+                        .into_any_element(),
+                        button("Cancel", false)
+                            .id("material-remove-cancel")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(i) = &mut this.island {
+                                    i.removing = None;
+                                }
+                                cx.notify();
+                            }))
+                            .into_any_element(),
                     ))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if let Some(i) = &mut this.island {
-                            i.paint = id;
-                            i.tool = Tool::Paint;
+                    .child(pick)
+                    .into_any_element()
+            }
+            (Some(name), None) => header(
+                hint(format!("Selected: {name} (material {paint})")).into_any_element(),
+                div()
+                    .flex()
+                    .gap_1()
+                    .child(
+                        button("Replace…", false)
+                            .id("material-replace")
+                            .tooltip(Tooltip::text(
+                                "Replace",
+                                "",
+                                "Swap in a texture from any set. It keeps the id, so ground already painted with it shows the new texture",
+                            ))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.open_set_browser(Some(paint));
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        button("Remove…", false)
+                            .id("material-remove")
+                            .tooltip(Tooltip::text(
+                                "Remove",
+                                "",
+                                "Take it out of the island’s set. Ground that uses it gets another texture you pick",
+                            ))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                let Some(i) = &mut this.island else { return };
+                                // Unused: nothing to repaint.
+                                if i.material_share(paint) <= 0. {
+                                    let into = i.thumbs.iter().map(|t| t.0).find(|&t| t != paint);
+                                    if let Some(into) = into {
+                                        this.remove_island_material(paint, into);
+                                    }
+                                } else {
+                                    i.removing = Some(paint);
+                                }
+                                cx.notify();
+                            })),
+                    )
+                    .into_any_element(),
+            )
+            .into_any_element(),
+        };
+        let body: AnyElement = match &island.set_browser {
+            None => {
+                let mut grid = div().flex().flex_wrap().gap_1().p_1().w_full();
+                for (id, image) in &island.thumbs {
+                    let id = *id;
+                    let name = names
+                        .and_then(|p| p.materials.get(&id))
+                        .map_or(String::new(), |m| mesh_name(&m.file).to_owned());
+                    // 2070's stand-in texture paints as any layer, but the
+                    // game draws its magenta checker at the default preset.
+                    let placeholder = island.placeholder_layer(id);
+                    let (label, help) = if placeholder {
+                        (
+                            format!("{id} placeholder"),
+                            "Placeholder: draws magenta in game. Click to paint with it anyway",
+                        )
+                    } else {
+                        (id.to_string(), "Click to paint with this material")
+                    };
+                    grid = grid.child(
+                        tile(
+                            ("material", u32::from(id)).into(),
+                            image.clone(),
+                            label,
+                            island.paint == id,
+                            false,
+                        )
+                        .tooltip(Tooltip::text(name, id.to_string(), help))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(i) = &mut this.island {
+                                i.paint = id;
+                                i.tool = Tool::Paint;
+                            }
+                            cx.notify();
+                        })),
+                    );
+                }
+                let used = names.map_or(0, |p| p.ground_layers.len());
+                div()
+                    .flex()
+                    .flex_col()
+                    .child(header(
+                        hint(format!("{set_name} · {used} of 32 materials")).into_any_element(),
+                        button("Add from set…", false)
+                            .id("material-set-add")
+                            .tooltip(Tooltip::text(
+                                "Add materials",
+                                "",
+                                "Add a texture from any of the game’s material sets. The first change copies a shipped set into the mod as this island’s own",
+                            ))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.open_set_browser(None);
+                                cx.notify();
+                            }))
+                            .into_any_element(),
+                    ))
+                    .child(selected)
+                    .child(grid)
+                    .into_any_element()
+            }
+            Some(b) => {
+                let back = button("Done", false)
+                    .id("material-set-done")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        // Done goes from a set's materials back to the list of
+                        // sets, and from the list back to the island's set.
+                        if let Some(i) = &mut this.island
+                            && i.set_browser.as_mut().and_then(|b| b.open.take()).is_none()
+                        {
+                            i.set_browser = None;
                         }
                         cx.notify();
-                    })),
-            );
-        }
+                    }))
+                    .into_any_element();
+                let status = b.busy.clone();
+                match &b.open {
+                    None => {
+                        let mut list = div().flex().flex_col().w_full().p_1();
+                        let current = &island.island.material_set;
+                        for (k, path) in b.sets.iter().enumerate() {
+                            let p = path.clone();
+                            list = list.child(
+                                div()
+                                    .id(("material-set", k as u32))
+                                    .px_2()
+                                    .py(px(3.))
+                                    .text_size(px(12.))
+                                    .cursor_pointer()
+                                    .rounded_sm()
+                                    .hover(|d| d.bg(theme::get().hover))
+                                    .when(path == current, |d| d.bg(theme::get().selected))
+                                    .child(mesh_name(path).to_owned())
+                                    .tooltip(Tooltip::text(path.clone(), "", "Show its materials"))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.browse_set(p.clone(), cx);
+                                        cx.notify();
+                                    })),
+                            );
+                        }
+                        div()
+                            .flex()
+                            .flex_col()
+                            .child(header(
+                                hint(status.unwrap_or_else(|| match b.replacing {
+                                    Some(id) => format!(
+                                        "Pick a set to take material {id}’s replacement from"
+                                    ),
+                                    None => format!(
+                                        "Pick a set to add from ({} in the game)",
+                                        b.sets.len()
+                                    ),
+                                }))
+                                .into_any_element(),
+                                back,
+                            ))
+                            .child(list)
+                            .into_any_element()
+                    }
+                    Some(view) => {
+                        let mut grid = div().flex().flex_wrap().gap_1().p_1().w_full();
+                        for e in &view.entries {
+                            let Some(image) = view
+                                .thumbs
+                                .iter()
+                                .find(|t| t.0 == e.id)
+                                .map(|t| t.1.clone())
+                            else {
+                                continue;
+                            };
+                            let have = island.has_material(&e.file);
+                            let entry = e.clone();
+                            let mut t = tile(
+                                ElementId::Name(format!("material-browse-{}", e.id).into()),
+                                image,
+                                mesh_name(&e.file).to_owned(),
+                                false,
+                                have,
+                            )
+                            .tooltip(Tooltip::text(
+                                e.file.clone(),
+                                "",
+                                if have {
+                                    "Already in the island’s set"
+                                } else {
+                                    "Click to add it to the island’s set"
+                                },
+                            ));
+                            if !have {
+                                t = t.on_click(cx.listener(move |this, _, _, cx| {
+                                    this.add_set_material(entry.clone(), cx);
+                                    cx.notify();
+                                }));
+                            }
+                            grid = grid.child(t);
+                        }
+                        let free = 32 - names.map_or(0, |p| p.ground_layers.len()).min(32);
+                        div()
+                            .flex()
+                            .flex_col()
+                            .child(header(
+                                hint(status.unwrap_or_else(|| match b.replacing {
+                                    Some(id) => format!(
+                                        "{} · click the texture to put in place of material {id}",
+                                        mesh_name(&view.path)
+                                    ),
+                                    None => format!(
+                                        "{} · {free} free slots in the island’s set",
+                                        mesh_name(&view.path)
+                                    ),
+                                }))
+                                .into_any_element(),
+                                back,
+                            ))
+                            .child(grid)
+                            .into_any_element()
+                    }
+                }
+            }
+        };
         gpui_editor_kit::widgets::vscroll(
             "material-palette-scroll",
             &self.scrolls.get("material-palette"),
-            grid,
+            div().id("material-palette").w_full().child(body),
         )
         .size_full()
         .bg(theme::get().panel)
@@ -3334,12 +4074,13 @@ impl Editor {
 
     /// The hovered island, in the Inspector while none is open.
     fn island_peek_panel(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let words = self.asset_words();
         let (path, image) = self.island_peek.as_ref()?;
         let all = self.island_list.as_deref().map_or(&[][..], Vec::as_slice);
         let world = all.iter().find(|s| s.path == *path);
         let mut facts = Vec::new();
         if let Some(s) = world {
-            facts.push(super::wizard::province(&s.region));
+            facts.push(self.island_rules().province(&s.region));
             facts.push(format!("{} m map", s.world[0]));
         }
         // The list's rule: a base island whose name a DLC one shares says
@@ -3348,13 +4089,13 @@ impl Editor {
             all.iter().any(|o| {
                 o.path != s.path
                     && o.world[0] == s.world[0]
-                    && island_title(&o.path) == island_title(&s.path)
+                    && island_title(words, &o.path) == island_title(words, &s.path)
             })
         });
         if let Some(pack) = island_pack(path).or_else(|| twin.then(|| "Base game".to_owned())) {
             facts.push(pack);
         }
-        let title = island_title(path);
+        let title = island_title(words, path);
         let open = path.clone();
         Some(
             div()
@@ -3374,7 +4115,7 @@ impl Editor {
                     div()
                         .text_size(px(13.))
                         .font_weight(FontWeight::SEMIBOLD)
-                        .child(island_title(path)),
+                        .child(island_title(words, path)),
                 )
                 .child(
                     div()
@@ -3450,13 +4191,14 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let words = self.asset_words();
         // The ground cover presets' main plants, for the picker's pictures;
         // queued while the section can show them.
         if let (Some(island), Some(thumbs)) = (&self.island, &mut self.thumbs)
             && let Some(sets) = &island.prop_sets
         {
             thumbs.request(
-                sets.choices(&island.region())
+                sets.choices(island.rules(), &island.region())
                     .into_iter()
                     .filter_map(|n| sets.get(n))
                     .flat_map(|s| s.main_plants(PRESET_PLANTS)),
@@ -3480,7 +4222,7 @@ impl Editor {
         let Some(&first) = island
             .selection
             .iter()
-            .find(|&&item| island.doc.matrix(item).is_some())
+            .find(|&&item| island.island.doc.matrix(item).is_some())
         else {
             // Nothing selected: the page is the island's; the tool's name
             // and key live in the floating panel.
@@ -3498,10 +4240,11 @@ impl Editor {
         // transform fields and buttons are shared.
         let (title, model, details): (String, String, Vec<(&str, String)>) = match first {
             Item::Prop(id) => {
-                let Some(p) = island.doc.prop(id) else {
+                let Some(p) = island.island.doc.prop(id) else {
                     return finish_inspector(self, body, window, cx);
                 };
                 let model = island
+                    .island
                     .doc
                     .meshes
                     .get(p.source.file as usize)
@@ -3509,7 +4252,7 @@ impl Editor {
                     .unwrap_or_default();
                 let s = &p.source;
                 (
-                    format!("{} #{id}", pretty(mesh_name(&model))),
+                    format!("{} #{id}", pretty(words, mesh_name(&model))),
                     model,
                     vec![
                         ("Kind", "Prop".into()),
@@ -3533,7 +4276,7 @@ impl Editor {
                 )
             }
             Item::Object(id) => {
-                let Some(o) = island.doc.objects.iter().find(|o| o.id == id) else {
+                let Some(o) = island.island.doc.objects.iter().find(|o| o.id == id) else {
                     return finish_inspector(self, body, window, cx);
                 };
                 let asset = assets.as_deref().and_then(|a| a.get(o.guid));
@@ -3629,6 +4372,9 @@ impl Editor {
                         n => format!("{kind} #{n}"),
                     });
                     let file = model.rsplit('/').next().unwrap_or(&model).to_owned();
+                    let editable_model = (model.ends_with(".cfg") || model.ends_with(".prp"))
+                        .then(|| model.clone())
+                        .filter(|_| self.supports(crate::editor::Workspace::Model));
                     // Facts that cannot be edited ride on the file line, not
                     // in rows that look like fields. The file is a link to
                     // its Assets entry, said as one: muted, it hid that.
@@ -3670,14 +4416,37 @@ impl Editor {
                                     })),
                             )
                         })
+                        // The model itself opens in the Model workspace.
+                        .when(editable_model.is_some(), |d| {
+                            let cfg = editable_model.clone().unwrap_or_default();
+                            d.child(
+                                div()
+                                    .id("selection-edit-model")
+                                    .flex_shrink_0()
+                                    .text_color(theme::get().accent)
+                                    .cursor_pointer()
+                                    .hover(|s| s.underline())
+                                    .tooltip(Tooltip::text(
+                                        "Edit model",
+                                        "",
+                                        "Opens it in the Model workspace; saving replaces it in the mod",
+                                    ))
+                                    .child("· Edit model")
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.open_model(&cfg, cx);
+                                        cx.notify();
+                                    })),
+                            )
+                        })
                 },
             );
         // One prop of many alike: how many, and a way to take them all, as
         // retinting or removing every marsh bush starts there.
         if let (Item::Prop(id), 1) = (first, island.selection.len())
-            && let Some(file) = island.doc.prop(id).map(|p| p.source.file)
+            && let Some(file) = island.island.doc.prop(id).map(|p| p.source.file)
         {
             let alike = island
+                .island
                 .doc
                 .props
                 .iter()
@@ -3721,6 +4490,7 @@ impl Editor {
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 if let Some(i) = &mut this.island {
                                     i.selection = i
+                                        .island
                                         .doc
                                         .props
                                         .iter()
@@ -3823,9 +4593,8 @@ impl Editor {
                 );
             }
         }
-        // How it sits on the ground is the Y field's tooltip only: it is
-        // what a move does to Y, and as a line under the fields ("Keeps
-        // its height when moved ⓘ") it read as a setting that won't toggle.
+        // How it sits on the ground: the Y field's tooltip, and the toggle
+        // under the fields.
         let ground = details
             .iter()
             .find(|(l, _)| *l == "Follows terrain")
@@ -3877,9 +4646,26 @@ impl Editor {
                     .child("Position"),
             )
             .child(grid);
+        // The game's AdaptTerrainHeight, for every selected prop.
+        if let (Item::Prop(_), Some(follows)) = (first, ground) {
+            body = body.child(
+                checkbox(
+                    "Follows terrain",
+                    follows,
+                    "Keeps its height above the ground when you sculpt or move it",
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some(i) = &mut this.island {
+                        i.set_follows_terrain(!follows);
+                    }
+                    cx.notify();
+                })),
+            );
+        }
         // Rivers and lakes are curves: their edit lives in the River tool.
         if let Item::Object(id) = first
             && island
+                .island
                 .doc
                 .objects
                 .iter()
@@ -4015,6 +4801,42 @@ impl Editor {
                         })),
                 ),
         );
+        // Which building's model the selected slot's paths show (rails,
+        // channels): the game lays one only once a building stands there.
+        if let Some(super::PathPreview {
+            slot,
+            buildings,
+            current,
+        }) = island.path_preview()
+        {
+            let mut chips = div().flex().flex_wrap().gap_1();
+            let choices = std::iter::once((None, "Auto".to_owned()))
+                .chain(buildings.into_iter().map(|(g, n)| (Some(g), n)))
+                .chain(std::iter::once((Some(0), "None".to_owned())));
+            for (k, (choice, label)) in choices.enumerate() {
+                chips = chips.child(
+                    button(label.clone(), current == choice)
+                        .id(("path-preview", k))
+                        .text_size(px(11.))
+                        .tooltip(Tooltip::text(
+                            label,
+                            "",
+                            match choice {
+                                None => "The model most buildings that fit this slot lay along its paths",
+                                Some(0) => "No model along this slot's paths",
+                                Some(_) => "What this building lays along the slot's paths once built",
+                            },
+                        ))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(i) = &mut this.island {
+                                i.set_path_preview(slot, choice);
+                            }
+                            cx.notify();
+                        })),
+                );
+            }
+            body = body.child(section("Path preview")).child(chips);
+        }
         // A game original keeps its way into the mod while a prop is
         // selected: a button of its own under the selection's commands, as
         // the checklist has with nothing selected. A link on the folded
@@ -4030,7 +4852,7 @@ impl Editor {
                         .pt_2()
                         .text_size(px(11.))
                         .text_color(theme::get().muted)
-                        .child(format!("Island · {}", island_title(&island.path))),
+                        .child(format!("Island · {}", island_title(words, &island.path))),
                 );
             body = body.child(
                 widgets::action(
@@ -4068,16 +4890,18 @@ impl Editor {
 /// name as the Inspector titles it, and how many more. None with nothing
 /// selected, so the last action's message shows instead.
 pub(crate) fn selection_status(island: &IslandEditor, assets: Option<&Assets>) -> Option<String> {
+    let words = &island.module().text().asset_words;
     let first = island.selection.iter().next()?;
     let name = match *first {
         Item::Prop(id) => {
-            let p = island.doc.prop(id)?;
-            let mesh = island.doc.meshes.get(p.source.file as usize)?;
-            format!("{} #{id}", pretty(mesh_name(mesh)))
+            let p = island.island.doc.prop(id)?;
+            let mesh = island.island.doc.meshes.get(p.source.file as usize)?;
+            format!("{} #{id}", pretty(words, mesh_name(mesh)))
         }
         // The Inspector's title ("Lake #1"), not a bare "Object #1".
         Item::Object(id) => {
             let guid = island
+                .island
                 .doc
                 .objects
                 .iter()
@@ -4103,6 +4927,7 @@ fn play_checklist(
 ) -> (String, Div) {
     let coasts = island.coast_guids();
     let harbours = island
+        .island
         .doc
         .objects
         .iter()
@@ -4249,7 +5074,7 @@ fn play_checklist(
                         if let Some(i) = &mut this.island {
                             i.want_in_mod();
                         }
-                        this.save()
+                        this.save();
                     }) as Box<dyn Fn(&mut Editor, &mut Context<Editor>)>,
                 )
             }),
@@ -4324,15 +5149,9 @@ fn play_checklist(
 }
 
 fn island_heading(island: &IslandEditor) -> Div {
-    let region = wizard::province(
-        island
-            .path
-            .split("/provinces/")
-            .nth(1)
-            .and_then(|r| r.split('/').next())
-            .unwrap_or_default(),
-    );
-    let size = island.doc.field.grid.size()[0];
+    let words = &island.module().text().asset_words;
+    let region = island.rules().province(&island.region());
+    let size = island.island.doc.field.grid.size()[0];
     div()
         .flex()
         .flex_col()
@@ -4342,7 +5161,7 @@ fn island_heading(island: &IslandEditor) -> Div {
                 .truncate()
                 .text_size(px(13.))
                 .font_weight(FontWeight::SEMIBOLD)
-                .child(island_title(&island.path)),
+                .child(island_title(words, &island.path)),
         )
         .child(
             div()
@@ -4363,13 +5182,13 @@ fn finish_inspector(
     let Some(island) = &editor.island else {
         return body.into_any_element();
     };
-    let g = &island.doc.field.grid;
+    let g = &island.island.doc.field.grid;
     // Under a selection, the island's sections get a quiet caption of
     // their own: a second bold title read as a second selected object.
     let selected = island
         .selection
         .iter()
-        .any(|&item| island.doc.matrix(item).is_some());
+        .any(|&item| island.island.doc.matrix(item).is_some());
     if selected {
         // A band across the pane, as property panels head a category:
         // in the section headings' style alone it read as one more group
@@ -4521,7 +5340,7 @@ fn finish_inspector(
         format!(
             "{:.0} m · {} props",
             g.size()[0],
-            crate::project::count(island.doc.props.len())
+            crate::project::count(island.island.doc.props.len())
         ),
     ));
     if open {
@@ -4557,11 +5376,11 @@ fn finish_inspector(
             ))
             .child(info_row(
                 "Objects",
-                crate::project::count(island.doc.objects.len()),
+                crate::project::count(island.island.doc.objects.len()),
             ))
             .child(info_row(
                 "Props",
-                crate::project::count(island.doc.props.len()),
+                crate::project::count(island.island.doc.props.len()),
             ));
     }
     let marks = island.spot_marks();
@@ -4628,7 +5447,14 @@ fn finish_inspector(
                 ),
         );
     }
-    body = body.child(session_controls(island, editor.thumbs.as_ref(), window, cx));
+    let time = time_of_day(editor, island, cx);
+    body = body.child(session_controls(
+        island,
+        editor.thumbs.as_ref(),
+        time,
+        window,
+        cx,
+    ));
     if let Some((id, kind)) = island.selected_slot() {
         let resource = island
             .listing
@@ -4680,13 +5506,56 @@ fn finish_inspector(
 
 /// The island's session settings: the vegetation prop set the game
 /// scatters ground props from, and the ambient preset.
+/// The view's time of day: a slider over the day, and Day and Night to
+/// jump to noon or midnight.
+fn time_of_day(editor: &Editor, island: &IslandEditor, cx: &mut Context<Editor>) -> Div {
+    let day = (6. ..18.).contains(&island.time_of_day);
+    let jump = |hours: f32| {
+        move |this: &mut Editor, _: &ClickEvent, _: &mut Window, cx: &mut Context<Editor>| {
+            if let Some(i) = &mut this.island {
+                i.set_field(Field::TimeOfDay, hours);
+            }
+            cx.notify();
+        }
+    };
+    div()
+        .flex()
+        .items_center()
+        .gap_1()
+        .child(
+            editor
+                .island_compact(Field::TimeOfDay, "Time", "", cx)
+                .flex_1(),
+        )
+        .child(
+            widgets::button("Day", day)
+                .tooltip(Tooltip::text(
+                    "Day",
+                    "",
+                    "Noon: the sun at the preset's highest",
+                ))
+                .on_click(cx.listener(jump(12.))),
+        )
+        .child(
+            widgets::button("Night", !day)
+                .tooltip(Tooltip::text(
+                    "Night",
+                    "",
+                    "Midnight: moonlight and the preset's night sky",
+                ))
+                .on_click(cx.listener(jump(0.))),
+        )
+}
+
 fn session_controls(
     island: &super::IslandEditor,
     thumbs: Option<&super::catalog::Thumbs>,
+    time: Div,
     window: &mut Window,
     cx: &mut Context<Editor>,
 ) -> Div {
-    let session = &island.doc.session;
+    let words = &island.module().text().asset_words;
+    let session = &island.island.doc.session;
     // Open while nothing is selected; folded under a selection, where the
     // selection's own fields matter. A key per case keeps both remembered.
     let (heading, open) = widgets::collapsible(
@@ -4730,7 +5599,7 @@ fn session_controls(
                     "Default" => "Game default".to_owned(),
                     // Its detail line says "No plants"; the label need not.
                     "None" => "None".to_owned(),
-                    other => preset_name(other),
+                    other => preset_name(words, other),
                 };
                 let detail = detail(&n);
                 let pictures = pictures(&n);
@@ -4770,10 +5639,10 @@ fn session_controls(
     let summary = match &island.prop_sets {
         Some(_) => format!(
             "{} · {}",
-            preset_name(&session.vegetation_prop_set),
-            preset_name(&session.global_ambient)
+            preset_name(words, &session.vegetation_prop_set),
+            preset_name(words, &session.global_ambient)
         ),
-        None => preset_name(&session.global_ambient),
+        None => preset_name(words, &session.global_ambient),
     };
     let heading = if island.prop_sets.is_some() {
         heading.child(
@@ -4834,7 +5703,7 @@ fn session_controls(
     }
     if let Some(sets) = &island.prop_sets {
         let names = sets
-            .choices(&island.region())
+            .choices(island.rules(), &island.region())
             .into_iter()
             .map(str::to_owned)
             .collect();
@@ -4958,6 +5827,7 @@ fn session_controls(
         )
         .w_full(),
     );
+    out = out.child(time);
     for (edge, name) in [
         ("North", &session.north_ambient),
         ("South", &session.south_ambient),
@@ -4974,7 +5844,7 @@ fn session_controls(
             .pt_1()
             .text_size(px(10.))
             .text_color(theme::get().muted)
-            .child("Preset and lighting are saved with the island."),
+            .child("Preset and lighting are saved with the island; the time of day is the view's only."),
     )
 }
 
@@ -4987,20 +5857,47 @@ impl IslandEditor {
         let extent = self.extent();
         v.viewport.paint(v.camera, extent, bounds, window);
         let project = |x: f32, z: f32| {
-            let y = self.doc.field.height([x, z]);
+            let y = self.island.doc.field.height([x, z]);
             v.camera.project([x, y + 0.05, z], bounds, extent)
         };
         {
             let _span = gpui_editor_kit::profile::span("paint view: rivers");
             self.paint_rivers(view, bounds, window);
         }
-        if self.overlay() == Some(anno_formats::grids::Kind::WaterFlow) {
+        if self.overlay() == Some(anno_formats::a7m::grids::Kind::WaterFlow) {
             self.paint_flow_arrows(view, bounds, window);
         }
-        if self.tool == Tool::Harbour {
+        if self.tool == Tool::Slot {
+            // Which way each slot faces: a 6 m tick on the ground, so a mine
+            // turned away from its mountain shows before it is built.
+            for mark in self.slot_marks() {
+                let [x, _, z] = mark.at;
+                let (dx, dz) = (mark.yaw.cos(), mark.yaw.sin());
+                let tick: Vec<_> = (0..=6)
+                    .map(|k| project(x + dx * k as f32, z + dz * k as f32))
+                    .collect();
+                let color = slot_hue(mark.resource);
+                paint::line(
+                    &tick,
+                    4.,
+                    rgba(crate::colors::with_alpha(crate::colors::CASING, 0xc0)),
+                    window,
+                );
+                paint::line(
+                    &tick,
+                    2.,
+                    rgba(crate::colors::with_alpha(color, 0xf0)),
+                    window,
+                );
+            }
+        }
+        if matches!(self.tool, Tool::Harbour | Tool::Slot) {
             // Point handles; the picked one larger and highlighted.
-            for (id, i, p) in self.coast_handles(view) {
-                let picked = self.coast_point == Some((id, i));
+            for (id, i, p) in self.curve_handles(view) {
+                let picked = self.curve_point == Some((id, i))
+                    || self
+                        .road_editing()
+                        .is_some_and(|e| e.work == id && e.picked.contains(&i));
                 let r = if picked { 5. } else { 3. };
                 let (x, y) = (f32::from(p.x), f32::from(p.y));
                 let square: Vec<_> = [[-r, -r], [r, -r], [r, r], [-r, r], [-r, -r]]
@@ -5034,36 +5931,44 @@ impl IslandEditor {
                     window,
                 );
             }
-            Some(Drag::Region { from, to }) => {
-                // The rectangle draped over the ground.
-                let (x0, x1) = (from[0].min(to[0]), from[0].max(to[0]));
-                let (z0, z1) = (from[2].min(to[2]), from[2].max(to[2]));
-                let edge = |a: [f32; 2], b: [f32; 2]| -> Vec<Point<Pixels>> {
-                    (0..=32)
-                        .map(|k| {
-                            let t = k as f32 / 32.;
-                            project(a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t)
-                        })
-                        .collect()
-                };
-                for (a, b) in [
-                    ([x0, z0], [x1, z0]),
-                    ([x1, z0], [x1, z1]),
-                    ([x1, z1], [x0, z1]),
-                    ([x0, z1], [x0, z0]),
-                ] {
-                    paint::line(
-                        &edge(a, b),
-                        2.,
-                        rgba(crate::colors::with_alpha(crate::colors::PICK, 0xe6)),
-                        window,
-                    );
+            Some(Drag::Region { from, to, lasso }) => {
+                let pick = rgba(crate::colors::with_alpha(crate::colors::PICK, 0xe6));
+                if let Some(points) = lasso {
+                    // The lasso's trace, closing back to where it started.
+                    let mut line: Vec<Point<Pixels>> =
+                        points.iter().map(|p| project(p[0], p[1])).collect();
+                    if let Some(&first) = line.first() {
+                        line.push(first);
+                    }
+                    paint::line(&line, 2., pick, window);
+                } else {
+                    // The rectangle draped over the ground.
+                    let (x0, x1) = (from[0].min(to[0]), from[0].max(to[0]));
+                    let (z0, z1) = (from[2].min(to[2]), from[2].max(to[2]));
+                    let edge = |a: [f32; 2], b: [f32; 2]| -> Vec<Point<Pixels>> {
+                        (0..=32)
+                            .map(|k| {
+                                let t = k as f32 / 32.;
+                                project(a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t)
+                            })
+                            .collect()
+                    };
+                    for (a, b) in [
+                        ([x0, z0], [x1, z0]),
+                        ([x1, z0], [x1, z1]),
+                        ([x1, z1], [x0, z1]),
+                        ([x0, z1], [x0, z0]),
+                    ] {
+                        paint::line(&edge(a, b), 2., pick, window);
+                    }
                 }
             }
             _ => {}
         }
         let active = match &v.drag {
-            Some(Drag::Gizmo { gesture, .. }) => Some(gesture.handle),
+            Some(Drag::Gizmo { gesture, .. } | Drag::PathGizmo { gesture, .. }) => {
+                Some(gesture.handle)
+            }
             _ => None,
         };
         if let Some(frame) = self.gizmo_frame(view) {
@@ -5159,11 +6064,13 @@ impl IslandEditor {
     /// grid, harbour coasts, blockers and sound spots, the brush ring and
     /// selection boxes. Built per event; a few thousand points at most.
     pub(super) fn overlay_lines(&self) -> Vec<gpu::Line> {
-        let on_ground = |x: f32, z: f32| [x, self.doc.field.height([x, z]) + 0.05, z];
+        let on_ground = |x: f32, z: f32| [x, self.island.doc.field.height([x, z]) + 0.05, z];
         let mut lines = Vec::new();
+        self.shape_lines(&mut lines);
         if self.layers.chunks {
-            let [w, d] = self.doc.field.grid.size();
-            let step = gpui_editor_kit::heightfield::TILE as f32 * self.doc.field.grid.spacing;
+            let [w, d] = self.island.doc.field.grid.size();
+            let step =
+                gpui_editor_kit::heightfield::TILE as f32 * self.island.doc.field.grid.spacing;
             let mut x = 0.;
             while x <= w {
                 let points = (0..=64).map(|i| on_ground(x, d * i as f32 / 64.)).collect();
@@ -5191,8 +6098,15 @@ impl IslandEditor {
         } else {
             Default::default()
         };
-        let start = (self.harbour.as_ref()).and_then(|l| l.guid(harbour::Piece::StartCoast));
-        for o in self.doc.objects.iter().filter(|o| coasts.contains(&o.guid)) {
+        let start = (self.island.harbour.as_ref())
+            .and_then(|l| l.guid(anno_core::harbour::Piece::StartCoast));
+        for o in self
+            .island
+            .doc
+            .objects
+            .iter()
+            .filter(|o| coasts.contains(&o.guid))
+        {
             let Some(path) = &o.path else { continue };
             let points = path
                 .iter()
@@ -5213,6 +6127,40 @@ impl IslandEditor {
                     crate::colors::COAST,
                     if quiet { 0x80 } else { 0xe6 },
                 ),
+            });
+        }
+        // Work areas' paths to their slots: every one with the Slot tool,
+        // else those touching the selection.
+        let links = match (self.tool, self.assets.as_deref()) {
+            (Tool::Slot, Some(assets)) => harbour::links(
+                &self.island.doc.objects,
+                |guid| harbour::link_end(assets, guid),
+                |_| true,
+            ),
+            _ => self.slot_links(self.selection.iter().copied()),
+        };
+        for link in links {
+            let Some(path) = (self.island.doc.objects.iter())
+                .find(|o| o.id == link.work)
+                .and_then(|o| o.path.as_ref())
+            else {
+                continue;
+            };
+            let lit = [link.work, link.slot]
+                .iter()
+                .any(|&id| self.selection.contains(&Item::Object(id)));
+            let points = path
+                .iter()
+                .map(|p| [p.p[0], p.p[1] + 0.3, p.p[2]])
+                .collect();
+            lines.push(gpu::Line {
+                points,
+                width: if lit { 3. } else { 2. },
+                color: if lit {
+                    crate::colors::with_alpha(crate::colors::PICK, 0xe6)
+                } else {
+                    crate::colors::with_alpha(crate::colors::OBJECT_MARKER, 0xc0)
+                },
             });
         }
         if self.layers.spots {
@@ -5371,11 +6319,14 @@ impl IslandEditor {
     /// canvas at its camera and refreshes the guides. False when the pane
     /// must paint after all (see `fast_frames`).
     pub(crate) fn sync_camera(&self, view: usize) -> bool {
+        // The camera goes to the view first either way: the view's thread
+        // starts on the frame before the pane paints, and a camera it
+        // learns only in paint costs it a second recording.
+        let v = &self.views[view];
+        v.viewport.set_camera(v.camera, self.extent());
         if !self.fast_frames(view) {
             return false;
         }
-        let v = &self.views[view];
-        v.viewport.set_camera(v.camera, self.extent());
         self.push_overlay();
         true
     }
@@ -5389,7 +6340,7 @@ impl IslandEditor {
         self.gizmo_frame(view).is_none()
             && !matches!(self.views[view].drag, Some(Drag::Marquee(_)))
             && !matches!(self.tool, Tool::Harbour | Tool::River | Tool::Slot)
-            && self.overlay() != Some(anno_formats::grids::Kind::WaterFlow)
+            && self.overlay() != Some(anno_formats::a7m::grids::Kind::WaterFlow)
             && self.lines_current()
             && !self.renderer.pending()
     }
@@ -5479,6 +6430,15 @@ impl Editor {
                     }
                     Tool::Place => "Click: place",
                     Tool::Paint => "Drag: paint · Alt-click or I: pipette · [ ]: radius",
+                    Tool::Grid
+                        if island.edits_blockers()
+                            && island.blocker == grids::BlockerEdit::Shapes =>
+                    {
+                        "Click: add a point · Enter, double-click or the first point: close · Drag a point: move · Shift-click: remove · Esc: cancel"
+                    }
+                    Tool::Grid if island.edits_blockers() => {
+                        "Drag: block · Shift: clear · [ ]: radius"
+                    }
                     Tool::Grid => {
                         "Drag: paint the grid · Shift: erase · Alt-click: pick value · [ ]: radius"
                     }
@@ -5515,20 +6475,34 @@ impl Editor {
                 .trim_start_matches(" | ")
                 .replace(" ·  · ", " · ");
             // Frame rate shown, then what the CPU and GPU frame times alone
-            // would allow; the GPU's share is the viewport passes'.
+            // would allow; the GPU's share is the viewport passes'. The GPU
+            // rate follows the first-to-last span: tile GPUs (Apple) overlap
+            // one pass's fragments with the next's vertices, so the summed
+            // pass times count the overlap twice (89 fps shown against a
+            // 27 ms sum on an M-series MacBook).
             let stats = island.frame_stats();
             let fps = |ms: f32| if ms > 0. { 1000. / ms } else { 0. };
-            let rate = format!(
-                "{:.0} fps · CPU {:.1} ms ({:.0} fps: build {:.1}, layout {:.1}, encode {:.1}) · GPU {:.1} ms ({:.0} fps)",
+            let mut rate = format!(
+                "{:.0} fps · CPU {:.1} ms ({:.0} fps: build {:.1}, layout {:.1}, encode {:.1}) · GPU {:.1} ms ({:.0} fps, passes sum {:.1} ms)",
                 fps(stats.frame_ms),
                 stats.cpu_ms,
                 fps(stats.cpu_ms),
                 stats.build_ms,
                 stats.layout_ms,
                 stats.encode_ms,
+                stats.span_avg_ms,
+                fps(stats.span_avg_ms),
                 stats.gpu_ms,
-                fps(stats.gpu_ms),
             );
+            // Zero: the backend gives no allocator report.
+            if stats.vram_used > 0 {
+                let gib = |b: u64| b as f64 / f64::from(1u32 << 30);
+                rate += &format!(
+                    " · VRAM {:.2} GiB ({:.2} reserved)",
+                    gib(stats.vram_used),
+                    gib(stats.vram_reserved),
+                );
+            }
             out.push(
                 div()
                     .absolute()
@@ -5584,6 +6558,9 @@ impl Editor {
                                 .bg(theme::get().overlay)
                                 .text_size(px(10.))
                                 .text_color(theme::get().text)
+                                .when(self.pass_times, |d| {
+                                    d.font_family(theme::MONO_FONT).child(pass_rows(&stats))
+                                })
                                 .child(rate),
                         )
                     })
@@ -5592,6 +6569,29 @@ impl Editor {
         }
         out
     }
+}
+
+/// View → GPU pass times: one row per timed pass over every open view,
+/// smoothed, in a fixed order, then what the timestamps do not cover (the
+/// gaps between passes and untimed work) so the rows add up to the span.
+/// Monospaced with fixed-width figures: proportional digits made the pill
+/// jitter every frame.
+fn pass_rows(stats: &gpui_editor_kit::gpu::Stats) -> Div {
+    let passes = || stats.pass_avg.iter().filter(|(n, _)| !n.is_empty());
+    let timed: f32 = passes().map(|p| p.1).sum();
+    let row = |name: &str, ms: f32| {
+        div()
+            .flex()
+            .justify_between()
+            .gap_4()
+            .child(name.to_string())
+            .child(format!("{ms:>6.2} ms"))
+    };
+    div()
+        .font_family(theme::MONO_FONT)
+        .pb_1()
+        .children(passes().map(|&(name, ms)| row(name, ms)))
+        .child(row("between passes", (stats.span_avg_ms - timed).max(0.)))
 }
 
 /// A model name without its one- or two-letter variant token, at the end
@@ -5615,51 +6615,13 @@ fn variant_base(name: &str) -> String {
     }
 }
 
-/// An island file as the list names it. Shipped names repeat their
-/// province (`celtic_island_medium_01` → `Medium 01`), which the list's
-/// group header and the badge's tooltip already say.
-/// The island list's kind filter, read from the shipped file names.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum IslandKind {
-    All,
-    /// The default: under All, decoration and campaign islands filled the
-    /// first screen before any island one would start from.
-    #[default]
-    Playable,
-    Decoration,
-    Other,
-}
-
-impl IslandKind {
-    const ALL: [IslandKind; 4] = [Self::All, Self::Playable, Self::Decoration, Self::Other];
-
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            Self::All => "All",
-            Self::Playable => "Playable",
-            Self::Decoration => "Decoration",
-            Self::Other => "Campaign & NPC",
-        }
-    }
-
-    /// Names are the only signal the shipped files carry; "campaign" wins
-    /// over "deco" so a campaign decoration counts as Other.
-    fn of(path: &str) -> IslandKind {
-        let name = path.rsplit('/').next().unwrap_or(path).to_ascii_lowercase();
-        if ["campaign", "pirate", "third_party", "thirdparty", "trader"]
-            .iter()
-            .any(|w| name.contains(w))
-        {
-            Self::Other
-        } else if name.contains("deco") {
-            Self::Decoration
-        } else {
-            Self::Playable
-        }
-    }
-
-    pub(crate) fn admits(self, path: &str) -> bool {
-        self == Self::All || Self::of(path) == self
+/// A slot marker's color by kind, the same on the dot and its heading.
+fn slot_hue(resource: harbour::Resource) -> u32 {
+    match resource {
+        harbour::Resource::Mine | harbour::Resource::NewWorldMine => crate::colors::SLOT_MINE,
+        harbour::Resource::River => crate::colors::SLOT_RIVER,
+        harbour::Resource::Marsh => crate::colors::SLOT_MARSH,
+        _ => crate::colors::SLOT_OTHER,
     }
 }
 
@@ -5669,9 +6631,13 @@ pub(crate) fn island_pack(path: &str) -> Option<String> {
     crate::browser::pack_name(path.split('/').nth(1)?)
 }
 
-pub(crate) fn island_title(path: &str) -> String {
+/// An island file as the list names it. Shipped names repeat their
+/// province (`celtic_island_medium_01` → `Medium 01`), which the list's
+/// group header and the badge's tooltip already say.
+pub(crate) fn island_title(words: &AssetWords, path: &str) -> String {
     let file = path.rsplit('/').next().unwrap_or(path);
-    let name = file.trim_end_matches(".a7m");
+    // `.a7m`, or 2070's `.isd`.
+    let name = file.rsplit_once('.').map_or(file, |(stem, _)| stem);
     let short = name
         .find("_island_")
         .map_or(name, |i| &name[i + "_island_".len()..]);
@@ -5689,7 +6655,7 @@ pub(crate) fn island_title(path: &str) -> String {
             parts.remove(i);
         }
     }
-    let mut out = words(&parts.join(" "));
+    let mut out = spelled(words, &parts.join(" "));
     if let Some(first) = out.get_mut(..1) {
         first.make_ascii_uppercase();
     }
@@ -5698,8 +6664,8 @@ pub(crate) fn island_title(path: &str) -> String {
 
 /// A game id as a modder reads it: `tree_beech_02_a` → `Tree beech 02 a`.
 /// The raw id stays in tooltips and the inspector's path.
-pub(crate) fn pretty(id: &str) -> String {
-    let spaced = sentence_case(&words(&id.replace('_', " ")));
+pub(crate) fn pretty(words: &AssetWords, id: &str) -> String {
+    let spaced = sentence_case(words, &spelled(words, &id.replace('_', " ")));
     // A variant letter joins the number before it ("Bush 06a marsh"): on
     // its own, "Bush 06 a marsh" read as English, a bush and "a marsh".
     // A word run into its number splits ("detail01" → "detail 01",
@@ -5733,15 +6699,14 @@ pub(crate) fn pretty(id: &str) -> String {
 }
 
 /// Title Case asset texts (`Mountain Slot`) as the rest of the editor
-/// writes: later words lower case unless they are place names.
-fn sentence_case(text: &str) -> String {
-    const PROPER: &[&str] = &["Albion", "Latium", "Celtic", "Roman", "Prydein"];
+/// writes: later words lower case unless they are the game's proper names.
+fn sentence_case(words: &AssetWords, text: &str) -> String {
     text.split(' ')
         .enumerate()
         .map(|(i, w)| {
             let title = w.chars().next().is_some_and(|c| c.is_ascii_uppercase())
                 && w.chars().skip(1).all(|c| c.is_ascii_lowercase());
-            if i > 0 && title && !PROPER.contains(&w) {
+            if i > 0 && title && !words.proper.contains(&w) {
                 w.to_ascii_lowercase()
             } else {
                 w.to_owned()
@@ -5769,31 +6734,22 @@ fn ground_name(layer: &str) -> String {
     words.join(" ")
 }
 
-/// Words the game's ids run together, spelled out. Matched per word
-/// without case; anything else passes through.
-const JOINED: &[(&str, &str)] = &[
-    ("pirateoutpost", "pirate outpost"),
-    ("legioneagle", "legion eagle"),
-    ("workareaslot", "work area slot"),
-    ("3rdparty", "third-party"),
-    ("marshveg", "marsh"),
-    ("noskirt", "no skirt"),
-    ("simplecfg", "model object"),
-    // Place names keep their capital wherever they fall in an id.
-    ("prydein", "Prydein"),
-    ("albion", "Albion"),
-    ("latium", "Latium"),
-    ("celtic", "Celtic"),
-    ("roman", "Roman"),
-];
-
-fn words(text: &str) -> String {
+/// `text` with the game's run-together words spelled out and its proper
+/// names capitalised, word by word; anything else passes through.
+fn spelled(words: &AssetWords, text: &str) -> String {
     text.split(' ')
         .map(|w| {
-            JOINED
-                .iter()
+            (words.joined.iter())
                 .find(|(joined, _)| w.eq_ignore_ascii_case(joined))
-                .map_or(w, |(_, spelled)| spelled)
+                .map(|&(_, spelled)| spelled)
+                .or_else(|| {
+                    words
+                        .proper
+                        .iter()
+                        .copied()
+                        .find(|p| w.eq_ignore_ascii_case(p))
+                })
+                .unwrap_or(w)
         })
         .collect::<Vec<_>>()
         .join(" ")
@@ -5801,7 +6757,7 @@ fn words(text: &str) -> String {
 
 /// A section heading that says its value while folded ("Wetlands 01 ·
 /// Celtic 01" under "Ground cover & lighting"). Open, the rows say it.
-fn fold_summary(heading: Stateful<Div>, open: bool, summary: String) -> Div {
+pub(crate) fn fold_summary(heading: Stateful<Div>, open: bool, summary: String) -> Div {
     let out = div().flex().flex_col().child(heading);
     if open || summary.is_empty() {
         return out;
@@ -5825,12 +6781,12 @@ fn fold_summary(heading: Stateful<Div>, open: bool, summary: String) -> Div {
 
 /// A preset id without its kind prefix, capitalised: `ls_wetlands_01` →
 /// `Wetlands 01`, `amb_celtic_01` → `Celtic 01`.
-fn preset_name(id: &str) -> String {
+pub(crate) fn preset_name(words: &AssetWords, id: &str) -> String {
     let bare = ["ls_", "amb_"]
         .iter()
         .find_map(|p| id.strip_prefix(p))
         .unwrap_or(id);
-    let mut out = pretty(bare);
+    let mut out = pretty(words, bare);
     if let Some(first) = out.get_mut(..1) {
         first.make_ascii_uppercase();
     }
@@ -5859,12 +6815,12 @@ impl Editor {
             return;
         }
         island.harbour_loading = true;
-        let (region, path) = (island.region(), island.path.clone());
+        let (module, region, path) = (island.module(), island.region(), island.path.clone());
         cx.spawn(async move |this, cx| {
             let lib = cx
                 .background_spawn(async move {
                     let _span = gpui_editor_kit::profile::span("harbour records (background)");
-                    harbour::Library::load(&install, &assets, &region)
+                    harbour::Library::load(module, &install, &assets, &region)
                 })
                 .await;
             this.update(cx, |this, cx| {
@@ -5874,7 +6830,9 @@ impl Editor {
                 {
                     i.harbour_loading = false;
                     match lib {
-                        Ok(lib) if i.harbour.is_none() => i.harbour = Some(Arc::new(lib)),
+                        Ok(lib) if i.island.harbour.is_none() => {
+                            i.island.harbour = Some(Arc::new(lib))
+                        }
                         Ok(_) => {}
                         Err(e) => {
                             i.harbour_failed = true;
@@ -5900,11 +6858,11 @@ impl Editor {
             }
             return;
         };
-        if island.harbour.is_some() {
+        if island.island.harbour.is_some() {
             return;
         }
-        match harbour::Library::load(install, assets, &island.region()) {
-            Ok(lib) => island.harbour = Some(Arc::new(lib)),
+        match harbour::Library::load(island.module(), install, assets, &island.region()) {
+            Ok(lib) => island.island.harbour = Some(Arc::new(lib)),
             Err(e) => island.say(format!("Harbour records unavailable: {e:#}"), true),
         }
     }
@@ -5919,9 +6877,9 @@ impl Editor {
             return island.say("Assets are still loading; try again in a moment", true);
         }
         if island.spot_records.is_none() {
-            let mut guids = sound::guids(self.game).to_vec();
-            guids.push(super::blockers::BLOCKER);
-            match harbour::find_records(install, &guids) {
+            let mut guids = sound::guids(island.rules()).to_vec();
+            guids.push(island.rules().build_blocker);
+            match harbour::find_records(island.rules(), install, &guids) {
                 Ok(r) => island.spot_records = Some(Arc::new(r)),
                 Err(e) => return island.say(format!("Spot records unavailable: {e:#}"), true),
             }
@@ -5953,12 +6911,12 @@ impl Editor {
             ),
         ] {
             options = options.child(
-                button(label, island.start_coast == start)
+                button(label, island.island.start_coast == start)
                     .text_size(px(11.))
                     .tooltip(Tooltip::text(label, "", detail))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if let Some(i) = &mut this.island {
-                            i.start_coast = start;
+                            i.island.start_coast = start;
                         }
                         cx.notify();
                     })),
@@ -6006,7 +6964,7 @@ impl Editor {
                 true,
                 (
                     "Auto in region",
-                    "Drag a rectangle; the tool places the best spots inside it",
+                    "Drag a rectangle or trace a lasso; the tool places the best spots inside it",
                 ),
             ),
         ] {
@@ -6023,6 +6981,26 @@ impl Editor {
             );
         }
         if island.auto_region {
+            for (lasso, label, detail) in [
+                (false, "Rectangle", "Drag a rectangle over the ground"),
+                (
+                    true,
+                    "Lasso",
+                    "Trace around a ridge, river bank or marsh; the outline closes on release",
+                ),
+            ] {
+                options = options.child(
+                    button(label, island.auto_lasso == lasso)
+                        .text_size(px(11.))
+                        .tooltip(Tooltip::text(label, "", detail))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(i) = &mut this.island {
+                                i.auto_lasso = lasso;
+                            }
+                            cx.notify();
+                        })),
+                );
+            }
             let step = |delta: i32| {
                 cx.listener(
                     move |this: &mut Self,
@@ -6082,9 +7060,46 @@ impl Editor {
                     })),
             );
         }
+        options = options.child(widgets::toolbar_separator()).child(
+            button("Carve ground", island.carve_ground)
+                .text_size(px(11.))
+                .tooltip(Tooltip::text(
+                    "Carve ground",
+                    "",
+                    "Writing a river shapes and paints its bed; a reopened one only where its points changed. Off writes the curve and cells alone",
+                ))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    if let Some(i) = &mut this.island {
+                        i.carve_ground = !i.carve_ground;
+                    }
+                    cx.notify();
+                })),
+        );
+        // The bed carving makes, for rivers; lakes keep their basin.
+        if island.carve_ground && !island.river.as_ref().map_or(island.lake_mode, |d| d.lake) {
+            for (field, label, unit) in [
+                (BedField::Depth, "Bed depth", "m"),
+                (BedField::Bank, "Bank height", "m"),
+                (BedField::Reach, "Bank width", "m"),
+                (BedField::Bends, "Bends", "%"),
+                (BedField::Pools, "Pools", "%"),
+            ] {
+                options = options.child(self.island_compact(Field::Bed(field), label, unit, cx));
+            }
+        }
         let Some(draft) = &island.river else {
             return options;
         };
+        options = options
+            .child(widgets::toolbar_separator())
+            .child(self.island_compact(Field::Falloff, "Falloff", "m", cx));
+        // The picked knot's flow speeds, as `u0` stores them.
+        if !draft.lake && draft.picked.is_some() {
+            options = options.child(widgets::toolbar_separator());
+            for (bank, label) in [(0, "Left flow"), (1, "Centre flow"), (2, "Right flow")] {
+                options = options.child(self.island_compact(Field::Flow(bank), label, "", cx));
+            }
+        }
         options
             .child(widgets::toolbar_separator())
             .child(
@@ -6129,8 +7144,58 @@ impl Editor {
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let island = self.island.as_ref().expect("options render with an island");
+        // The path edit mode owns the bar: placing is off while it is on.
+        if let Some(edit) = island.road_editing() {
+            let points = island
+                .island
+                .doc
+                .objects
+                .iter()
+                .find(|o| o.id == edit.work)
+                .and_then(|o| o.path.as_ref())
+                .map_or(0, Vec::len);
+            let picked = edit.picked.len();
+            options = options.child(
+                div()
+                    .px_1()
+                    .text_size(px(11.))
+                    .text_color(theme::get().muted)
+                    .child(format!("Path: {points} points, {picked} picked")),
+            );
+            type Action = fn(&mut IslandEditor);
+            let actions: [(&str, &str, Action); 3] = [
+                (
+                    "Add point",
+                    "Adds a point halfway along the segment after each picked point (the longest segment when none is picked). Double-clicking the path adds one there",
+                    IslandEditor::add_road_points,
+                ),
+                (
+                    "Delete point",
+                    "Deletes the picked points (Delete). The first and last points stay",
+                    IslandEditor::remove_road_points,
+                ),
+                ("Done", "Leaves the path edit mode (Enter or Esc)", |i| {
+                    i.road_edit = None
+                }),
+            ];
+            for (label, detail, act) in actions {
+                options = options.child(
+                    button(label, false)
+                        .text_size(px(11.))
+                        .tooltip(Tooltip::text(label, "", detail))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(i) = &mut this.island {
+                                act(i);
+                            }
+                            cx.notify();
+                        })),
+                );
+            }
+            return options;
+        }
         for (resource, label) in harbour::Resource::ALL {
             let shipped = island
+                .island
                 .harbour
                 .as_ref()
                 .is_none_or(|lib| lib.guid(resource.pieces(false).0).is_some());
@@ -6138,11 +7203,11 @@ impl Editor {
                 continue;
             }
             options = options.child(
-                button(label, island.resource == resource)
+                button(label, island.island.resource == resource)
                     .text_size(px(11.))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if let Some(i) = &mut this.island {
-                            i.resource = resource;
+                            i.island.resource = resource;
                         }
                         cx.notify();
                     })),
@@ -6151,11 +7216,12 @@ impl Editor {
         options = options.child(widgets::toolbar_separator());
         // Marsh slots have no fixed variant; shipped ones are all listed and
         // carry no generator slot count.
-        let kinds: &[(bool, &str, &str)] = if island.resource.has_fixed()
+        let kinds: &[(bool, &str, &str)] = if island.island.resource.has_fixed()
             && island
+                .island
                 .harbour
                 .as_ref()
-                .is_none_or(|lib| lib.guid(island.resource.pieces(true).0).is_some())
+                .is_none_or(|lib| lib.guid(island.island.resource.pieces(true).0).is_some())
         {
             &[
                 (
@@ -6174,18 +7240,46 @@ impl Editor {
         };
         for &(fixed, label, detail) in kinds {
             options = options.child(
-                button(label, island.fixed_slots == fixed)
+                button(label, island.island.fixed_slots == fixed)
                     .text_size(px(11.))
                     .tooltip(Tooltip::text(label, "", detail))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if let Some(i) = &mut this.island {
-                            i.fixed_slots = fixed;
+                            i.island.fixed_slots = fixed;
                         }
                         cx.notify();
                     })),
             );
         }
         options = self.island_auto_options(options.child(widgets::toolbar_separator()), cx);
+        if !island.selection.is_empty() {
+            let detail = island.module().text().slot_roads;
+            options = options.child(widgets::toolbar_separator()).child(
+                button("Edit path", false)
+                    .text_size(px(11.))
+                    .tooltip(Tooltip::text(
+                        "Edit path",
+                        "",
+                        "Edits the points of the selected work area's path, or the selected slot's first one: pick points, move them with the gizmo, add and delete them. Double-clicking a path does the same",
+                    ))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(i) = &mut this.island {
+                            i.edit_selected_path();
+                        }
+                        cx.notify();
+                    })),
+            ).child(
+                button("Road", false)
+                    .text_size(px(11.))
+                    .tooltip(Tooltip::text("Road", "", detail))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(i) = &mut this.island {
+                            i.rebuild_slot_roads();
+                        }
+                        cx.notify();
+                    })),
+            );
+        }
         // Only project islands reach the test map.
         if let (Some((id, kind)), Some(assets), true) =
             (island.selected_slot(), &island.assets, island.is_new())
@@ -6198,24 +7292,26 @@ impl Editor {
                     .text_color(theme::get().muted)
                     .child("Test map:"),
             );
-            let slots = island.game.profile().slots;
+            let slots = island.rules().slots;
             let deposits = match slots {
                 ResourceSlots::Random => island
+                    .island
                     .doc
                     .objects
                     .iter()
                     .find(|o| o.id == id)
                     .and_then(|o| assets.get(o.guid))
                     .into_iter()
-                    .flat_map(|a| assets.slot_replacements(a.guid, &island.region()))
+                    .flat_map(|a| assets.slot_replacements(a.guid, &island.asset_region()))
                     .map(|a| fertility::Deposit {
                         guid: a.guid,
                         label: fertility::label(assets, a.guid),
                     })
                     .collect(),
                 ResourceSlots::Typed => {
-                    fertility::deposits(assets, &island.region(), kind.slot_type())
+                    fertility::deposits(assets, &island.asset_region(), kind.slot_type())
                 }
+                ResourceSlots::None => Vec::new(),
             };
             // A random slot can also be replaced by nothing.
             let empty = (slots == ResourceSlots::Random).then_some((Some(0), "Empty".to_owned()));
@@ -6229,7 +7325,7 @@ impl Editor {
                         .tooltip(Tooltip::text(
                             label,
                             "",
-                            crate::game_text::of(island.game).slot_resource,
+                            island.module().text().slot_resource,
                         ))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             if let Some(i) = &mut this.island {
@@ -6252,6 +7348,19 @@ pub enum ListingOf {
 }
 
 impl Editor {
+    /// The open game's island rules; BARE's for a game without islands,
+    /// whose island tools never show.
+    pub(crate) fn island_rules(&self) -> &'static IslandRules {
+        self.module
+            .islands()
+            .map_or(&IslandRules::BARE, |i| i.rules())
+    }
+
+    /// The game's words for showing its ids and texts ([`pretty`]).
+    pub(crate) fn asset_words(&self) -> &'static AssetWords {
+        &self.module.text().asset_words
+    }
+
     fn edit_listing(&mut self, of: ListingOf, f: impl FnOnce(&mut Listing)) {
         match of {
             ListingOf::Wizard => {
@@ -6271,7 +7380,9 @@ impl Editor {
     /// has no land yet, so it warns from the map size; the inspector shows
     /// the class the land gives and allows an override.
     pub fn listing_controls(&self, of: ListingOf, cx: &mut Context<Self>) -> Div {
-        let profile = self.game.profile();
+        let Some(profile) = self.module.islands().map(|i| i.rules()) else {
+            return div();
+        };
         let (min_start, max_slot, start_classes) = (
             profile.min_start_extent(),
             profile.max_slot(),
@@ -6325,16 +7436,17 @@ impl Editor {
             // Bare names: "Start island → 384 m map" on two of three
             // segments said the width three times with the line below; the
             // line alone announces the widening.
-            crate::project::ROLES.map(|(label, kind)| (kind.to_owned(), label.into())),
+            (profile.roles.iter()).map(|r| (r.value.to_owned(), r.label.into())),
             &listing.kind,
             move |kind| {
-                (narrow && kind != "Normal" && *kind != current && start_width.is_none())
+                let start = profile.role(kind).is_some_and(|r| r.start);
+                (narrow && start && *kind != current && start_width.is_none())
                     .then(|| "No map of this region is wide enough for a start island".into())
             },
             cx,
             move |this, kind, _, _| {
                 if narrow
-                    && kind != "Normal"
+                    && profile.role(&kind).is_some_and(|r| r.start)
                     && let (Some(index), Some(w)) = (widen, &mut this.wizard)
                 {
                     w.choose_size(index);
@@ -6362,10 +7474,10 @@ impl Editor {
             .child(note("Role".into(), false))
             .child(roles)
             .child(note(
-                match listing.kind.as_str() {
+                match profile.role(&listing.kind).map(|r| (r.regular, r.start)) {
                     // The widening said in words: the arrow on the role
                     // alone was easy to miss.
-                    "Normal" => match start_width {
+                    Some((true, false)) => match start_width {
                         // The width it goes to; the current one is selected
                         // just above.
                         Some(w) if narrow => format!(
@@ -6373,7 +7485,7 @@ impl Editor {
                         ),
                         _ => "Non-start island slots only.".to_owned(),
                     },
-                    "Starter" => "Only where a player starts.".to_owned(),
+                    Some((false, true)) => "Only where a player starts.".to_owned(),
                     _ => "Either, like every shipped start island.".to_owned(),
                 },
                 false,
@@ -6381,7 +7493,7 @@ impl Editor {
         let class = match land {
             None => {
                 let world = self.wizard.as_ref().map_or(0, |w| w.world());
-                if listing.is_start() && world < min_start {
+                if listing.is_start(profile) && world < min_start {
                     out = out.child(note(
                         format!("A {world} m map is too small for a start island: starts need {min_start}–{max_slot} m of land ({start_classes})"),
                         true,
@@ -6428,8 +7540,8 @@ impl Editor {
             }
         };
         if let Some(class) = class
-            && listing.is_start()
-            && !matches!(class.as_str(), "Large" | "XL")
+            && listing.is_start(profile)
+            && !(profile.size_classes.iter()).any(|c| c.start && c.name == class)
         {
             out = out.child(note(
                 format!("{class} islands never fill start slots; starts are {start_classes} ({min_start}–{max_slot} m of land)"),
@@ -6473,7 +7585,7 @@ impl Editor {
                 .child(modes);
             if let Some(selected) = &listing.fertilities {
                 let mut choices = div().flex().flex_wrap().gap_1();
-                for f in fertility::choices(assets, &island.region()) {
+                for f in fertility::choices(assets, &island.asset_region()) {
                     let guid = f.guid;
                     choices = choices.child(
                         button(f.label, selected.contains(&guid))
@@ -6560,19 +7672,22 @@ enum Pick {
 }
 
 impl Editor {
-    /// Builds or loads the placeable catalog off the UI thread, once.
+    /// Builds the placeable catalog off the UI thread, once per open game
+    /// (0.6-0.7 s); it lives in memory only.
     fn ensure_catalog(&mut self, cx: &mut Context<Self>) {
         let (None, false, Some(install)) =
             (&self.catalog, self.catalog_loading, self.install.clone())
         else {
             return;
         };
+        let Some(rules) = self.module.islands().map(|i| i.rules()) else {
+            return;
+        };
         self.catalog_loading = true;
-        let cache = self.config.join("catalog.json");
         cx.spawn(async move |this, cx| {
             let built = cx
                 .background_executor()
-                .spawn(async move { super::catalog::Catalog::load_or_build(&install, &cache) })
+                .spawn(async move { super::catalog::Catalog::build(rules, &install) })
                 .await;
             this.update(cx, |this, cx| {
                 this.catalog_loading = false;
@@ -6604,6 +7719,18 @@ impl Editor {
     }
 
     /// Picks up finished thumbnails every 100 ms while any are pending.
+    /// Starts the thumbnail worker and its PNG cache if nothing has: the
+    /// Library, the Islands panes, Models and the Map workspace share one.
+    pub(crate) fn start_thumbs(&mut self) {
+        if self.thumbs.is_none()
+            && let Some(install) = self.install.clone()
+        {
+            let dir = self.config.join("thumbnails");
+            let look = self.module.model_look();
+            self.thumbs = Some(super::catalog::Thumbs::new(install, dir, look));
+        }
+    }
+
     pub(crate) fn poll_thumbs(&mut self, cx: &mut Context<Self>) {
         if self.thumbs_polling || !self.thumbs_pending() {
             return;
@@ -6638,6 +7765,9 @@ impl Editor {
                             crate::editor::Pane::IslandInspector,
                             crate::editor::Pane::ProjectModels,
                             crate::editor::Pane::ProjectOverview,
+                            crate::editor::Pane::MapIslands,
+                            crate::editor::Pane::ModelList,
+                            crate::editor::Pane::ModelInspector,
                         ] {
                             this.notify_pane(pane, cx);
                         }
@@ -6675,8 +7805,11 @@ impl Editor {
             let stem = p.rsplit('/').next().unwrap_or(&p);
             match kind {
                 // Harvestable kinds only: no dead trees, stumps or palms.
-                "Trees" if island.game.profile().harvestable_tree_preset => {
-                    anno_formats::landscape::is_harvestable_tree(island.game, &p)
+                "Trees" if island.rules().harvestable_tree_preset => {
+                    anno_core::island::landscape::is_harvestable_tree(
+                        island.rules().tree_exclusions,
+                        &p,
+                    )
                 }
                 "Trees" => {
                     p.contains("/vegetation/trees/")
@@ -6719,9 +7852,9 @@ impl Editor {
         let Some(install) = self.install.clone() else {
             return;
         };
-        let found = (|| -> anyhow::Result<Option<anno_formats::objects::Template>> {
-            let archive = rda::Archive::from_bytes(install.read(island)?, island)?;
-            let gamedata = anno_formats::adf::Adf::decode(&archive.read_path("gamedata.data")?)?;
+        let found = (|| -> anyhow::Result<Option<anno_core::island::objects::Template>> {
+            let archive = rda::Archive::parse(install.read(island)?, island)?;
+            let gamedata = anno_formats::adf::Adf::parse(&archive.read_path("gamedata.data")?)?;
             let store = objects::Objects::read(&gamedata)?;
             Ok(store
                 .objects
@@ -6781,6 +7914,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let words = self.asset_words();
         self.ensure_catalog(cx);
         let Some(island) = &self.island else {
             return crate::editor::pane_note("Open an island to place models from its region.");
@@ -6808,7 +7942,7 @@ impl Editor {
         };
         let placing_prop = island
             .place
-            .and_then(|f| island.doc.meshes.get(f as usize).cloned());
+            .and_then(|f| island.island.doc.meshes.get(f as usize).cloned());
         let placing_object = island
             .place_object
             .as_ref()
@@ -6831,7 +7965,7 @@ impl Editor {
                     ));
                 }
                 // By the name on the card, as the Models page lists them.
-                rows.sort_by_cached_key(|r| pretty(&r.0).to_lowercase());
+                rows.sort_by_cached_key(|r| pretty(words, &r.0).to_lowercase());
             }
             super::catalog::Kind::Props => {
                 for p in &catalog.props {
@@ -6887,6 +8021,7 @@ impl Editor {
         // half keeps the catalog's order.
         let mut on_island = 0;
         let here: std::collections::HashSet<String> = island
+            .island
             .doc
             .meshes
             .iter()
@@ -6942,12 +8077,7 @@ impl Editor {
         }
         let total = rows.len();
         rows.truncate(LIBRARY_ROWS);
-        if self.thumbs.is_none()
-            && let Some(install) = self.install.clone()
-        {
-            let dir = self.config.join("thumbnails");
-            self.thumbs = Some(super::catalog::Thumbs::start(install, dir));
-        }
+        self.start_thumbs();
         if let Some(thumbs) = &mut self.thumbs {
             thumbs.request(rows.iter().filter_map(|r| r.5.as_deref()));
         }
@@ -7081,7 +8211,7 @@ impl Editor {
                         format!("{detail} · {uses}× on shipped islands")
                     },
                     // File names, spaced: `tree beech 02 a` wraps and reads.
-                    label: pretty(&label).into(),
+                    label: pretty(words, &label).into(),
                     active: active || in_set,
                     in_set,
                     here: kind == super::catalog::Kind::Props
@@ -7218,7 +8348,7 @@ impl Editor {
                     .when_some(group.clone().filter(|_| grouping), |d, g| {
                         d.child(
                             widgets::action(
-                                format!("← All · {}", pretty(&g)),
+                                format!("← All · {}", pretty(words, &g)),
                                 widgets::Tone::Secondary,
                             )
                             .h(px(26.))
@@ -7397,8 +8527,6 @@ impl Editor {
 
 #[cfg(test)]
 mod tests {
-    use super::IslandKind;
-
     #[test]
     fn variants_group_with_or_without_a_trailing_word() {
         use super::variant_base;
@@ -7417,41 +8545,63 @@ mod tests {
         assert_eq!(variant_base("reed_03_b"), "reed_03");
     }
 
+    // Each game's own proper names and run-together words: 117 keeps
+    // Albion's capital, 1800 Enbesa's, 2070 spells out its harbour system,
+    // and none of them applies another game's.
     #[test]
-    fn island_titles_leave_the_pack_to_the_detail() {
-        use super::{island_pack, island_title};
-        let base = "data/base/provinces/roman/islands/pool/roman_island_medium_01/roman_island_medium_01.a7m";
-        let dlc = "data/dlc01/provinces/roman/islands/pool/roman_dlc_01_island_small_01/roman_dlc_01_island_small_01.a7m";
-        let egypt = "data/dlc03/provinces/egypt/islands/pool/q/egypt_dlc_03_valley_village_01/egypt_dlc_03_valley_village_01.a7m";
-        assert_eq!(island_title(base), "Medium 01");
-        assert_eq!(island_pack(base), None);
-        assert_eq!(island_title(dlc), "Small 01");
-        assert_eq!(island_pack(dlc).as_deref(), Some("DLC 1"));
-        assert_eq!(island_title(egypt), "Egypt valley village 01");
-        assert_eq!(island_pack(egypt).as_deref(), Some("DLC 3"));
+    fn asset_names_read_with_their_own_games_words() {
+        use super::{island_title, pretty};
+        use anno_core::game::Game;
+        let words = |game| &crate::games::text(game).asset_words;
+        let (a117, a1800, a2070) = (
+            words(Game::Anno117),
+            words(Game::Anno1800),
+            words(Game::Anno2070),
+        );
+        assert_eq!(pretty(a117, "Mountain Slot Albion"), "Mountain slot Albion");
+        assert_eq!(
+            pretty(a1800, "Mountain Slot Albion"),
+            "Mountain slot albion"
+        );
+        assert_eq!(
+            pretty(a117, "legioneagle_prydein_01"),
+            "Legion eagle Prydein 01"
+        );
+        assert_eq!(
+            pretty(a1800, "questobject_enbesa_02a"),
+            "Quest object Enbesa 02a"
+        );
+        assert_eq!(
+            pretty(a117, "questobject_enbesa_02a"),
+            "Quest object enbesa 02a"
+        );
+        assert_eq!(
+            pretty(a2070, "harboursystem_eden_01"),
+            "Harbour system Eden 01"
+        );
+        assert_eq!(
+            pretty(a1800, "harboursystem_eden_01"),
+            "Harboursystem eden 01"
+        );
+        // A 2070 island's title drops its `.isd` as others drop `.a7m`.
+        assert_eq!(
+            island_title(a2070, "data/levels/islands/normal/n_m02.isd"),
+            "N m02"
+        );
     }
 
     #[test]
-    fn island_kind_reads_the_shipped_file_names() {
-        let at = |name: &str| format!("data/base/provinces/celtic/islands/{name}.a7m");
-        assert_eq!(
-            IslandKind::of(&at("celtic_island_medium_01")),
-            IslandKind::Playable
-        );
-        assert_eq!(
-            IslandKind::of(&at("celtic_island_deco_08")),
-            IslandKind::Decoration
-        );
-        // Campaign wins over deco: a campaign decoration is not a free one.
-        assert_eq!(
-            IslandKind::of(&at("celtic_island_campaign_deco_01")),
-            IslandKind::Other
-        );
-        assert_eq!(
-            IslandKind::of(&at("celtic_island_third_party_trader_01")),
-            IslandKind::Other
-        );
-        assert!(IslandKind::All.admits(&at("celtic_island_deco_08")));
-        assert!(!IslandKind::Playable.admits(&at("celtic_island_deco_08")));
+    fn island_titles_leave_the_pack_to_the_detail() {
+        use super::{island_pack, island_title};
+        let words = &crate::games::text(anno_core::game::Game::Anno117).asset_words;
+        let base = "data/base/provinces/roman/islands/pool/roman_island_medium_01/roman_island_medium_01.a7m";
+        let dlc = "data/dlc01/provinces/roman/islands/pool/roman_dlc_01_island_small_01/roman_dlc_01_island_small_01.a7m";
+        let egypt = "data/dlc03/provinces/egypt/islands/pool/q/egypt_dlc_03_valley_village_01/egypt_dlc_03_valley_village_01.a7m";
+        assert_eq!(island_title(words, base), "Medium 01");
+        assert_eq!(island_pack(base), None);
+        assert_eq!(island_title(words, dlc), "Small 01");
+        assert_eq!(island_pack(dlc).as_deref(), Some("DLC 1"));
+        assert_eq!(island_title(words, egypt), "Egypt valley village 01");
+        assert_eq!(island_pack(egypt).as_deref(), Some("DLC 3"));
     }
 }

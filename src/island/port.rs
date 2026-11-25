@@ -1,256 +1,208 @@
-// Brings models from outside into the mod: Anno 1800 props into a 117 mod,
+// Brings models into the mod from outside: props of another game (1800
+// prps into a 117 mod, 117 cfgs into an 1800 mod, 2070 cfgs into either)
 // and model files from disk (a cfg with its meshes and textures, or a bare
-// mesh). Also lists the models a project carries and the files each needs.
+// mesh). Also lists the models a project carries and which files each one
+// needs.
 //
-// 1800 props: 117 loads 1800's meshes as they are (it ships 1800's palm,
-// `palm_tree_01_04_lod0.rdm`, byte for byte, and every 1800 terrain prop uses
-// its 92-byte mesh layout), so the meshes, their distance levels and
-// textures are copied unchanged under `FOLDER`, and a 117 cfg is written
-// from a shipped 117 prop of the same kind.
+// Another game's prop goes through the neutral model (core::neutral): the
+// source game's module reads it, the target game's writes it, so a game
+// needs one reader and one writer instead of a converter per other game.
+// What each conversion keeps and drops lives with those readers and
+// writers in the game crates.
+use anno_core::files;
+use anno_core::game::Module;
+use anno_core::neutral::{self, Ported, Source, texture_files};
 use anno_formats::{
-    game::Game,
-    model::{mesh_path, texture_path},
+    model::{Transform, texture_path},
     rda::normalize_path,
     rdm::Rdm,
     vfs::Install,
+    xml::tag,
 };
 use anyhow::{Context, Result, bail, ensure};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-/// Where ported files live in the mod: the 1800 path without its `data/`.
-pub const FOLDER: &str = "data/editor/anno1800/";
+/// Where ported files live in the mod: `<root>/editor/anno<game>/` under
+/// the target's first project root, then the source path without its root.
+const EDITOR: &str = "editor/anno";
 
-/// 117 props whose cfg the ported ones copy, by the 1800 mesh's kind.
-const PLANT_TEMPLATE: &str = "data/base/graphics/library/environment/props/vegetation/trees/tree_palm_01/tree_palm_06_03.cfg";
-const STATIC_TEMPLATE: &str =
-    "data/base/graphics/roman/environment/props/rocks/roman_rock_07/roman_rock_07_e.cfg";
+fn folder(from: &dyn Module, root: &str) -> String {
+    format!("{root}/{EDITOR}{}/", from.profile().short_name)
+}
+
+/// The project root ported models go under in `to`; none for a game
+/// without projects, which can't take any.
+fn root(to: &dyn Module) -> Option<&'static str> {
+    to.project_roots().first().copied()
+}
+
+/// Whether `path` is a model the island import ported from the other game:
+/// under the ported folder of any project root.
+pub fn is_ported(path: &str) -> bool {
+    path.split_once('/')
+        .is_some_and(|(_, rest)| rest.starts_with(EDITOR))
+}
 
 /// Whether `source`, a model of game `from`, can be brought into `to`:
-/// only `.prp` props, and only from the game `to` ports props from.
-pub fn portable(from: Game, to: Game, source: &str) -> bool {
-    to.profile().ports_props_from == Some(from) && source.ends_with(".prp")
+/// props of a game `to` ports from, and effect cfgs placed on their own,
+/// into a game with projects. Decals become the target's decals and effects
+/// its own effects; which ones the source game's reader turns away (1800's
+/// mesh decals) fail when ported.
+pub fn portable(from: &dyn Module, to: &dyn Module, source: &str) -> bool {
+    root(to).is_some()
+        && to.ports().props_from.contains(&from.game())
+        && (source.ends_with(from.ports().prop_ext)
+            || (source.ends_with(".cfg") && source.contains("/effects/")))
 }
 
-/// The cfg a ported `source` is placed as.
-pub fn target(source: &str) -> String {
-    let stem = source.strip_suffix(".prp").unwrap_or(source);
-    moved(&format!("{stem}.cfg"))
+/// Decals and effects. Nothing in the target game looks like either, so the
+/// wizard brings them instead of matching by look.
+pub fn always_brought(source: &str) -> bool {
+    source.contains("/decals/") || source.contains("/effects/")
 }
 
-fn moved(path: &str) -> String {
-    let rel = path.strip_prefix("data/").unwrap_or(path);
-    format!("{FOLDER}{}", rel.to_ascii_lowercase())
+/// The model a ported `source` of `from` is placed as in `to`. `to` has
+/// projects (`portable`).
+pub fn target(from: &dyn Module, to: &dyn Module, source: &str) -> String {
+    let stem = (source.strip_suffix(from.ports().prop_ext))
+        .or_else(|| source.strip_suffix(".cfg"))
+        .unwrap_or(source);
+    let root = root(to).expect("a portable target has a project root");
+    moved(from, root, &format!("{stem}{}", to.ports().prop_ext))
 }
 
-/// One ported prop: every file to stage, its cfg (`target`) last.
-pub struct Ported {
-    pub files: Vec<(String, Vec<u8>)>,
+/// `path`, a file of `from`, under the ported folder in `root`. Its own
+/// root comes off: one of `from`'s, else `data/`, where every game ships
+/// (a game without project roots).
+fn moved(from: &dyn Module, root: &str, path: &str) -> String {
+    let rel = (from.project_roots().iter().copied().chain(["data"]))
+        .find_map(|r| path.strip_prefix(r)?.strip_prefix('/'))
+        .unwrap_or(path);
+    format!("{}{}", folder(from, root), rel.to_ascii_lowercase())
 }
 
-/// One `<Material>` of a prp.
-#[derive(Clone)]
-struct PrpMaterial {
-    diffuse: Option<String>,
-    normal: Option<String>,
-    color: [String; 3],
-    double_sided: String,
+/// Another game's install as a converter's source: files under the ported
+/// folder named for that game, in the target's `root`.
+struct Shipped<'a> {
+    from: &'a dyn Module,
+    root: &'a str,
+    install: &'a Install,
 }
 
-/// First `<tag>value</…>` in `xml`.
-fn tag<'a>(xml: &'a str, name: &str) -> Option<&'a str> {
-    crate::terrain::tag(xml, name)
-}
-
-/// Replaces the content of every `<name>…</name>` in `xml`.
-fn set(xml: &str, name: &str, value: &str) -> String {
-    let (open, close) = (format!("<{name}>"), format!("</{name}>"));
-    let mut out = String::with_capacity(xml.len());
-    let mut rest = xml;
-    while let Some(i) = rest.find(&open) {
-        let body = &rest[i + open.len()..];
-        let Some(j) = body.find(&close) else { break };
-        out.push_str(&rest[..i + open.len()]);
-        out.push_str(value);
-        rest = &body[j..];
+impl Source for Shipped<'_> {
+    fn read(&self, path: &str) -> Result<Vec<u8>> {
+        self.install.read(path)
     }
-    out.push_str(rest);
-    out
-}
 
-/// Sets `<name><x>…</x><y>…</y><z>…</z></name>`, when present.
-fn set_point(xml: &str, name: &str, p: [f32; 3]) -> String {
-    let (open, close) = (format!("<{name}>"), format!("</{name}>"));
-    let (Some(a), Some(b)) = (xml.find(&open), xml.find(&close)) else {
-        return xml.to_owned();
-    };
-    let mut body = xml[a..b].to_owned();
-    for (axis, v) in ["x", "y", "z"].iter().zip(p) {
-        body = set(&body, axis, &v.to_string());
+    fn place(&self, path: &str) -> String {
+        moved(self.from, self.root, path)
     }
-    format!("{}{body}{}", &xml[..a], &xml[b..])
 }
 
-/// The `<stem>_N.dds` files the game reads for texture `source`.
-fn texture_files(from: &Install, source: &str) -> Vec<(String, Vec<u8>)> {
-    let source = source.replace('\\', "/");
-    let stem = source.rsplit_once('.').map_or(source.as_str(), |(s, _)| s);
-    (0..4)
-        .map_while(|level| {
-            let path = format!("{stem}_{level}.dds");
-            let bytes = from.read(&path).ok()?;
-            Some((moved(&path), bytes))
-        })
-        .collect()
-}
-
-/// A 117 cfg for `mesh` (its virtual path in the mod), modelled on a
-/// shipped prop: the palm for plants (vertex colors carry wind and AO), a
-/// rock otherwise. One material block per entry of `materials`, whose
-/// textures are virtual paths too.
-fn wrap(
-    to: &Install,
-    mesh: &str,
-    rdm: &Rdm,
-    format: &str,
-    materials: &[PrpMaterial],
-) -> Result<String> {
-    let plant = format.contains("C4b");
-    let template = if plant {
-        PLANT_TEMPLATE
-    } else {
-        STATIC_TEMPLATE
-    };
-    let xml = String::from_utf8_lossy(&to.read(template)?).into_owned();
-    let (lo, hi) = rdm.bounds;
-    let center: [f32; 3] = std::array::from_fn(|i| (lo[i] + hi[i]) / 2.);
-    let extent: [f32; 3] = std::array::from_fn(|i| (hi[i] - lo[i]) / 2.);
-    let radius = extent.iter().map(|v| v * v).sum::<f32>().sqrt();
-    let mut cfg = xml.clone();
-    for (axis, i) in [("x", 0), ("y", 1), ("z", 2)] {
-        for prefix in ["Center", "MeshCenter"] {
-            cfg = set(&cfg, &format!("{prefix}.{axis}"), &center[i].to_string());
-        }
-        for prefix in ["Extent", "MeshExtent"] {
-            cfg = set(&cfg, &format!("{prefix}.{axis}"), &extent[i].to_string());
-        }
-    }
-    cfg = set(&cfg, "Radius", &radius.to_string());
-    cfg = set(&cfg, "MeshRadius", &radius.to_string());
-
-    // One material block per prp material, in the mesh's material order.
-    let open = "<Materials>";
-    let (a, b) = (
-        cfg.find(open).context("template has no Materials")? + open.len(),
-        cfg.find("</Materials>")
-            .context("template has no Materials")?,
-    );
-    let block = cfg[a..b].to_owned();
-    let blocks: String = (materials.iter().enumerate())
-        .map(|(i, m)| {
-            let mut out = set(&block, "Name", &format!("material_{i}"));
-            out = set(&out, "VertexFormat", format);
-            if let Some(t) = &m.diffuse {
-                out = set(&out, "cModelDiffTex", t);
-            }
-            // Without one the template's stays named but off.
-            match &m.normal {
-                Some(t) => out = set(&out, "cModelNormalTex", t),
-                None => out = set(&out, "NORMAL_ENABLED", "0"),
-            }
-            for (c, v) in ["r", "g", "b"].iter().zip(&m.color) {
-                out = set(&out, &format!("cDiffuseColor.{c}"), v);
-            }
-            set(&out, "DOUBLE_SIDED", &m.double_sided)
-        })
-        .collect();
-    cfg.replace_range(a..b, &blocks);
-    // Each distance level draws every material.
-    let indices: String = (0..materials.len())
-        .map(|i| format!("<i>{i}</i>\n"))
-        .collect();
-    let lod = format!("<i><Indices>{indices}</Indices>\n</i>\n");
-    if let (Some(a), Some(b)) = (
-        cfg.find("<MaterialLODInfos>"),
-        cfg.find("</MaterialLODInfos>"),
-    ) {
-        cfg.replace_range(a + "<MaterialLODInfos>".len()..b, &lod.repeat(5));
-    }
-    // The model's own name and mesh come after its materials.
-    let after = cfg.find("</MaterialLODInfos>").unwrap_or(0);
-    let name = mesh
-        .rsplit('/')
-        .next()
-        .unwrap_or(mesh)
-        .trim_end_matches(".rdm")
-        .trim_end_matches("_lod0");
-    let tail = set(&cfg[after..], "Name", name);
-    let tail = set(&tail, "FileName", mesh);
-    let tail = set_point(&set_point(&tail, "AABBMin", lo), "AABBMax", hi);
-    cfg.replace_range(after.., &tail);
-
-    Ok(cfg)
-}
-
-/// Ports 1800 prop `source` (a `.prp`) for `to`, a 117 install that has
-/// the template cfgs.
-pub fn port(from: &Install, to: &Install, source: &str) -> Result<Ported> {
+/// Ports prop `source` of module `from`, another game read from `from_install`,
+/// for module `to`, written beside `to_install`'s template props and placed
+/// under `to`'s first project root.
+pub fn port(
+    from: &dyn Module,
+    to: &dyn Module,
+    from_install: &Install,
+    to_install: &Install,
+    source: &str,
+) -> Result<Ported> {
     ensure!(
-        portable(from.game(), to.game(), source),
-        "{source}: only Anno 1800 props can be brought into Anno 117"
+        portable(from, to, source),
+        "{source}: not a prop {} can bring in",
+        to.profile().title
     );
-    let prp = String::from_utf8_lossy(&from.read(source)?).into_owned();
-    let mesh = tag(&prp, "MeshFileName")
-        .context("prp has no MeshFileName")?
-        .replace('\\', "/");
-    let format = tag(&prp, "VertexFormat").unwrap_or_default();
-    let materials: Vec<PrpMaterial> = (prp.split("<Material>").skip(1))
-        .map(|m| PrpMaterial {
-            diffuse: tag(m, "cPropDiffuseTex")
-                .filter(|t| !t.is_empty())
-                .map(str::to_owned),
-            normal: tag(m, "cPropNormalTex")
-                .filter(|t| !t.is_empty() && tag(m, "NORMAL_MAP_ENABLED") != Some("0"))
-                .map(str::to_owned),
-            color: ["r", "g", "b"].map(|c| {
-                tag(m, &format!("cDiffuseColor.{c}"))
-                    .unwrap_or("1")
-                    .to_owned()
-            }),
-            double_sided: tag(m, "DOUBLE_SIDED").unwrap_or("0").to_owned(),
-        })
-        .collect();
-    ensure!(!materials.is_empty(), "prp has no materials");
+    let model = (from.read_model(from_install, source))
+        .with_context(|| format!("{} models are not read", from.profile().title))??;
+    let shipped = Shipped {
+        from,
+        root: root(to).expect("checked by portable"),
+        install: from_install,
+    };
+    let out = (to.write_model(&model, &shipped, to_install))
+        .with_context(|| format!("{} models are not written", to.profile().title))??;
+    if out.pieces.is_empty() && out.effects.is_empty() {
+        if source.contains("/effects/") {
+            bail!("{source}: {} has no effect like it", to.profile().title);
+        }
+        let shown: Vec<&str> = out.left_out.iter().take(3).map(String::as_str).collect();
+        if shown.is_empty() {
+            bail!("it holds no mesh (animated units and effects only)");
+        }
+        bail!(
+            "nothing in it can be an {} prop: {}",
+            to.profile().short_name,
+            shown.join("; ")
+        );
+    }
+    Ok(out)
+}
 
+/// Files to stage: virtual path and bytes.
+type Files = Vec<(String, Vec<u8>)>;
+
+/// Where island `name`'s own material set goes in a mod of `to`, under the
+/// ported folder of `from`, the game its materials come from: a file per
+/// island, so editing it never changes another island's set. None for a
+/// game without projects.
+pub fn material_set_path(from: &dyn Module, to: &dyn Module, name: &str) -> Option<String> {
+    Some(format!(
+        "{}material_sets/{}.xml",
+        folder(from, root(to)?),
+        name.to_ascii_lowercase()
+    ))
+}
+
+/// The texture tags of a ground material xml (both games).
+const MATERIAL_TEXTURES: [&str; 4] = [
+    "DiffuseFileName",
+    "HeightFileName",
+    "SpecFileName",
+    "NormalFileName",
+];
+
+/// A ground material of the other game (`file` is its xml) for `to`'s
+/// sets: the xml and its textures under the ported folder of `to`'s first
+/// project root, xml first. Both
+/// games use the same four maps (diffuse with height in alpha, height, spec,
+/// normal) and BC7 textures. We write the xml in the short-closed form 1800's
+/// own materials use.
+pub fn port_material(
+    from_module: &dyn Module,
+    to: &dyn Module,
+    from: &Install,
+    file: &str,
+) -> Result<(String, Files)> {
+    let root = root(to).with_context(|| format!("{} has no projects", to.profile().title))?;
+    let xml = String::from_utf8_lossy(&from.read(file)?).into_owned();
+    let moved = |path: &str| moved(from_module, root, path);
+    let shipped = Shipped {
+        from: from_module,
+        root,
+        install: from,
+    };
     let mut files = Vec::new();
-    let bytes = from.read(&mesh).with_context(|| format!("mesh {mesh}"))?;
-    let rdm = Rdm::parse(&bytes).with_context(|| format!("mesh {mesh}"))?;
-    files.push((moved(&mesh), bytes));
-    // Distance levels sit next to the mesh; the game finds them by name.
-    let stem = mesh.strip_suffix(".rdm").unwrap_or(&mesh);
-    let stem = stem.strip_suffix("_lod0").unwrap_or(stem);
-    for level in 1..=4 {
-        let path = format!("{stem}_lod{level}.rdm");
-        if let Ok(bytes) = from.read(&path) {
-            files.push((moved(&path), bytes));
-        }
+    let mut out = String::from("<Material>");
+    for name in MATERIAL_TEXTURES {
+        let Some(source) = tag(&xml, name).filter(|t| !t.is_empty()) else {
+            continue;
+        };
+        let source = source.replace('\\', "/");
+        let maps = texture_files(&shipped, &source);
+        ensure!(
+            !maps.is_empty() || name != "DiffuseFileName",
+            "{file}: its diffuse texture does not ship"
+        );
+        files.extend(maps);
+        out.push_str(&format!("<{name}>{}</>\n", moved(&source)));
     }
-    for m in &materials {
-        for t in [&m.diffuse, &m.normal].into_iter().flatten() {
-            files.extend(texture_files(from, t));
-        }
-    }
-
-    let moved_materials: Vec<PrpMaterial> = (materials.iter())
-        .map(|m| PrpMaterial {
-            diffuse: m.diffuse.as_deref().map(|t| moved(&t.replace('\\', "/"))),
-            normal: m.normal.as_deref().map(|t| moved(&t.replace('\\', "/"))),
-            ..m.clone()
-        })
-        .collect();
-    let cfg = wrap(to, &moved(&mesh), &rdm, format, &moved_materials)?;
-    files.push((target(source), cfg.into_bytes()));
-    Ok(Ported { files })
+    out.push_str("</>\n");
+    let path = moved(file);
+    files.insert(0, (path.clone(), out.into_bytes()));
+    Ok((path, files))
 }
 
 /// Where a model imported from a loose folder goes: its own folder under
@@ -284,33 +236,29 @@ pub struct ProjectModel {
     pub size: usize,
 }
 
-/// The models among the project's files. A model's files are the ones its
-/// cfg references (with their distance levels and mips), when staged.
-pub fn project_models(files: &BTreeMap<String, Vec<u8>>) -> Vec<ProjectModel> {
-    files
-        .iter()
-        .filter(|(p, _)| p.ends_with(".cfg") || p.ends_with(".prp"))
-        .map(|(cfg, bytes)| {
-            let text = String::from_utf8_lossy(bytes);
+/// The models among the project's files (texts in `files`; `size` of any
+/// file, kept or staged): the files whose kind in `module` names others
+/// (`Kind::deps`). A model's files are the ones it names, with their
+/// distance levels and mips, when staged.
+pub fn project_models(
+    module: &dyn Module,
+    files: &BTreeMap<String, Vec<u8>>,
+    size: impl Fn(&str) -> Option<usize>,
+) -> Vec<ProjectModel> {
+    (files.iter())
+        .filter_map(|(p, bytes)| Some((p, bytes, files::kind_of(module, p)?.deps?)))
+        .map(|(cfg, bytes, deps)| {
             let mut own = vec![cfg.clone()];
-            for r in references(&text) {
-                for wanted in expected(&r) {
-                    own.extend(
-                        family(&wanted)
-                            .into_iter()
-                            .filter(|f| files.contains_key(f)),
-                    );
-                }
-            }
+            own.extend(deps(bytes).into_iter().filter(|f| size(f).is_some()));
             own.sort();
             own.dedup();
             ProjectModel {
-                kind: if cfg.starts_with(FOLDER) {
+                kind: if is_ported(cfg) {
                     ModelKind::Ported
                 } else {
                     ModelKind::Custom
                 },
-                size: own.iter().filter_map(|f| files.get(f)).map(Vec::len).sum(),
+                size: own.iter().filter_map(|f| size(f)).sum(),
                 files: own,
                 cfg: cfg.clone(),
             }
@@ -329,59 +277,6 @@ pub fn removable(models: &[ProjectModel], model: &ProjectModel) -> Vec<String> {
         })
         .cloned()
         .collect()
-}
-
-/// Extensions a cfg names files with: meshes as exported (fbx, max) or
-/// shipped, textures as authored or shipped, and sub-models and effects.
-const REFERENCED: [&str; 14] = [
-    "rdm", "fbx", "max", "dds", "psd", "png", "tga", "cfg", "prp", "rdp", "anim", "cf7", "ifo",
-    "fc",
-];
-
-/// File references in a cfg or prp: every tag body that is a path with one
-/// of the `REFERENCED` extensions, as written.
-fn references(xml: &str) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for body in xml.split('>').filter_map(|s| s.split('<').next()) {
-        let body = body.trim();
-        let Some((_, ext)) = body.rsplit_once('.') else {
-            continue;
-        };
-        let ok = REFERENCED.contains(&ext.to_ascii_lowercase().as_str())
-            && !body.contains(char::is_whitespace)
-            && body.len() > ext.len() + 1;
-        if ok && !out.iter().any(|o| o == body) {
-            out.push(body.to_owned());
-        }
-    }
-    out
-}
-
-/// The files the game reads for reference `r`: the shipped mesh for an
-/// exporter path, the top mip for an authored texture.
-fn expected(r: &str) -> Vec<String> {
-    let ext = r
-        .rsplit_once('.')
-        .map_or("", |(_, e)| e)
-        .to_ascii_lowercase();
-    match ext.as_str() {
-        "rdm" | "fbx" | "max" => vec![mesh_path(r)],
-        "dds" | "psd" | "png" | "tga" => vec![texture_path(r)],
-        _ => vec![normalize_path(r).into_owned()],
-    }
-}
-
-/// `file` and the siblings the game finds by name: distance levels of a
-/// mesh, lower mips of a texture.
-fn family(file: &str) -> Vec<String> {
-    let mut out = vec![file.to_owned()];
-    if let Some(stem) = file.strip_suffix(".rdm") {
-        let stem = stem.strip_suffix("_lod0").unwrap_or(stem);
-        out.extend((1..=4).map(|k| format!("{stem}_lod{k}.rdm")));
-    } else if let Some(stem) = file.strip_suffix("_0.dds") {
-        out.extend((1..=4).map(|k| format!("{stem}_{k}.dds")));
-    }
-    out
 }
 
 /// `rel` under `base`, matching each component without case: mods made on
@@ -419,14 +314,19 @@ pub struct Imported {
 /// A cfg inside a mod's `data/` tree keeps its paths. A cfg in a loose
 /// folder goes to [`custom_folder`] and its references are rewritten there.
 /// Files the game ships are referenced, never copied.
-pub fn import(source: &Path, mod_id: &str, install: &Install) -> Result<Imported> {
+pub fn import(
+    module: &dyn Module,
+    source: &Path,
+    mod_id: &str,
+    install: &Install,
+) -> Result<Imported> {
     let ext = source
         .extension()
         .map(|e| e.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_default();
     match ext.as_str() {
         "cfg" | "prp" => import_cfg(source, &ext, mod_id, install),
-        "rdm" => import_mesh(source, mod_id, install),
+        "rdm" => import_mesh(module, source, mod_id, install),
         _ => bail!("pick a .cfg, .prp or .rdm file"),
     }
 }
@@ -455,24 +355,15 @@ fn import_cfg(source: &Path, ext: &str, mod_id: &str, install: &Install) -> Resu
     let mut missing = Vec::new();
     let mut shipped = 0;
     let mut kept_paths = true;
-    for r in references(&text) {
-        let wanted = expected(&r);
-        let in_root = root.and_then(|root| {
-            wanted
-                .iter()
-                .find_map(|w| Some((find_ci(root, w)?, w.clone())))
-        });
-        let beside = || {
-            wanted.iter().find_map(|w| {
-                let name = w.rsplit('/').next()?;
-                Some((find_ci(dir, name)?, w.clone()))
-            })
-        };
-        let (found, wanted_path, keep) = match in_root {
-            Some((path, w)) => (path, w, true),
+    for r in files::references(&text) {
+        let wanted = files::shipped_path(&r);
+        let in_root = root.and_then(|root| find_ci(root, &wanted));
+        let beside = || find_ci(dir, wanted.rsplit('/').next()?);
+        let (found, keep) = match in_root {
+            Some(path) => (path, true),
             None => match beside() {
-                Some((path, w)) => (path, w, false),
-                None if wanted.iter().any(|w| install.file(w).is_some()) => {
+                Some(path) => (path, false),
+                None if install.file(&wanted).is_some() => {
                     shipped += 1;
                     continue;
                 }
@@ -486,18 +377,18 @@ fn import_cfg(source: &Path, ext: &str, mod_id: &str, install: &Install) -> Resu
         // The file's own name stays; the folder is the model's when the
         // cfg came from a loose folder.
         let (dest, new_ref) = if keep {
-            (wanted_path.clone(), r.clone())
+            (wanted.clone(), r.clone())
         } else {
             let name = r.rsplit(['/', '\\']).next().unwrap_or(&r);
             let new_ref = format!("{target}/{name}");
-            (expected(&new_ref).remove(0), new_ref)
+            (files::shipped_path(&new_ref), new_ref)
         };
         if install.file(&dest).is_some() {
             shipped += 1;
             continue;
         }
-        let dest_family = family(&dest);
-        for (n, sibling) in family(&wanted_path).iter().enumerate() {
+        let dest_family = files::siblings(&dest);
+        for (n, sibling) in files::siblings(&wanted).iter().enumerate() {
             let name = sibling.rsplit('/').next().unwrap_or(sibling);
             let path = if n == 0 {
                 Some(found.clone())
@@ -547,9 +438,14 @@ fn import_cfg(source: &Path, ext: &str, mod_id: &str, install: &Install) -> Resu
 
 /// A bare mesh: a cfg from the shipped templates, one material per mesh
 /// material, all using the textures beside the mesh (`*diff*`, `*norm*`).
-fn import_mesh(source: &Path, mod_id: &str, install: &Install) -> Result<Imported> {
+fn import_mesh(
+    module: &dyn Module,
+    source: &Path,
+    mod_id: &str,
+    install: &Install,
+) -> Result<Imported> {
     ensure!(
-        install.game().profile().mesh_import,
+        module.ports().mesh_import,
         "Anno 1800 props need a .prp; pick the model’s .prp or .cfg"
     );
     let bytes = std::fs::read(source).with_context(|| format!("Reading {}", source.display()))?;
@@ -559,14 +455,15 @@ fn import_mesh(source: &Path, mod_id: &str, install: &Install) -> Result<Importe
         "skinned meshes need an animated cfg; pick the model’s .cfg"
     );
     let name = stem_of(source);
-    let target = custom_folder(mod_id, name.trim_end_matches("_lod0"));
-    let mesh = format!("{target}/{name}.rdm");
-    let mut files = vec![(mesh.clone(), bytes)];
-    let dir = source.parent().context("the file has a folder")?;
     let stem = name.trim_end_matches("_lod0");
+    let target = custom_folder(mod_id, stem);
+    let mesh = format!("{target}/{name}.rdm");
+    let mut disk = Disk::default();
+    disk.0.insert(mesh.clone(), source.to_owned());
+    let dir = source.parent().context("the file has a folder")?;
     for k in 1..=4 {
         if let Some(p) = find_ci(dir, &format!("{stem}_lod{k}.rdm")) {
-            files.push((format!("{target}/{stem}_lod{k}.rdm"), std::fs::read(p)?));
+            disk.0.insert(format!("{target}/{stem}_lod{k}.rdm"), p);
         }
     }
     // The top mip of the first texture whose name says what it is, with
@@ -595,7 +492,10 @@ fn import_mesh(source: &Path, mod_id: &str, install: &Install) -> Result<Importe
             .trim_end_matches(|c: char| c.is_ascii_digit())
             .trim_end_matches('_');
         let reference = format!("{target}/{base}.psd");
-        for (n, sibling) in family(&texture_path(&reference)).iter().enumerate() {
+        for (n, sibling) in files::siblings(&texture_path(&reference))
+            .iter()
+            .enumerate()
+        {
             let on_disk = found.iter().find(|p| {
                 let f = p
                     .file_name()
@@ -605,25 +505,49 @@ fn import_mesh(source: &Path, mod_id: &str, install: &Install) -> Result<Importe
                 f == format!("{base}_{n}.dds") || (n == 0 && f == format!("{base}.dds"))
             });
             if let Some(p) = on_disk {
-                files.push((sibling.clone(), std::fs::read(p)?));
+                disk.0.insert(sibling.clone(), p.clone());
             }
         }
         Ok(Some(reference))
     };
     let diffuse = texture(&["diff", "_d.", "albedo", "color"])?;
     let normal = texture(&["norm", "_n."])?;
-    let count = (rdm.groups.iter().map(|g| g.material + 1).max()).unwrap_or(1) as usize;
-    let material = PrpMaterial {
-        diffuse,
-        normal,
-        color: ["1".into(), "1".into(), "1".into()],
-        double_sided: "0".into(),
+    // One material: the writer repeats it for every material the mesh's
+    // groups use.
+    let model = neutral::Model {
+        pieces: vec![neutral::Piece {
+            name: format!("{target}/{stem}"),
+            label: name.clone(),
+            at: Transform::IDENTITY,
+            shape: neutral::Shape::Mesh {
+                rdm: mesh,
+                transform: Transform::IDENTITY,
+            },
+            materials: vec![neutral::Material {
+                diffuse,
+                normal,
+                metallic: None,
+                color: [1.; 3],
+                double_sided: false,
+                alpha: anno_formats::model::Alpha::Opaque,
+                ground_shaded: false,
+                terrain_tint: 0.,
+            }],
+            tints: Vec::new(),
+        }],
+        ..neutral::Model::default()
     };
-    // The rdm's own layout name, as cfgs spell it (P4h_N4b_…); see rdm.rs.
-    let format = rdm.format.to_string();
-    let cfg = wrap(install, &mesh, &rdm, &format, &vec![material; count.max(1)])?;
-    let cfg_path = format!("{target}/{}.cfg", name.trim_end_matches("_lod0"));
-    files.insert(0, (cfg_path.clone(), cfg.into_bytes()));
+    let written = (module.write_model(&model, &disk, install))
+        .with_context(|| format!("{} models are not written", module.profile().title))??;
+    let cfg_path = format!("{target}/{stem}.cfg");
+    let mut files = written.files;
+    // The cfg first, as `Imported` promises.
+    let at = files
+        .iter()
+        .position(|f| f.0 == cfg_path)
+        .context("no cfg written")?;
+    let cfg = files.remove(at);
+    files.insert(0, cfg);
     Ok(Imported {
         cfg: cfg_path,
         files,
@@ -631,28 +555,262 @@ fn import_mesh(source: &Path, mod_id: &str, install: &Install) -> Result<Importe
     })
 }
 
+/// Files picked on disk as a converter's source, by the path each takes in
+/// the mod; they keep that path.
+#[derive(Default)]
+struct Disk(BTreeMap<String, PathBuf>);
+
+impl Source for Disk {
+    fn read(&self, path: &str) -> Result<Vec<u8>> {
+        let file = self
+            .0
+            .get(path)
+            .with_context(|| format!("no file {path}"))?;
+        std::fs::read(file).with_context(|| format!("Reading {}", file.display()))
+    }
+
+    fn place(&self, path: &str) -> String {
+        path.to_owned()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anno_core::game::Game;
+    use anno_formats::model::Model;
 
-    #[test]
-    fn set_replaces_every_tag_body() {
-        assert_eq!(
-            set("<a>1</a><b>2</b><a>3</a>", "a", "x"),
-            "<a>x</a><b>2</b><a>x</a>"
-        );
-        assert_eq!(set("<a>1</a>", "c", "x"), "<a>1</a>");
+    /// The module of the game installed at `install`.
+    fn module_of(install: &Install) -> &'static dyn Module {
+        crate::games::module(crate::games::of(install))
+    }
+
+    /// A model cache drawing ported models as before looks: the tests
+    /// check what loads, not how it glows.
+    fn plain() -> super::super::models::Cache {
+        super::super::models::Cache::new(&anno_core::files::ModelLook::PLAIN)
     }
 
     #[test]
     fn ported_paths_live_under_the_folder() {
+        let (a1800, a117): (&dyn Module, &dyn Module) = (&::anno1800::MODULE, &::anno117::MODULE);
         assert_eq!(
-            target("data/graphics/props/x/Tree_A.prp"),
+            target(a1800, a117, "data/graphics/props/x/Tree_A.prp"),
             "data/editor/anno1800/graphics/props/x/tree_a.cfg"
         );
-        assert!(portable(Game::Anno1800, Game::Anno117, "a/b.prp"));
-        assert!(!portable(Game::Anno1800, Game::Anno117, "a/b.cfg"));
-        assert!(!portable(Game::Anno117, Game::Anno1800, "a/b.prp"));
+        assert_eq!(
+            target(a117, a1800, "data/base/graphics/x/tree_a.cfg"),
+            "data/editor/anno117/base/graphics/x/tree_a.prp"
+        );
+        assert!(is_ported(&target(a117, a1800, "data/base/x.cfg")));
+        assert!(portable(a1800, a117, "a/b.prp"));
+        assert!(!portable(a1800, a117, "a/b.cfg"));
+        assert!(portable(a117, a1800, "a/props/b.cfg"));
+        assert!(!portable(a117, a1800, "a/b.prp"));
+        // Decals and effects come over both ways: 117's cfgs, 1800's decal
+        // prps and the effect cfgs its islands place.
+        assert!(portable(a117, a1800, "a/props/decals/beach/b.cfg"));
+        assert!(portable(a117, a1800, "a/effects/fire/b.cfg"));
+        assert!(portable(a1800, a117, "a/props/decals/b.prp"));
+        assert!(portable(a1800, a117, "a/effects/fire/b.cfg"));
+        assert!(!portable(a1800, a117, "a/props/b.cfg"));
+        assert_eq!(
+            target(a1800, a117, "data/graphics/effects/Fire.cfg"),
+            "data/editor/anno1800/graphics/effects/fire.cfg"
+        );
+    }
+
+    /// 117 under other project roots and nothing else: no islands, no
+    /// packaging. A port that looked the target up by its `Game` would
+    /// write under 117's `data/`.
+    struct Rooted;
+    impl Module for Rooted {
+        fn game(&self) -> Game {
+            Game::Anno117
+        }
+        fn profile(&self) -> &'static anno_core::game::Profile {
+            ::anno117::MODULE.profile()
+        }
+        fn text(&self) -> &'static anno_core::text::GameText {
+            ::anno117::MODULE.text()
+        }
+        fn card_art(&self) -> &'static [u8] {
+            &[]
+        }
+        fn accent(&self) -> [u32; 2] {
+            [0; 2]
+        }
+        // 117's port rules: what it takes and its prop extension.
+        fn ports(&self) -> anno_core::files::Ports {
+            ::anno117::MODULE.ports()
+        }
+        fn project_roots(&self) -> &'static [&'static str] {
+            &["content", "extra"]
+        }
+        fn write_model(
+            &self,
+            model: &anno_core::neutral::Model,
+            from: &dyn Source,
+            to: &Install,
+        ) -> Option<Result<Ported>> {
+            ::anno117::MODULE.write_model(model, from, to)
+        }
+    }
+
+    // Needs both games: an 1800 prop ported into a game whose first project
+    // root is `content` lands under it, every file and piece, and is still
+    // told apart as ported.
+    #[test]
+    fn a_port_lands_under_the_targets_project_root() {
+        let (Some(a), Some(b)) = (
+            anno_formats::vfs::install_dir("ANNO1800_DIR"),
+            anno_formats::vfs::install_dir("ANNO117_DIR"),
+        ) else {
+            eprintln!("skipping: ANNO1800_DIR or ANNO117_DIR unset");
+            return;
+        };
+        let families = crate::games::profile(anno_core::game::Game::Anno1800).archive_families;
+        let from = Install::open(a, families).unwrap();
+        let families = crate::games::profile(anno_core::game::Game::Anno117).archive_families;
+        let to = Install::open(b, families).unwrap();
+        let source = "data/graphics/props/terrain_props/rocks/rocks_jungle/rock_jungle_23.prp";
+        let module: &dyn Module = &::anno1800::MODULE;
+        let placed = target(module, &Rooted, source);
+        assert_eq!(
+            placed,
+            "content/editor/anno1800/graphics/props/terrain_props/rocks/rocks_jungle/rock_jungle_23.cfg"
+        );
+        assert!(is_ported(&placed));
+        let ported = port(module, &Rooted, &from, &to, source).unwrap();
+        assert!(!ported.files.is_empty() && !ported.pieces.is_empty());
+        for path in (ported.files.iter().map(|f| &f.0)).chain(ported.pieces.iter().map(|p| &p.0)) {
+            assert!(path.starts_with("content/editor/anno1800/"), "{path}");
+        }
+        assert!(ported.pieces.iter().any(|p| p.0 == placed));
+        // A game without projects takes no ports.
+        assert!(!portable(module, &::anno2070::MODULE, source));
+    }
+
+    // Needs Anno 117: a 117 rock ports into the skeleton as its own text mesh
+    // under its own root, every mesh and texture byte copied as shipped;
+    // the skeleton reads that back into the model 117 read, and 117 writes
+    // it again as a cfg that loads from a mod, its files under the folder
+    // named for the skeleton.
+    #[test]
+    fn a_117_prop_ports_into_the_skeleton_and_back() {
+        use crate::games::fixtures::{SKELETON, install};
+        let Some(dir) = anno_formats::vfs::install_dir("ANNO117_DIR") else {
+            eprintln!("skipping: ANNO117_DIR unset");
+            return;
+        };
+        let families = crate::games::profile(anno_core::game::Game::Anno117).archive_families;
+        let a117 = Install::open(dir, families).unwrap();
+        let m117: &dyn Module = &::anno117::MODULE;
+        let rock =
+            "data/base/graphics/roman/environment/props/rocks/roman_rock_06/roman_rock_06_a.cfg";
+        let tmp = tempfile::tempdir().unwrap();
+        let empty = install(&tmp.path().join("empty"), &[("skeleton/readme.txt", b"x")]);
+        let placed = target(m117, &SKELETON, rock);
+        assert_eq!(
+            placed,
+            "content/editor/anno117/base/graphics/roman/environment/props/rocks/roman_rock_06/roman_rock_06_a.skm"
+        );
+        let ported = port(m117, &SKELETON, &a117, &empty, rock).unwrap();
+        assert_eq!(ported.pieces.len(), 1);
+        assert_eq!(ported.pieces[0].0, placed);
+        for (path, bytes) in &ported.files {
+            assert!(path.starts_with("content/editor/anno117/"), "{path}");
+            if !path.ends_with(".skm") {
+                let shipped = path.replacen("content/editor/anno117/", "data/", 1);
+                assert_eq!(bytes, &a117.read(&shipped).unwrap(), "{path}");
+            }
+        }
+        assert!(ported.files.iter().any(|f| f.0.ends_with(".rdm")));
+        assert!(ported.files.iter().any(|f| f.0.ends_with("_0.dds")));
+
+        // Back: the skeleton reads its mesh from an install that holds it.
+        let held: Vec<(&str, &[u8])> = (ported.files.iter())
+            .map(|(p, b)| (p.as_str(), b.as_slice()))
+            .collect();
+        let skel = install(&tmp.path().join("skeleton"), &held);
+        let original = m117.read_model(&a117, rock).unwrap().unwrap();
+        let read = SKELETON.read_model(&skel, &placed).unwrap().unwrap();
+        assert_eq!(read.pieces.len(), original.pieces.len());
+        for (a, b) in read.pieces.iter().zip(&original.pieces) {
+            use neutral::Shape;
+            let (
+                Shape::Mesh {
+                    rdm: ra,
+                    transform: ta,
+                },
+                Shape::Mesh {
+                    rdm: rb,
+                    transform: tb,
+                },
+            ) = (&a.shape, &b.shape)
+            else {
+                panic!("{}: not a mesh", b.label);
+            };
+            assert_eq!(ta, tb);
+            assert_eq!(skel.read(ra).unwrap(), a117.read(rb).unwrap());
+            assert_eq!(a.materials.len(), b.materials.len());
+            for (ma, mb) in a.materials.iter().zip(&b.materials) {
+                assert_eq!(
+                    (
+                        ma.color,
+                        ma.alpha,
+                        ma.double_sided,
+                        ma.ground_shaded,
+                        ma.terrain_tint
+                    ),
+                    (
+                        mb.color,
+                        mb.alpha,
+                        mb.double_sided,
+                        mb.ground_shaded,
+                        mb.terrain_tint
+                    )
+                );
+                assert_eq!(ma.diffuse.is_some(), mb.diffuse.is_some());
+            }
+        }
+        let back = Shipped {
+            from: &SKELETON,
+            root: "data",
+            install: &skel,
+        };
+        let written = m117.write_model(&read, &back, &a117).unwrap().unwrap();
+        // What 117 writes of its own rock, mesh for mesh and mip for mip.
+        let direct = Shipped {
+            from: m117,
+            root: "data",
+            install: &a117,
+        };
+        let direct = m117
+            .write_model(&original, &direct, &a117)
+            .unwrap()
+            .unwrap();
+        let bytes = |p: &Ported| -> Vec<Vec<u8>> {
+            (p.files.iter())
+                .filter(|(path, _)| !path.ends_with(".cfg"))
+                .map(|(_, b)| b.clone())
+                .collect()
+        };
+        assert_eq!(bytes(&written), bytes(&direct));
+        let mods = tempfile::tempdir().unwrap();
+        for (path, bytes) in &written.files {
+            assert!(path.starts_with("data/editor/annoskel/"), "{path}");
+            let file = mods.path().join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, bytes).unwrap();
+        }
+        a117.mount_mods(&[mods.path()], &["data"]).unwrap();
+        let cfg = &written.pieces[0].0;
+        let model = Model::load(&a117, cfg).unwrap();
+        assert!(model.problems.is_empty(), "{:?}", model.problems);
+        let diffuse = model.parts[0].materials[0].diffuse.as_deref();
+        assert!(diffuse.is_some_and(|t| a117.exists(t)), "{diffuse:?}");
+        assert!(model.mesh_extent[1] > 0.1, "{:?}", model.mesh_extent);
     }
 
     // Needs both games: a ported jungle tree and rock load through the
@@ -661,20 +819,22 @@ mod tests {
     #[test]
     fn ported_props_load_from_the_mod() {
         let (Some(a), Some(b)) = (
-            std::env::var_os("ANNO1800_DIR"),
-            std::env::var_os("ANNO117_DIR"),
+            anno_formats::vfs::install_dir("ANNO1800_DIR"),
+            anno_formats::vfs::install_dir("ANNO117_DIR"),
         ) else {
             eprintln!("skipping: ANNO1800_DIR or ANNO117_DIR unset");
             return;
         };
-        let from = Install::open_game(Game::Anno1800, a).unwrap();
-        let to = Install::open_game(Game::Anno117, b).unwrap();
+        let families = crate::games::profile(anno_core::game::Game::Anno1800).archive_families;
+        let from = Install::open(a, families).unwrap();
+        let families = crate::games::profile(anno_core::game::Game::Anno117).archive_families;
+        let to = Install::open(b, families).unwrap();
         let dir = tempfile::tempdir().unwrap();
         for source in [
             "data/graphics/props/terrain_props/vegetation/trees/jungle/tree_jungle_very_large_01.prp",
             "data/graphics/props/terrain_props/rocks/rocks_jungle/rock_jungle_23.prp",
         ] {
-            let Ok(ported) = port(&from, &to, source) else {
+            let Ok(ported) = port(module_of(&from), module_of(&to), &from, &to, source) else {
                 let found = from.search(source.rsplit('/').next().unwrap(), 5);
                 panic!(
                     "{source}: {:?}",
@@ -697,20 +857,196 @@ mod tests {
                 std::fs::create_dir_all(file.parent().unwrap()).unwrap();
                 std::fs::write(file, bytes).unwrap();
             }
-            to.mount_mod(dir.path()).unwrap();
-            let cfg = target(source);
+            to.mount_mods(&[dir.path()], &["data"]).unwrap();
+            let cfg = target(&::anno1800::MODULE, &::anno117::MODULE, source);
             let model = anno_formats::model::Model::load(&to, &cfg).unwrap();
             assert!(model.problems.is_empty(), "{:?}", model.problems);
             let part = model.parts.iter().find(|p| p.mesh.is_some()).unwrap();
             let diffuse = part.materials[0].diffuse.as_deref();
             assert!(diffuse.is_some_and(|t| to.exists(t)), "{diffuse:?}");
             assert!(model.mesh_extent[1] > 0.1, "{:?}", model.mesh_extent);
-            let pieces = super::super::models::load(&to, &Default::default(), &cfg, 1.).unwrap();
+            let pieces = super::super::models::load(&to, &plain(), &cfg, 1.).unwrap();
             assert!(!pieces.is_empty());
         }
     }
 
-    /// An install whose only archive ships `files`.
+    // Needs both games. 117 props become 1800 prps that load from a mod over
+    // the 1800 install. The maritime pine is drawn at 5x in its cfg and has one
+    // vertex color, so its prp mesh carries the scale and 1800's two-color
+    // plant layout. The rock keeps its layout.
+    #[test]
+    fn ported_117_props_load_in_1800() {
+        let (Some(a), Some(b)) = (
+            anno_formats::vfs::install_dir("ANNO117_DIR"),
+            anno_formats::vfs::install_dir("ANNO1800_DIR"),
+        ) else {
+            eprintln!("skipping: ANNO1800_DIR or ANNO117_DIR unset");
+            return;
+        };
+        let families = crate::games::profile(anno_core::game::Game::Anno1800).archive_families;
+        let from = Install::open(a, families).unwrap();
+        let families = crate::games::profile(anno_core::game::Game::Anno117).archive_families;
+        let to = Install::open(b, families).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let pine = "data/base/graphics/roman/environment/props/vegetation/trees/tree_maritime_pine_01/tree_maritime_pine_01_k.cfg";
+        let rock =
+            "data/base/graphics/roman/environment/props/rocks/roman_rock_06/roman_rock_06_a.cfg";
+        // 1800's plant layout, two colors, and its plain static one.
+        let (plant, rock_layout) = (
+            "P4h_N4b_G4b_B4b_T2h_C4b_C4b".to_owned(),
+            "P4h_N4b_G4b_B4b_T2h".to_owned(),
+        );
+        for (source, format) in [(pine, &plant), (rock, &rock_layout)] {
+            let original = Model::load(&from, source).unwrap();
+            let ported = port(module_of(&from), module_of(&to), &from, &to, source).unwrap();
+            assert!(
+                ported.files.iter().any(|f| f.0.ends_with("_0.dds")),
+                "{source}: no textures"
+            );
+            for (path, bytes) in &ported.files {
+                let file = dir.path().join(path);
+                std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+                std::fs::write(file, bytes).unwrap();
+            }
+            to.mount_mods(&[dir.path()], &["data"]).unwrap();
+            let prp = target(&::anno117::MODULE, &::anno1800::MODULE, source);
+            let model = Model::load(&to, &prp).unwrap();
+            assert!(model.problems.is_empty(), "{:?}", model.problems);
+            let part = &model.parts[0];
+            let mesh = part.mesh.as_ref().unwrap();
+            assert_eq!(&mesh.format.to_string(), format);
+            assert_eq!(part.transform, Transform::IDENTITY);
+            let diffuse = part.materials[0].diffuse.as_deref();
+            assert!(diffuse.is_some_and(|t| to.exists(t)), "{diffuse:?}");
+            // Same height as the 117 model draws.
+            let height = |m: &Model| m.mesh_extent[1];
+            let want = (original.parts[0].transform.scale[1])
+                * (original.parts[0].mesh.as_ref().unwrap().bounds.1[1]
+                    - original.parts[0].mesh.as_ref().unwrap().bounds.0[1])
+                / 2.;
+            assert!(
+                (height(&model) - want).abs() < 0.02 * want,
+                "{source}: {} against {want}",
+                height(&model)
+            );
+            let pieces = super::super::models::load(&to, &plain(), &prp, 1.).unwrap();
+            assert!(!pieces.is_empty());
+        }
+        let text = String::from_utf8(
+            to.read(target(&::anno117::MODULE, &::anno1800::MODULE, pine))
+                .unwrap(),
+        )
+        .unwrap();
+        // The pine's own tints, not the template's green ones.
+        assert!(text.contains("<Count>6</>"), "{text}");
+        assert_eq!(text.matches("<Material>").count(), 1);
+        assert_eq!(tag(&text, "DOUBLE_SIDED"), Some("1"));
+    }
+
+    // Needs both games. 117 models built from several meshes come over as
+    // pieces. A Manx house is its own mesh plus torches and lamps (without
+    // their fire); a wall end is nine stone blocks with no mesh of its own.
+    // Placed at their offsets the pieces fill the same box as the 117 model,
+    // and each loads from the mod over the 1800 install.
+    #[test]
+    fn grouped_117_models_port_as_pieces() {
+        let (Some(a), Some(b)) = (
+            anno_formats::vfs::install_dir("ANNO117_DIR"),
+            anno_formats::vfs::install_dir("ANNO1800_DIR"),
+        ) else {
+            eprintln!("skipping: ANNO1800_DIR or ANNO117_DIR unset");
+            return;
+        };
+        let families = crate::games::profile(anno_core::game::Game::Anno1800).archive_families;
+        let from = Install::open(a, families).unwrap();
+        let families = crate::games::profile(anno_core::game::Game::Anno117).archive_families;
+        let to = Install::open(b, families).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let kit = "data/base/graphics/library/modular_level_kits";
+        let house = format!("{kit}/manx_island/house_celtic_mid_long_wooden_01.cfg");
+        let wall = format!("{kit}/generic/stone_block_wall/stone_block_wall_end_01.cfg");
+        fn grow(b: &mut ([f32; 3], [f32; 3]), w: [f32; 3]) {
+            b.0 = std::array::from_fn(|k| b.0[k].min(w[k]));
+            b.1 = std::array::from_fn(|k| b.1[k].max(w[k]));
+        }
+        // World bounds of every mesh of a 117 model, sub-models included.
+        fn bounds(i: &Install, cfg: &str, at: Transform, b: &mut ([f32; 3], [f32; 3])) {
+            let m = Model::load(i, cfg).unwrap();
+            for p in &m.parts {
+                let Some(mesh) = &p.mesh else { continue };
+                for v in &mesh.positions {
+                    grow(b, at.then(&p.transform).apply(*v));
+                }
+            }
+            for c in &m.props {
+                if !c.cfg.contains("/effects/") && !c.cfg.contains("/decals/") {
+                    bounds(i, &c.cfg, at.then(&c.transform), b);
+                }
+            }
+        }
+        let empty = || ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
+        for (source, at_least) in [(&house, 2), (&wall, 9)] {
+            let ported = port(module_of(&from), module_of(&to), &from, &to, source).unwrap();
+            assert!(
+                ported.pieces.len() >= at_least,
+                "{source}: {:?} left out {:?}",
+                ported.pieces,
+                ported.left_out
+            );
+            for (path, bytes) in &ported.files {
+                let file = dir.path().join(path);
+                std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+                std::fs::write(file, bytes).unwrap();
+            }
+            to.mount_mods(&[dir.path()], &["data"]).unwrap();
+            let mut got = empty();
+            for (prp, offset) in &ported.pieces {
+                assert!(prp.ends_with(".prp"), "{prp}");
+                let model = Model::load(&to, prp).unwrap();
+                assert!(model.problems.is_empty(), "{prp}: {:?}", model.problems);
+                assert_eq!(model.parts[0].transform, Transform::IDENTITY);
+                for v in &model.parts[0].mesh.as_ref().unwrap().positions {
+                    grow(&mut got, offset.apply(*v));
+                }
+            }
+            let mut want = empty();
+            bounds(&from, source, Transform::IDENTITY, &mut want);
+            for k in 0..3 {
+                // Half floats: a few millimetres at house size.
+                assert!(
+                    (got.0[k] - want.0[k]).abs() < 0.05 && (got.1[k] - want.1[k]).abs() < 0.05,
+                    "{source}: {got:?} against {want:?}"
+                );
+            }
+        }
+    }
+
+    // Needs 117. A ground material's xml and textures move under the ported
+    // folder, and the xml names the moved textures.
+    #[test]
+    fn a_ground_material_ports_with_its_textures() {
+        let Some(dir) = anno_formats::vfs::install_dir("ANNO117_DIR") else {
+            eprintln!("skipping: ANNO117_DIR unset");
+            return;
+        };
+        let families = crate::games::profile(anno_core::game::Game::Anno117).archive_families;
+        let from = Install::open(dir, families).unwrap();
+        let file = "data/base/graphics/library/environment/materials/beach_01/beach_01.xml";
+        let (path, files) = port_material(module_of(&from), &anno117::MODULE, &from, file).unwrap();
+        assert_eq!(
+            path,
+            "data/editor/anno117/base/graphics/library/environment/materials/beach_01/beach_01.xml"
+        );
+        let xml = String::from_utf8(files[0].1.clone()).unwrap();
+        let diffuse = tag(&xml, "DiffuseFileName").unwrap();
+        assert!(diffuse.starts_with("data/editor/anno117/"), "{xml}");
+        let shipped = texture_path(diffuse);
+        assert!(files.iter().any(|f| f.0 == shipped), "{shipped}");
+        assert!(tag(&xml, "NormalFileName").is_some());
+    }
+
+    /// An install whose only archive ships `files`. It has no executable, so
+    /// no game to detect: the tests import into it as 117.
     fn shipped(game_files: &[(&str, &[u8])]) -> (tempfile::TempDir, Install) {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("maindata")).unwrap();
@@ -718,8 +1054,8 @@ mod tests {
         for (path, data) in game_files {
             p.add(path, data).unwrap();
         }
-        p.write(&dir.path().join("maindata/data0.rda")).unwrap();
-        let install = Install::open(dir.path()).unwrap();
+        std::fs::write(dir.path().join("maindata/data0.rda"), p.encode().unwrap()).unwrap();
+        let install = Install::open(dir.path(), &[]).unwrap();
         (dir, install)
     }
 
@@ -738,7 +1074,13 @@ mod tests {
         put("tree_lod1.rdm", b"far");
         put("TREE_DIFF_0.dds", b"d0");
         put("tree_diff_1.dds", b"d1");
-        let model = import(&dir.path().join("Tree.cfg"), "isles", &install).unwrap();
+        let model = import(
+            crate::games::module(Game::Anno117),
+            &dir.path().join("Tree.cfg"),
+            "isles",
+            &install,
+        )
+        .unwrap();
         let t = "data/isles/models/tree";
         assert_eq!(model.cfg, format!("{t}/tree.cfg"));
         let mut paths: Vec<&str> = model.files.iter().map(|f| f.0.as_str()).collect();
@@ -762,10 +1104,41 @@ mod tests {
         // The project then lists it with all its files, and removing it
         // takes them all.
         let files: BTreeMap<String, Vec<u8>> = model.files.into_iter().collect();
-        let models = project_models(&files);
+        let models = project_models(&anno117::MODULE, &files, |p| files.get(p).map(Vec::len));
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].kind, ModelKind::Custom);
         assert_eq!(removable(&models, &models[0]).len(), 5);
+    }
+
+    // A project's models are its files whose kind names others: 1800's
+    // props too, which 117 doesn't read.
+    #[test]
+    fn project_models_are_the_files_whose_kind_has_deps() {
+        let files: BTreeMap<String, Vec<u8>> = [
+            ("data/x/a.cfg", "<M><FileName>data/x/a.rdm</FileName></M>"),
+            ("data/x/a.rdm", "mesh"),
+            (
+                "data/x/b.prp",
+                "<P><MeshFileName>data/x/b.rdm</MeshFileName></P>",
+            ),
+            ("data/x/notes.txt", "<n>data/x/a.cfg</n>"),
+        ]
+        .into_iter()
+        .map(|(p, b)| (p.to_owned(), b.as_bytes().to_vec()))
+        .collect();
+        let size = |p: &str| files.get(p).map(Vec::len);
+        let cfgs = |m: &dyn Module| -> Vec<(String, Vec<String>)> {
+            (project_models(m, &files, size).into_iter())
+                .map(|m| (m.cfg, m.files))
+                .collect()
+        };
+        let a = (
+            "data/x/a.cfg".to_owned(),
+            vec!["data/x/a.cfg".to_owned(), "data/x/a.rdm".to_owned()],
+        );
+        assert_eq!(cfgs(&anno117::MODULE), std::slice::from_ref(&a));
+        let b = ("data/x/b.prp".to_owned(), vec!["data/x/b.prp".to_owned()]);
+        assert_eq!(cfgs(&anno1800::MODULE), [a, b]);
     }
 
     #[test]
@@ -781,6 +1154,7 @@ mod tests {
         put("Data/Art/Tree/tree.rdm", b"mesh");
         put("Data/Art/Tree/Maps/tree_diff_0.dds", b"d0");
         let model = import(
+            crate::games::module(Game::Anno117),
             &root.path().join("Data/Art/Tree/tree.cfg"),
             "isles",
             &install,
@@ -801,26 +1175,44 @@ mod tests {
         let (_g, install) = shipped(&[("data/isles/models/tree/tree.cfg", b"shipped")]);
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("tree.cfg"), CFG).unwrap();
-        let e = import(&dir.path().join("tree.cfg"), "isles", &install).unwrap_err();
+        let e = import(
+            crate::games::module(Game::Anno117),
+            &dir.path().join("tree.cfg"),
+            "isles",
+            &install,
+        )
+        .unwrap_err();
         assert!(
             format!("{e:#}").contains("neither beside it nor in the game"),
             "{e:#}"
         );
-        assert!(import(&dir.path().join("tree.txt"), "isles", &install).is_err());
+        assert!(
+            import(
+                crate::games::module(Game::Anno117),
+                &dir.path().join("tree.txt"),
+                "isles",
+                &install
+            )
+            .is_err()
+        );
     }
 
     // Needs 117: a shipped rock mesh and its textures, copied out and
     // brought back in as a bare mesh, load through the model reader.
     #[test]
     fn a_bare_mesh_becomes_a_loadable_prop() {
-        let Some(dir) = std::env::var_os("ANNO117_DIR") else {
+        let Some(dir) = anno_formats::vfs::install_dir("ANNO117_DIR") else {
             eprintln!("skipping: ANNO117_DIR unset");
             return;
         };
-        let install = Install::open_game(Game::Anno117, dir).unwrap();
-        let shipped = anno_formats::model::Model::load(&install, STATIC_TEMPLATE).unwrap();
+        let families = crate::games::profile(anno_core::game::Game::Anno117).archive_families;
+        let install = Install::open(dir, families).unwrap();
+        // A shipped rock: the static prop the 117 writer copies too.
+        let rock =
+            "data/base/graphics/roman/environment/props/rocks/roman_rock_07/roman_rock_07_e.cfg";
+        let shipped = anno_formats::model::Model::load(&install, rock).unwrap();
         let part = shipped.parts.iter().find(|p| p.mesh.is_some()).unwrap();
-        // The cfg's layout name is what `wrap` writes from the rdm.
+        // The cfg's layout name is what the 117 writer writes from the rdm.
         assert_eq!(
             part.mesh.as_ref().unwrap().format.to_string(),
             part.materials[0].vertex_format
@@ -833,21 +1225,347 @@ mod tests {
         };
         let mesh = copy(&part.rdm);
         for t in [&part.materials[0].diffuse, &part.materials[0].normal] {
-            for f in family(t.as_deref().unwrap()) {
+            for f in files::siblings(t.as_deref().unwrap()) {
                 if install.exists(&f) {
                     copy(&f);
                 }
             }
         }
-        let model = import(&mesh, "isles", &install).unwrap();
+        let model = import(module_of(&install), &mesh, "isles", &install).unwrap();
         let folder = tempfile::tempdir().unwrap();
         for (path, bytes) in &model.files {
             let p = folder.path().join(path);
             std::fs::create_dir_all(p.parent().unwrap()).unwrap();
             std::fs::write(p, bytes).unwrap();
         }
-        install.mount_mod(folder.path()).unwrap();
+        install.mount_mods(&[folder.path()], &["data"]).unwrap();
         let loaded = anno_formats::model::Model::load(&install, &model.cfg).unwrap();
         assert!(loaded.parts.iter().any(|p| p.mesh.is_some()), "mesh loads");
     }
+
+    /// FNV-1a, 64 bit: stable across toolchains, unlike std's hasher.
+    fn fnv(h: &mut u64, bytes: &[u8]) {
+        for &b in bytes {
+            *h = (*h ^ b as u64).wrapping_mul(0x100000001b3);
+        }
+    }
+
+    /// One digest over what porting `source` produced: every staged file
+    /// (path and bytes, in path order), the pieces and effects in order,
+    /// what was left out (sorted: its order is display only), or the error.
+    fn digest(result: Result<Ported>) -> u64 {
+        let mut h = 0xcbf29ce484222325;
+        match result {
+            Err(e) => fnv(&mut h, format!("error {e:#}").as_bytes()),
+            Ok(mut p) => {
+                p.files.sort_by(|a, b| a.0.cmp(&b.0));
+                for (path, bytes) in &p.files {
+                    fnv(&mut h, path.as_bytes());
+                    fnv(&mut h, bytes);
+                }
+                for (path, at) in p.pieces.iter().chain(&p.effects) {
+                    fnv(&mut h, format!("{path} {at:?}").as_bytes());
+                }
+                p.left_out.sort();
+                for l in &p.left_out {
+                    fnv(&mut h, l.as_bytes());
+                }
+            }
+        }
+        h
+    }
+
+    // Needs both games. Golden output of porting a fixed sample of shipped
+    // props each way, as digests of every file, piece, effect and note it
+    // produces. Taken from the pairwise converters before they went through
+    // the neutral model, which kept every byte but one thing: 117 cfgs
+    // written for prps with no `cDiffuseColor` now say `1.000000`, not
+    // `1`, like every other colour (5 of the 67 sampled; with that one
+    // edit undone they matched the old digests). Since 117's reader reads
+    // lights, 117 -> 1800 also notes each light left out; with that note
+    // dropped the old 117 -> 1800 digest came back. 1800's ground-quad
+    // decals and effect cfgs port too now, which shifts the 1800 -> 117
+    // sample; leaving those paths out of it gave the old digest back. A
+    // game update that
+    // changes a sampled file changes its digest too. `PORT_DIGESTS=<file>`
+    // writes each source's digest there, to find which one moved.
+    #[test]
+    fn ported_output_matches_its_golden_digests() {
+        let (Some(a), Some(b)) = (
+            anno_formats::vfs::install_dir("ANNO1800_DIR"),
+            anno_formats::vfs::install_dir("ANNO117_DIR"),
+        ) else {
+            eprintln!("skipping: ANNO1800_DIR or ANNO117_DIR unset");
+            return;
+        };
+        let families = crate::games::profile(anno_core::game::Game::Anno1800).archive_families;
+        let anno1800 = Install::open(a, families).unwrap();
+        let families = crate::games::profile(anno_core::game::Game::Anno117).archive_families;
+        let anno117 = Install::open(b, families).unwrap();
+        let mut lines = String::new();
+        let mut run = |from: &Install, to: &Install, games: [&dyn Module; 2], every: usize| {
+            let mut sources: Vec<String> = (0..from.file_count() as u32)
+                .map(|f| from.file_path(anno_formats::vfs::FileId(f)))
+                .filter(|p| p.contains("/props/") && portable(games[0], games[1], p))
+                .collect();
+            sources.sort_unstable();
+            let mut total = 0xcbf29ce484222325;
+            let mut n = 0;
+            for source in sources.iter().step_by(every) {
+                let d = digest(port(games[0], games[1], from, to, source));
+                lines.push_str(&format!("{source} {d:016x}\n"));
+                fnv(&mut total, &d.to_le_bytes());
+                n += 1;
+            }
+            (n, total)
+        };
+        let to_117 = run(
+            &anno1800,
+            &anno117,
+            [&::anno1800::MODULE, &::anno117::MODULE],
+            29,
+        );
+        let to_1800 = run(
+            &anno117,
+            &anno1800,
+            [&::anno117::MODULE, &::anno1800::MODULE],
+            61,
+        );
+        if let Some(file) = std::env::var_os("PORT_DIGESTS") {
+            std::fs::write(file, &lines).unwrap();
+        }
+        eprintln!("1800 -> 117: {to_117:x?}, 117 -> 1800: {to_1800:x?}");
+        assert_eq!(to_117, GOLDEN_TO_117);
+        assert_eq!(to_1800, GOLDEN_TO_1800);
+    }
+
+    // Needs all three games. Static 2070 models come into 117 and 1800 as
+    // props: every one of a sample of shipped 2070 cfgs whose parts' meshes
+    // are all static and readable ports, and each ported model loads from
+    // the mod over the target install with its mesh and diffuse texture.
+    // Meshes stay in 2070's rdm container, which the editor reads; whether
+    // the games draw them is not checked. Rigged models (most 2070
+    // buildings carry bone weights), effects and big-endian meshes do not
+    // port.
+    #[test]
+    fn anno_2070_models_port_into_117_and_1800() {
+        let dir = |game| {
+            let profile = crate::games::profile(game);
+            anno_formats::vfs::install_dir(profile.env_var)
+                .map(|d| Install::open(d, profile.archive_families))
+        };
+        let (Some(Ok(anno2070)), Some(Ok(anno117)), Some(Ok(anno1800))) =
+            (dir(Game::Anno2070), dir(Game::Anno117), dir(Game::Anno1800))
+        else {
+            eprintln!("skipping: ANNO2070_DIR, ANNO117_DIR or ANNO1800_DIR unset");
+            return;
+        };
+        let static_model = |cfg: &str| {
+            let parts =
+                Model::parse(&anno2070.read(cfg).unwrap()).map_or_else(|_| Vec::new(), |m| m.parts);
+            !parts.is_empty()
+                && parts.iter().all(|p| {
+                    (anno2070.read(&p.rdm).ok())
+                        .filter(|b| b.get(3) == Some(&1))
+                        .and_then(|b| Rdm::parse(&b).ok())
+                        .is_some_and(|m| !m.skinned)
+                })
+        };
+        let mut sources: Vec<String> = (0..anno2070.file_count() as u32)
+            .map(|f| anno2070.file_path(anno_formats::vfs::FileId(f)))
+            .filter(|p| p.ends_with(".cfg") && p.contains("/graphics/") && !p.contains("/effects/"))
+            .collect();
+        sources.sort_unstable();
+        let sample: Vec<&str> = (sources.iter().step_by(sources.len() / 120))
+            .map(String::as_str)
+            .filter(|cfg| static_model(cfg))
+            .take(24)
+            .collect();
+        assert!(sample.len() >= 12, "{} static models", sample.len());
+        for (to, game) in [
+            (&anno117, &::anno117::MODULE as &dyn Module),
+            (&anno1800, &::anno1800::MODULE),
+        ] {
+            let mods = tempfile::tempdir().unwrap();
+            let (mut ported, mut failed) = (Vec::new(), Vec::new());
+            for source in &sample {
+                match port(&::anno2070::MODULE, game, &anno2070, to, source) {
+                    Ok(p) => {
+                        for (path, bytes) in &p.files {
+                            let file = mods.path().join(path);
+                            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+                            std::fs::write(file, bytes).unwrap();
+                        }
+                        ported.push(p);
+                    }
+                    Err(e) => failed.push(format!("{source}: {e:#}")),
+                }
+            }
+            assert!(failed.is_empty(), "{:?}: {failed:#?}", game.game());
+            to.mount_mods(&[mods.path()], &["data"]).unwrap();
+            for p in &ported {
+                for (model, _) in &p.pieces {
+                    let loaded = Model::load(to, model).unwrap();
+                    let part = loaded.parts.iter().find(|p| p.mesh.is_some());
+                    let part = part.unwrap_or_else(|| panic!("{model}: no mesh loads"));
+                    if let Some(diffuse) = part.materials[0].diffuse.as_deref() {
+                        assert!(to.exists(diffuse), "{model}: {diffuse}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Every file of `files` into folder `dir`, as a mod lays them out.
+    fn stage(dir: &Path, files: &[(String, Vec<u8>)]) {
+        for (path, bytes) in files {
+            let file = dir.join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, bytes).unwrap();
+        }
+    }
+
+    // Needs Anno 117. The asset preview draws a shipped model's ground
+    // decals, and the same model read and written again into a mod as an
+    // import writes it, alike: each decal's grid, UVs, tint, textures,
+    // opacity and fade, and where it lies. The preview draws no particles
+    // or lights; the 117 model tests check those entries.
+    #[test]
+    fn written_117_decals_preview_as_shipped() {
+        let Some(dir) = anno_formats::vfs::install_dir("ANNO117_DIR") else {
+            eprintln!("skipping: ANNO117_DIR unset");
+            return;
+        };
+        let families = crate::games::profile(anno_core::game::Game::Anno117).archive_families;
+        let to = Install::open(dir, families).unwrap();
+        let module = crate::games::module(Game::Anno117);
+        let shipped = Shipped {
+            from: module,
+            root: "data",
+            install: &to,
+        };
+        let mods = tempfile::tempdir().unwrap();
+        let cases = [
+            "data/base/graphics/library/environment/props/decals/cracks/crack_decal_01.cfg",
+            "data/base/graphics/library/environment/props/decals/beach/beach_decal_02.cfg",
+            "data/base/graphics/celtic/buildings/ornaments/hall_of_fame/fireplaces/fireplace_01.cfg",
+            "data/dlc03/graphics/egypt/buildings/ornaments/hall_of_fame/statues/ancient_portal_01.cfg",
+        ];
+        let written: Vec<Ported> = (cases.iter())
+            .map(|cfg| {
+                let model = module.read_model(&to, cfg).unwrap().unwrap();
+                let out = module.write_model(&model, &shipped, &to).unwrap().unwrap();
+                stage(mods.path(), &out.files);
+                out
+            })
+            .collect();
+        to.mount_mods(&[mods.path()], &["data"]).unwrap();
+        // A decal as the preview draws it: no mesh file, a draped grid.
+        let decals = |cfg: &str| -> Vec<String> {
+            let pieces = super::super::models::load(&to, &plain(), cfg, 1.).unwrap();
+            (pieces.iter().filter(|p| p.rdm.is_empty()))
+                .map(|p| {
+                    let d = p.mesh.data();
+                    format!(
+                        "{:?} {:?} {:?} {:?} {:?} {:?} maps {} {} {} {}",
+                        p.local,
+                        d.positions,
+                        d.uvs,
+                        d.colors,
+                        d.indices,
+                        d.material,
+                        d.texture.is_some(),
+                        d.normal_map.is_some(),
+                        d.surface_map.is_some(),
+                        d.alpha_map.is_some(),
+                    )
+                })
+                .collect()
+        };
+        for (cfg, out) in cases.iter().zip(&written) {
+            let original = decals(cfg);
+            assert!(!original.is_empty(), "{cfg}: no decal drawn");
+            let again: Vec<String> = (out.pieces.iter())
+                .filter(|(path, _)| path.contains("_decal"))
+                .flat_map(|(path, at)| {
+                    assert_eq!(*at, Transform::IDENTITY, "{path}");
+                    decals(path)
+                })
+                .collect();
+            assert_eq!(again, original, "{cfg}");
+        }
+    }
+
+    // Needs both games. 1800's ground-quad decal prps become 117 box
+    // decals that load from the mod with their texture; its mesh decals
+    // (ice floes) are turned away. An effect cfg an 1800 island places
+    // becomes 117's own effect, placed as it ships.
+    #[test]
+    fn decals_and_effects_of_1800_come_into_117() {
+        let (Some(a), Some(b)) = (
+            anno_formats::vfs::install_dir("ANNO1800_DIR"),
+            anno_formats::vfs::install_dir("ANNO117_DIR"),
+        ) else {
+            eprintln!("skipping: ANNO1800_DIR or ANNO117_DIR unset");
+            return;
+        };
+        let families = crate::games::profile(anno_core::game::Game::Anno1800).archive_families;
+        let from = Install::open(a, families).unwrap();
+        let families = crate::games::profile(anno_core::game::Game::Anno117).archive_families;
+        let to = Install::open(b, families).unwrap();
+        let games: [&dyn Module; 2] = [&::anno1800::MODULE, &::anno117::MODULE];
+        let mods = tempfile::tempdir().unwrap();
+        let decal = port(
+            games[0],
+            games[1],
+            &from,
+            &to,
+            "data/cdlc05/graphics/props/decals/dirt_01.prp",
+        )
+        .unwrap();
+        assert_eq!(decal.pieces.len(), 1, "{:?}", decal.left_out);
+        assert!(decal.effects.is_empty() && decal.left_out.is_empty());
+        stage(mods.path(), &decal.files);
+        to.mount_mods(&[mods.path()], &["data"]).unwrap();
+        let (cfg, at) = &decal.pieces[0];
+        assert_eq!(*at, Transform::IDENTITY);
+        let loaded = Model::load(&to, cfg).unwrap();
+        assert!(loaded.problems.is_empty(), "{:?}", loaded.problems);
+        assert!(loaded.parts.is_empty() && loaded.decals.len() == 1);
+        let d = &loaded.decals[0];
+        assert_eq!(
+            (d.kind.as_str(), d.extents[0], d.extents[2]),
+            ("Terrain", 0.5, 0.5)
+        );
+        assert_eq!((d.opacity, d.uv_rect), (1., [0., 0., 1., 1.]));
+        let diffuse = d.material.as_ref().and_then(|m| m.diffuse.clone());
+        assert!(
+            diffuse
+                .as_deref()
+                .is_some_and(|t| is_ported(t) && to.exists(t)),
+            "{diffuse:?}"
+        );
+        let pieces = super::super::models::load(&to, &plain(), cfg, 1.).unwrap();
+        assert_eq!(pieces.len(), 1, "the preview draws the decal");
+
+        let floe = "data/dlc03/graphics/landscape/terrain/decals/ice_floes/icefloe_arctic_coast_fine_01.prp";
+        let e = port(games[0], games[1], &from, &to, floe).unwrap_err();
+        assert!(format!("{e:#}").contains("mesh decal"), "{e:#}");
+
+        let torch = "data/graphics/effects/environment/fps_torch.cfg";
+        let fire = port(games[0], games[1], &from, &to, torch).unwrap();
+        assert!(fire.pieces.is_empty() && fire.files.is_empty());
+        assert_eq!(
+            fire.effects,
+            [(
+                "data/base/graphics/library/effects/fire/fire_torch_01.cfg".to_owned(),
+                Transform::IDENTITY
+            )]
+        );
+    }
+
+    // Anno 117 build 26607411. A game update changes these; PORT_DIGESTS=<file>
+    // writes the per-prop digests to diff against the run before.
+    const GOLDEN_TO_117: (usize, u64) = (0x43, 0xff9faa8c13f054a5);
+    const GOLDEN_TO_1800: (usize, u64) = (0x6c, 0xe14eacb9fbb9a349);
 }

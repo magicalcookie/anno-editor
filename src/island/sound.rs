@@ -4,30 +4,14 @@
 // and beach ambience come from the EnvironmentGRid, not from spots, so none
 // are placed for them.
 use super::IslandEditor;
-use anno_formats::game::Game;
+use anno_core::game::IslandRules;
 use gpui_editor_kit::heightfield::Heightfield;
 
-pub const WATERFALL_SMALL: u32 = 69133;
-pub const WATERFALL_MEDIUM: u32 = 69134;
-pub const WATERFALL_BIG: u32 = 69135;
-pub const CLIFF: u32 = 102416;
-/// Every spot asset the auto placement writes, and so replaces.
-pub const GUIDS: [u32; 4] = [WATERFALL_SMALL, WATERFALL_MEDIUM, WATERFALL_BIG, CLIFF];
-
-const WATERFALLS_1800: [[u32; 3]; 3] = [
-    [102191, 102192, 102193],
-    [102194, 102195, 102196],
-    [102197, 102198, 102199],
-];
-const GUIDS_1800: [u32; 10] = [
-    102191, 102192, 102193, 102194, 102195, 102196, 102197, 102198, 102199, CLIFF,
-];
-
-pub fn guids(game: Game) -> &'static [u32] {
-    match game {
-        Game::Anno117 => &GUIDS,
-        Game::Anno1800 => &GUIDS_1800,
-    }
+/// Every spot asset the auto placement writes, and so replaces: the
+/// waterfall spots by size, then the cliff spot.
+pub fn guids(p: &IslandRules) -> Vec<u32> {
+    let falls = p.waterfall_spots.iter().flat_map(|s| s.iter().copied());
+    falls.chain([p.cliff_spot]).collect()
 }
 
 /// Waterfall models within this many metres are one fall (a fall is a top,
@@ -85,7 +69,7 @@ fn rise(field: &Heightfield, at: [f32; 2], radius: f32) -> f32 {
 /// far the ground rises around it. Falls with a spot of any size within
 /// `FALL_CLUSTER` already (`keep`, hand-placed ones) get none.
 pub fn waterfall_spots(
-    game: Game,
+    rules: &IslandRules,
     field: &Heightfield,
     models: &[[f32; 3]],
     keep: &[[f32; 3]],
@@ -119,13 +103,13 @@ pub fn waterfall_spots(
             0
         };
         let bottom = [at[0], field.height(at).max(0.), at[1]];
-        match game {
-            Game::Anno117 => out.push(Spot {
-                guid: GUIDS[size],
+        match *rules.waterfall_spots[size] {
+            [guid] => out.push(Spot {
+                guid,
                 position: bottom,
             }),
-            Game::Anno1800 => {
-                // 1800 has separate emitters for the top, curtain and foot.
+            [top_guid, curtain, foot] => {
+                // Separate emitters for the top, curtain and foot (1800).
                 // Follow the terrain rise around the lowest waterfall part.
                 let mut top = bottom;
                 let extent = field.grid.size();
@@ -150,12 +134,13 @@ pub fn waterfall_spots(
                 }
                 let middle = std::array::from_fn(|i| (top[i] + bottom[i]) / 2.);
                 out.extend(
-                    WATERFALLS_1800[size]
+                    [top_guid, curtain, foot]
                         .into_iter()
                         .zip([top, middle, bottom])
                         .map(|(guid, position)| Spot { guid, position }),
                 );
             }
+            _ => {}
         }
     }
     out
@@ -165,7 +150,7 @@ pub fn waterfall_spots(
 /// ground climbs `CLIFF_RISE` within `CLIFF_RISE_RADIUS`, steepest first,
 /// `CLIFF_GAP` apart and from the `keep` ones. They stand on the waterline
 /// (shipped y is 0.0 for 90% of them).
-pub fn cliff_spots(field: &Heightfield, keep: &[[f32; 3]]) -> Vec<Spot> {
+pub fn cliff_spots(guid: u32, field: &Heightfield, keep: &[[f32; 3]]) -> Vec<Spot> {
     let [w, d] = field.grid.size();
     let sea = |x: f32, z: f32| x < 0. || z < 0. || x > w || z > d || field.height([x, z]) <= 0.;
     let mut candidates = Vec::new();
@@ -200,7 +185,7 @@ pub fn cliff_spots(field: &Heightfield, keep: &[[f32; 3]]) -> Vec<Spot> {
         {
             taken.push(at);
             out.push(Spot {
-                guid: CLIFF,
+                guid,
                 position: [at[0], 0., at[1]],
             });
         }
@@ -223,6 +208,7 @@ impl IslandEditor {
                 .map_or(String::new(), |a| a.name.clone())
         };
         let mut models: Vec<[f32; 3]> = self
+            .island
             .doc
             .objects
             .iter()
@@ -230,11 +216,13 @@ impl IslandEditor {
             .map(|o| o.position)
             .collect();
         models.extend(
-            self.doc
+            self.island
+                .doc
                 .props
                 .iter()
                 .filter(|p| {
-                    self.doc
+                    self.island
+                        .doc
                         .meshes
                         .get(p.source.file as usize)
                         .is_some_and(|m| is_waterfall("", Some(m)))
@@ -242,20 +230,24 @@ impl IslandEditor {
                 .map(|p| p.source.position),
         );
         let kept = |guids: &[u32]| -> Vec<[f32; 3]> {
-            self.doc
+            self.island
+                .doc
                 .objects
                 .iter()
                 .filter(|o| guids.contains(&o.guid) && !super::is_generated(o.id))
                 .map(|o| o.position)
                 .collect()
         };
+        let rules = self.rules();
+        let spots = guids(rules);
         let falls = waterfall_spots(
-            self.game,
-            &self.doc.field,
+            rules,
+            &self.island.doc.field,
             &models,
-            &kept(&guids(self.game)[..guids(self.game).len() - 1]),
+            &kept(&spots[..spots.len() - 1]),
         );
-        let cliffs = cliff_spots(&self.doc.field, &kept(&[CLIFF]));
+        let cliff = rules.cliff_spot;
+        let cliffs = cliff_spots(cliff, &self.island.doc.field, &kept(&[cliff]));
         let (n_falls, n_cliffs) = (falls.len(), cliffs.len());
         let mut missing = Vec::new();
         let placed: Vec<_> = falls
@@ -269,7 +261,7 @@ impl IslandEditor {
                 }
             })
             .collect();
-        self.replace_generated(guids(self.game), placed);
+        self.replace_generated(&spots, placed);
         self.layers.spots = true;
         missing.dedup();
         let note = if missing.is_empty() {
@@ -294,6 +286,7 @@ impl IslandEditor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anno_core::game::Game;
     use gpui_editor_kit::heightfield::Grid;
 
     /// A 128 m square: sea west of x = 20, a 10 m cliff rising from the
@@ -324,7 +317,7 @@ mod tests {
     #[test]
     fn cliff_spots_follow_steep_coast_apart() {
         let field = coast();
-        let spots = cliff_spots(&field, &[]);
+        let spots = cliff_spots(crate::games::rules(Game::Anno117).cliff_spot, &field, &[]);
         assert!(spots.len() >= 3, "{spots:?}");
         for s in &spots {
             assert_eq!(s.position[1], 0.);
@@ -341,7 +334,7 @@ mod tests {
         // A hand-placed spot keeps auto ones away from it.
         let keep = [[20.5, 0., 30.]];
         assert!(
-            cliff_spots(&field, &keep)
+            cliff_spots(crate::games::rules(Game::Anno117).cliff_spot, &field, &keep)
                 .iter()
                 .all(|s| { (s.position[0] - 20.5).hypot(s.position[2] - 30.) >= CLIFF_GAP })
         );
@@ -351,15 +344,23 @@ mod tests {
     fn waterfall_1800_has_top_stream_and_bottom_emitters() {
         let field = coast();
         let models = [[24., 8., 30.], [21., 0.5, 30.]];
-        let spots = waterfall_spots(Game::Anno1800, &field, &models, &[]);
+        let spots = waterfall_spots(crate::games::rules(Game::Anno1800), &field, &models, &[]);
         assert_eq!(
             spots.iter().map(|s| s.guid).collect::<Vec<_>>(),
-            WATERFALLS_1800[1]
+            crate::games::rules(Game::Anno1800).waterfall_spots[1]
         );
         assert!(spots[0].position[1] > spots[1].position[1]);
         assert!(spots[1].position[1] > spots[2].position[1]);
         assert_eq!(spots[2].position, [21., 2., 30.]);
-        assert!(waterfall_spots(Game::Anno1800, &field, &models, &[[21., 2., 30.]]).is_empty());
+        assert!(
+            waterfall_spots(
+                crate::games::rules(Game::Anno1800),
+                &field,
+                &models,
+                &[[21., 2., 30.]]
+            )
+            .is_empty()
+        );
     }
 
     #[test]
@@ -367,27 +368,34 @@ mod tests {
         let field = coast();
         // Top on the cliff, foot on the shore: one fall, spot at the foot.
         let spots = waterfall_spots(
-            Game::Anno117,
+            crate::games::rules(Game::Anno117),
             &field,
             &[[24., 8., 30.], [21., 0.5, 30.]],
             &[],
         );
         assert_eq!(spots.len(), 1);
-        assert_eq!(spots[0].guid, WATERFALL_MEDIUM, "10 m rise is medium");
+        assert_eq!(
+            spots[0].guid,
+            crate::games::rules(Game::Anno117).waterfall_spots[1][0],
+            "10 m rise is medium"
+        );
         assert!((spots[0].position[0] - 21.).abs() < 1e-3);
         // On flat land the same fall is small; two falls apart get two spots.
         let flat = waterfall_spots(
-            Game::Anno117,
+            crate::games::rules(Game::Anno117),
             &field,
             &[[60., 0.5, 110.], [100., 0.5, 110.]],
             &[],
         );
         assert_eq!(flat.len(), 2);
-        assert!(flat.iter().all(|s| s.guid == WATERFALL_SMALL));
+        assert!(
+            flat.iter()
+                .all(|s| s.guid == crate::games::rules(Game::Anno117).waterfall_spots[0][0])
+        );
         // An existing spot at a fall keeps it from getting another.
         assert!(
             waterfall_spots(
-                Game::Anno117,
+                crate::games::rules(Game::Anno117),
                 &field,
                 &[[60., 0.5, 110.]],
                 &[[61., 0.5, 110.]]

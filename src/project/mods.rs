@@ -3,10 +3,8 @@
 // comes from, and flagging models an island takes from a mod the project
 // does not depend on.
 use crate::editor::Editor;
-use anno_formats::{
-    modinfo::{self, Installed},
-    rda,
-};
+use anno_core::modinfo::{self, Installed};
+use anno_formats::rda;
 use gpui_editor_kit::{
     gpui::{prelude::*, *},
     theme,
@@ -40,9 +38,9 @@ impl Editor {
         let Some(install) = &self.install else {
             return;
         };
-        let roots = modinfo::roots(self.game, install.dir());
+        let roots = modinfo::roots(self.module, install.dir());
         let own = self.project.mod_id().to_owned();
-        self.mods = modinfo::installed(self.game, &roots)
+        self.mods = modinfo::installed(self.module, &roots)
             .into_iter()
             .filter(|m| m.info.id != own)
             .collect();
@@ -88,7 +86,7 @@ impl Editor {
         let folder = self.project.folder();
         let mut dirs: Vec<&Path> = deps.iter().map(|(_, d)| d.as_path()).collect();
         dirs.push(&folder);
-        if let Err(e) = install.mount_mods(&dirs) {
+        if let Err(e) = install.mount_mods(&dirs, self.project.module.project_roots()) {
             eprintln!("Mod folders not mounted: {e:#}");
         }
         self.mounted = deps.into_iter().map(|(id, _)| id).collect();
@@ -183,7 +181,7 @@ impl Editor {
     /// The folder Install copies into; see `modinfo::install_root`.
     pub(crate) fn mods_root(&self) -> Option<PathBuf> {
         let install = self.install.as_ref()?;
-        Some(modinfo::install_root(self.game, install.dir()))
+        modinfo::install_root(self.module, install.dir())
     }
 
     /// Opens the mods folder in the file manager, making it first: a fresh

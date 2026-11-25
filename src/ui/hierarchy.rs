@@ -542,7 +542,7 @@ impl UiEditor {
             .then_some(self.canvas.view.size)
             .unwrap_or_default();
         let local = super::scene::apply(inv, f.pivot_world());
-        let anchor = anno_formats::phx::layout::anchor_offset(f.anchor, size);
+        let anchor = super::layout::anchor_offset(f.anchor, size);
         let pos = [local[0] - anchor[0], local[1] - anchor[1], f.position[2]];
         let ws = next.widgets();
         let Some(nw) = find_widget(&next, &ws, id) else {
@@ -617,7 +617,7 @@ impl UiEditor {
             Some(c) => c,
             None => self
                 .install
-                .list(super::GENERATED.trim_end_matches('/'))
+                .list(self.screens().generated.trim_end_matches('/'))
                 .iter()
                 .take(PROTOTYPE_SCAN)
                 .find_map(|p| {
@@ -919,7 +919,7 @@ impl Editor {
                             format!(
                                 "{} = {}",
                                 phx::property_type_name(prop.kind).unwrap_or("?"),
-                                super::property_default_text(&ui.asset, prop)
+                                super::property_default_text(ui.sources(), &ui.asset, prop)
                             ),
                             ui.selected == Some(prop.default),
                         )
@@ -1144,11 +1144,14 @@ impl Editor {
                     .tooltip(Tooltip::text(
                         "Sample data",
                         "",
-                        "Give template properties nothing sets a plausible game value: state flags such as IsLocked off, texts filled",
+                        ui.images.shared.sample_note(),
                     ))
                     .on_click(cx.listener(|this, _, _, cx| {
                         if let Some(ui) = &mut this.ui {
                             ui.sample = !ui.sample;
+                            if ui.sample && ui.images.shared.screens.sample_data.is_none() {
+                                ui.message = Some((super::NO_SAMPLE_CONTENT.into(), false));
+                            }
                             ui.relayout();
                             ui.relayout_screens();
                         }

@@ -95,26 +95,6 @@ fn height_key(top: f32) -> Div {
         )
 }
 
-/// What the game calls each region's province.
-pub(crate) fn province(region: &str) -> String {
-    match region {
-        "roman" => "Latium (Roman)".to_owned(),
-        "celtic" => "Albion (Celtic)".to_owned(),
-        "moderate" => "Old World".to_owned(),
-        "colony01" => "New World".to_owned(),
-        "arctic" => "Arctic".to_owned(),
-        "africa" => "Enbesa".to_owned(),
-        other => other.to_owned(),
-    }
-}
-
-/// The province alone ("Albion"), for compact places: rows, chips and
-/// meta lines. Pickers and group headers keep the full `province`.
-pub(crate) fn province_short(region: &str) -> String {
-    let name = province(&region.to_ascii_lowercase());
-    name.split(" (").next().unwrap_or(&name).to_owned()
-}
-
 impl Wizard {
     /// The field keys go to, for platform text input: the GUID while it
     /// is open, else the name.
@@ -132,11 +112,12 @@ impl Wizard {
             .filter(|(_, s)| s.region == self.region)
     }
 
-    /// The game's home region first, then the rest in skeleton order.
-    fn regions(&self) -> Vec<String> {
+    /// The game's home region (`rules.default_region`) first, then the rest
+    /// in skeleton order.
+    fn regions(&self, rules: &anno_core::game::IslandRules) -> Vec<String> {
         let mut r: Vec<String> = self.skeletons.iter().map(|s| s.region.clone()).collect();
         r.dedup();
-        r.sort_by_key(|r| !matches!(r.as_str(), "roman" | "moderate"));
+        r.sort_by_key(|r| !r.eq_ignore_ascii_case(rules.default_region));
         r
     }
 
@@ -150,6 +131,12 @@ impl Wizard {
             start: self.start,
             listing: self.listing.clone(),
         })
+    }
+
+    /// Types `name` into the Name field, as the keys would.
+    #[cfg(test)]
+    pub(crate) fn set_name(&mut self, name: &str) {
+        self.name = TextEdit::new((), name, Filter::Text);
     }
 
     pub fn listing(&self) -> &Listing {
@@ -186,22 +173,25 @@ impl Wizard {
 }
 
 impl Editor {
-    /// File → New island…
-    pub fn open_wizard(&mut self) {
+    /// File → New island…, asking first when the open island has edits
+    /// (`Editor::leave`).
+    pub fn open_wizard(&mut self, cx: &mut Context<Self>) {
+        self.leave(crate::editor::Leave::NewIsland, cx);
+    }
+
+    /// Opens the New island wizard. The open island stays until the new
+    /// one is made, so cancelling keeps it.
+    pub(crate) fn wizard_now(&mut self) {
         let Some(install) = &self.install else {
             return self.message("No install is open", true);
         };
-        // Ask instead of refusing: Save, Discard or Cancel (`Editor::leave`).
-        if self.island.as_ref().is_some_and(|i| i.dirty()) {
-            self.leaving = Some(crate::editor::Leave::NewIsland);
-            return;
-        }
-        let skeletons = skeletons(install, self.assets.as_deref());
+        let skeletons = skeletons(self.module, install, self.assets.as_deref());
         let Some(first) = skeletons.first() else {
             return self.message("The install ships no islands to build on", true);
         };
-        // The open island's region first: a modder working on Albion most
-        // likely wants another Albion island. Then the game's home region.
+        // The open island's region first: a modder working on one province
+        // most likely wants another island of it. Then the game's home
+        // region.
         // Skeleton regions are province folder names (`celtic`); the
         // island's region is the game's name for it (`Celtic`). Prefer the
         // folder in the open island's path, then the name without case.
@@ -220,10 +210,11 @@ impl Editor {
         });
         let region = if let Some(r) = open_region {
             r
-        } else if skeletons.iter().any(|s| s.region == "roman") {
-            "roman".to_owned()
-        } else if skeletons.iter().any(|s| s.region == "moderate") {
-            "moderate".to_owned()
+        } else if let Some(home) = (skeletons.iter()).find(|s| {
+            s.region
+                .eq_ignore_ascii_case(self.island_rules().default_region)
+        }) {
+            home.region.clone()
         } else {
             first.region.clone()
         };
@@ -233,6 +224,10 @@ impl Editor {
             .collect();
         let size = of_region[of_region.len() / 2];
         let world = skeletons[size].world[0];
+        let start = match Start::offered(self.module) {
+            [(only, _)] => *only,
+            _ => Start::Plateau,
+        };
         self.wizard = Some(Wizard {
             // Empty, as the New project name: the kit's fields have no
             // select-all, so a prefilled name got typed onto.
@@ -241,10 +236,10 @@ impl Editor {
             skeletons,
             region,
             size,
-            start: Start::Plateau,
-            listing: Listing::default(),
+            start,
+            listing: Listing::new(self.island_rules()),
             busy: false,
-            sketch: sketch(Start::Plateau, world),
+            sketch: sketch(start, world),
         });
     }
 
@@ -315,7 +310,7 @@ impl Editor {
         }
     }
 
-    fn create_island(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn create_island(&mut self, cx: &mut Context<Self>) {
         if !self.commit_wizard_guid() {
             return;
         }
@@ -329,14 +324,17 @@ impl Editor {
         self.message(
             format!(
                 "Creating {}…",
-                new::island_path(self.game, &spec.skeleton.region, &spec.name)
+                (self.module.islands())
+                    .map(|i| new::island_path(i, &spec.skeleton.region, &spec.name))
+                    .unwrap_or_default()
             ),
             false,
         );
+        let module = self.module;
         cx.spawn(async move |this, cx| {
             let created = cx
                 .background_executor()
-                .spawn(async move { IslandEditor::create(&install, &spec) })
+                .spawn(async move { IslandEditor::create(module, &install, &spec) })
                 .await;
             this.update(cx, |this, cx| {
                 match created {
@@ -366,9 +364,9 @@ impl Editor {
         let w = self.wizard.as_ref()?;
         let regions = segmented(
             "wizard-region",
-            w.regions()
+            w.regions(self.island_rules())
                 .into_iter()
-                .map(|r| (r.clone(), province(&r).into())),
+                .map(|r| (r.clone(), self.island_rules().province(&r).into())),
             &w.region,
             cx,
             |this, region, _, _| {
@@ -399,7 +397,7 @@ impl Editor {
         );
         let starts = segmented(
             "wizard-start",
-            Start::ALL.map(|(start, name)| (start, name.into())),
+            (Start::offered(self.module).iter()).map(|&(start, name)| (start, name.into())),
             &w.start,
             cx,
             |this, start, _, _| {
@@ -412,7 +410,8 @@ impl Editor {
         let path = w
             .skeletons
             .get(w.size)
-            .map(|s| new::island_path(self.game, &s.region, &w.name.text))
+            .zip(self.module.islands())
+            .map(|(s, i)| new::island_path(i, &s.region, &w.name.text))
             .unwrap_or_default();
         let size_m = w.skeletons.get(w.size).map_or(0, |s| s.world[0]);
         let named = !w.name.text.trim().is_empty();
@@ -429,7 +428,7 @@ impl Editor {
                     "wizard-name",
                     &w.name.text,
                     w.guid.is_none().then(|| w.name.display()),
-                    "e.g. Prydein Cove",
+                    "e.g. Hidden Cove",
                 )
                 // Back to the name, keeping a typed GUID (an invalid one
                 // stays open to fix).
@@ -456,6 +455,7 @@ impl Editor {
                 Start::Sea => "Open water to sculpt or import into.",
                 Start::Plateau => "A low rounded island with a beach.",
                 Start::Hills => "The plateau with rolling rises.",
+                Start::Copy => "The shipped island of this size as it is: its ground, objects, lakes and coast lines.",
             }))
             .child(gpui_editor_kit::widgets::section("Game placement"))
             .child(self.listing_controls(ListingOf::Wizard, cx));
@@ -475,12 +475,17 @@ impl Editor {
                     // metres and not only in shading.
                     // Two short facts, each number with its unit on one line.
                     .children(match super::new::start_relief(w.start, size_m as f32) {
+                        None if w.start == Start::Copy => vec![hint(format!(
+                            "Copies {}",
+                            w.skeletons.get(w.size).map_or("", |s| s.path.as_str())
+                        ))],
                         None => vec![hint("No land yet: open water to sculpt or import into.")],
                         Some((side, top)) => vec![
                             height_key(top),
                             hint(format!(
                                 "Starting land: about {side}\u{a0}m across · {}",
-                                self.game.profile().size_class(side)
+                                (self.module.islands())
+                                    .map_or("", |i| i.rules().size_class(side))
                             )),
 
                             // What the land still needs once made, as the
@@ -498,7 +503,11 @@ impl Editor {
                     // The Overview's GUID warning, where an island is made:
                     // publishing islands numbered in a range nobody reserved
                     // collides with other mods.
-                    .when(!self.project.guid_reserved(), |d| {
+                    // A game without packaging numbers no assets.
+                    .when_some(
+                        (self.project.guid_base().zip(self.module.packaging()))
+                            .filter(|_| !self.project.guid_reserved()),
+                        |d, (base, packaging)| {
                         d.child(
                             // Full width with a shrinkable text, or the line
                             // runs out of the dialog unwrapped.
@@ -570,8 +579,8 @@ impl Editor {
                                                     .cursor_pointer()
                                                     .hover(|s| s.underline())
                                                     .child("Reserve GUIDs ↗")
-                                                    .on_click(|_, _, cx| {
-                                                        cx.open_url("https://github.com/anno-mods/GuidRanges")
+                                                    .on_click(move |_, _, cx| {
+                                                        cx.open_url(packaging.guid_range.registry)
                                                     }),
                                             )
                                             // The range typed here, so reserving
@@ -586,8 +595,7 @@ impl Editor {
                                                 .w_full(),
                                             )
                                             .child(hint(format!(
-                                                "The first of your reserved range; kept for the whole project. Until then, GUIDs start at {}.",
-                                                self.project.guid_base()
+                                                "The first of your reserved range; kept for the whole project. Until then, GUIDs start at {base}.",
                                             )))
                                         })
                                 ),

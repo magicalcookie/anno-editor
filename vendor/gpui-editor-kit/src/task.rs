@@ -1,6 +1,7 @@
 // Background work bookkeeping: single-flight jobs where only the latest
-// request matters (streaming the region under a moving camera), and keyed
-// values loaded off the UI thread a batch at a time (models, textures).
+// request matters (streaming the region under a moving camera), keyed
+// values loaded off the UI thread a batch at a time (models, textures),
+// and a thread pool for parallel work the UI thread waits on.
 use gpui::Task;
 use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
@@ -210,5 +211,26 @@ mod tests {
         assert!(!ticket.canceled());
         drop(stream);
         assert!(ticket.canceled());
+    }
+}
+
+/// Runs `work` on a rayon pool kept for work the UI thread waits on, so
+/// its `par_iter`s run there. From the UI thread, rayon's global pool
+/// queues a parallel loop behind whatever background jobs hold it: an
+/// island's first scene took 170 ms instead of 15 while its models
+/// streamed in on that pool. Use only for short work; long work belongs
+/// off the UI thread altogether.
+pub fn interactive<R: Send>(work: impl FnOnce() -> R + Send) -> R {
+    static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
+    let pool = POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .thread_name(|i| format!("interactive {i}"))
+            .build()
+            .ok()
+    });
+    match pool {
+        Some(pool) => pool.install(work),
+        // No threads to be had: the global pool still gets it done.
+        None => work(),
     }
 }

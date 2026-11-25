@@ -1,12 +1,18 @@
 // The selection's outline: a band where pixels of marked instances meet
 // unmarked ones, read from the opaque pass's pick handles. Drawn over the
-// frame with alpha blending.
+// frame with alpha blending. A tile pass first marks which TILE squares of
+// pick handles hold a marked pixel, so the band skips the rest of the pane.
 //
 // b_marks: [placed words, 0xRRGGBBAA, width px, 0], then one bit per placed
 // row (handles with the high bit set), then one bit per batch handle - 1.
 
 @group(0) @binding(0) var t_ids: texture_2d<u32>;
 @group(0) @binding(1) var<storage, read> b_marks: array<u32>;
+// fs_tiles' output, bound for fs_outline only.
+@group(1) @binding(0) var t_tiles: texture_2d<u32>;
+
+// gpu.rs OUTLINE_TILE.
+const TILE: i32 = 8;
 
 struct Out {
     @builtin(position) clip: vec4<f32>,
@@ -18,6 +24,10 @@ struct Out {
     out.clip = vec4<f32>(p, 0.0, 1.0);
     return out;
 }
+
+// Words before the marks (gpu.rs MARKS_HEADER): placed words, color,
+// width, unused, the scene's corner and scale in the target, unused.
+const HEADER: u32 = 8u;
 
 fn bit(word: u32, i: u32) -> bool {
     if word >= arrayLength(&b_marks) {
@@ -35,14 +45,54 @@ fn marked(handle: u32) -> bool {
         if (row >> 5u) >= b_marks[0] {
             return false;
         }
-        return bit(4u + (row >> 5u), row);
+        return bit(HEADER + (row >> 5u), row);
     }
     let i = handle - 1u;
-    return bit(4u + b_marks[0] + (i >> 5u), i);
+    return bit(HEADER + b_marks[0] + (i >> 5u), i);
 }
 
+// Whether window pixel `p` shows a marked instance: the pick handles are
+// the scene's, drawn at the render scale into targets that start at the
+// pane's corner.
 fn at(p: vec2<i32>, last: vec2<i32>) -> bool {
-    return marked(textureLoad(t_ids, clamp(p, vec2<i32>(0), last), 0).x);
+    return marked(textureLoad(t_ids, handle_at(p, last), 0).x);
+}
+
+// Pick handles, not window pixels, are what `at` maps to.
+fn handle_at(p: vec2<i32>, last: vec2<i32>) -> vec2<i32> {
+    let o = vec2<f32>(bitcast<f32>(b_marks[4]), bitcast<f32>(b_marks[5]));
+    return clamp(vec2<i32>((vec2<f32>(p) + 0.5 - o) * bitcast<f32>(b_marks[6])), vec2<i32>(0), last);
+}
+
+// One texel per TILE square of pick handles: 1 where any is marked.
+@fragment fn fs_tiles(in: Out) -> @location(0) u32 {
+    let base = vec2<i32>(in.clip.xy) * TILE;
+    let last = vec2<i32>(textureDimensions(t_ids)) - 1;
+    let end = min(base + TILE, last + 1);
+    for (var y = base.y; y < end.y; y++) {
+        for (var x = base.x; x < end.x; x++) {
+            if marked(textureLoad(t_ids, vec2<i32>(x, y), 0).x) {
+                return 1u;
+            }
+        }
+    }
+    return 0u;
+}
+
+// Whether any tile under the window square of `reach` around `p` holds a
+// marked pixel. `at` maps monotonically, so the square's corners bound
+// every tap the band makes.
+fn near_marks(p: vec2<i32>, reach: i32, last: vec2<i32>) -> bool {
+    let lo = handle_at(p - reach, last) / TILE;
+    let hi = handle_at(p + reach, last) / TILE;
+    for (var y = lo.y; y <= hi.y; y++) {
+        for (var x = lo.x; x <= hi.x; x++) {
+            if textureLoad(t_tiles, vec2<i32>(x, y), 0).x != 0u {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 // How far a gap inside a model may be: a pixel with marked pixels within
@@ -83,6 +133,11 @@ fn enclosed(p: vec2<i32>, last: vec2<i32>) -> bool {
     let p = vec2<i32>(in.clip.xy);
     let last = vec2<i32>(textureDimensions(t_ids)) - 1;
     let bits = b_marks[1];
+    // Past the band's reach nothing draws; `enclosed` only runs for
+    // pixels the band reached.
+    if !near_marks(p, i32(f32(max(b_marks[2], 1u)) + 3.0) + 2, last) {
+        discard;
+    }
     let color = vec3<f32>(f32(bits >> 24u), f32((bits >> 16u) & 255u), f32((bits >> 8u) & 255u)) / 255.0;
     if at(p, last) {
         // Light, so the model keeps its own colours: at 0.3 a picked bush

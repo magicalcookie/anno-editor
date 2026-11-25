@@ -56,6 +56,8 @@ mod svg_renderer;
 mod tab_stop;
 mod taffy;
 mod text_system;
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+mod texture_handoff;
 mod util;
 mod view;
 mod window;
@@ -146,6 +148,8 @@ pub use subscription::*;
 pub use svg_renderer::*;
 pub use taffy::{AvailableSpace, LayoutId};
 pub use text_system::*;
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+pub use texture_handoff::*;
 pub use util::{FutureExt, Timeout};
 pub use view::*;
 pub use window::*;

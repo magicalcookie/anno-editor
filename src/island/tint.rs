@@ -1,12 +1,12 @@
 // Editing the island tint: the working map, painting, terrain bake, and
 // image import/export. Encoding, tiles and the save bake live in
-// `anno_formats::tint`.
+// `anno_formats::a7m::tint`.
 //
 // Images exchange the shader's decoded color c (0..1, 0.5 neutral), the
 // value before `multiplier = (2c)^2.2`, so a mid-grey image is no tint and
 // painting in an image editor behaves like the game.
 use anno_formats::{
-    tint::{self, TintMap},
+    a7m::tint::{self, TintMap},
     vfs::Install,
 };
 use anyhow::{Context as _, Result};
@@ -35,7 +35,7 @@ pub const PRESETS: [(&str, [f32; 3]); 7] = [
 /// The island's working tint level; missing tiles read as neutral, a
 /// missing folder (no tint shipped) as an all-neutral map.
 pub fn load(install: &Install, data_dir: &str, world: [u32; 2]) -> TintMap {
-    TintMap::read(install, data_dir, WORK_LEVEL, world).unwrap_or_else(|e| {
+    TintMap::load(install, data_dir, WORK_LEVEL, world).unwrap_or_else(|e| {
         eprintln!("{data_dir}: tint unavailable, starting neutral: {e:#}");
         TintMap::neutral(WORK_LEVEL, world)
     })
@@ -45,7 +45,7 @@ pub fn load(install: &Install, data_dir: &str, world: [u32; 2]) -> TintMap {
 pub fn sample(map: &TintMap, x: f32, z: f32) -> [f32; 3] {
     let tx = ((x.max(0.) * map.per_metre) as usize).min(map.width - 1);
     let ty = ((z.max(0.) * map.per_metre) as usize).min(map.height - 1);
-    tint::decode(map.get(tx, ty))
+    tint::TintMap::multiplier(map.get(tx, ty))
 }
 
 /// Blends texels under the brush toward `target` (or neutral when `erase`).
@@ -73,8 +73,8 @@ pub fn paint(
                 continue;
             }
             let i = y * map.width + x;
-            let m = tint::decode(map.texels[i]);
-            let next = tint::encode(std::array::from_fn(|c| {
+            let m = tint::TintMap::multiplier(map.texels[i]);
+            let next = tint::TintMap::texel(std::array::from_fn(|c| {
                 m[c] + (target[c] - m[c]) * t.min(1.)
             }));
             if next != map.texels[i] {
@@ -126,7 +126,7 @@ pub fn export(map: &TintMap, path: &Path) -> Result<()> {
     let mut rgb = Vec::with_capacity(map.texels.len() * 3);
     // North (the last texel row) first, as image rows run.
     for &t in map.texels.chunks(map.width).rev().flatten() {
-        for m in tint::decode(t) {
+        for m in tint::TintMap::multiplier(t) {
             rgb.push(
                 (m.max(0.).powf(1. / 2.2) / 2. * 255.)
                     .round()
@@ -147,7 +147,7 @@ pub fn export(map: &TintMap, path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{PRESETS, WORK_LEVEL, export, import, paint, sample};
-    use anno_formats::tint::TintMap;
+    use anno_formats::a7m::tint::TintMap;
     use gpui_editor_kit::heightfield::Brush;
 
     fn brush(radius: f32) -> Brush {

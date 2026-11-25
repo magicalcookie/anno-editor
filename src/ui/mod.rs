@@ -5,12 +5,14 @@
 // index in `files`.
 mod bindings;
 mod canvas;
+mod evaluate;
 pub mod files;
 mod game_view;
 mod gpu;
 mod graph;
 mod hierarchy;
 mod interact;
+mod layout;
 pub mod library;
 mod placement;
 mod preview;
@@ -24,6 +26,7 @@ use crate::{
     editor::{Editor, Workspace, empty_pane},
     project::Project,
 };
+use anno_core::ui::{SampleData, Screens};
 use anno_formats::{
     phx::{self, Asset, DefaultValue, Edit, Names, Record, Value},
     vfs::Install,
@@ -43,10 +46,100 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
-/// Folder of compiled widget/component assets, keyed by guid.
-const GENERATED: &str = "data/ui/studio/generated/";
 /// A load that panicked in the layout code, told apart from ordinary errors.
 const LAYOUT_UNSUPPORTED: &str = "layout not supported";
+/// What turning sample data on says for a game whose assets give none.
+const NO_SAMPLE_CONTENT: &str = "Sample data: this game's assets give no screen content, so lists the game fills (the minimap ring) stay empty";
+
+/// What the UI workspace reads from one install once and shares between
+/// the screens it opens, each built on first use. The editor holds it
+/// (`files::Find`) and drops it with the install when the launcher
+/// switches; it is not keyed by game, as two installs of one game can
+/// follow each other in one process.
+pub struct Shared {
+    pub module: &'static dyn anno_core::game::Module,
+    /// The game's UI folders, naming and HUD.
+    pub screens: &'static Screens,
+    /// Every ImageAsset by texture path (`scene::Images`).
+    images: OnceLock<std::collections::HashMap<String, phx::Guid>>,
+    /// What the game's own assets put where layout has only sample data.
+    sample: OnceLock<Option<Arc<dyn SampleData>>>,
+    /// Which game data each template class reads (`bindings::Catalog`).
+    catalog: OnceLock<Arc<bindings::Catalog>>,
+    /// The install's colour palettes, which its screens' ColorTypes
+    /// resolve through (`scene::read_asset` registers them as it meets
+    /// them).
+    pub palettes: Arc<phx::Palettes>,
+    /// The install's Phoenix sources: enum entry names and widget types
+    /// (`Shared::sources`).
+    sources: OnceLock<Arc<phx::Sources>>,
+}
+
+impl Shared {
+    /// Panics for a game without UI screens: only theirs open here.
+    pub fn new(module: &'static dyn anno_core::game::Module) -> Arc<Shared> {
+        let screens = module.ui().expect("a game with UI screens").screens();
+        Arc::new(Shared {
+            module,
+            screens,
+            images: OnceLock::new(),
+            sample: OnceLock::new(),
+            catalog: OnceLock::new(),
+            palettes: Arc::default(),
+            sources: OnceLock::new(),
+        })
+    }
+
+    /// The sample data, read from `install`'s assets on first use for a
+    /// game that has any. Reads the whole assets file then: call it off
+    /// the UI thread before a layout.
+    fn sample(&self, install: &Install) -> Option<&Arc<dyn SampleData>> {
+        self.sample
+            .get_or_init(|| {
+                let read = self.screens.sample_data?;
+                let schema = self.module.database()?;
+                match anno_formats::assets::Assets::load(install, schema) {
+                    Ok(assets) => read(&assets),
+                    Err(e) => {
+                        eprintln!("UI sample data: {e:#}");
+                        None
+                    }
+                }
+            })
+            .as_ref()
+    }
+
+    /// The sample data if it has been read.
+    fn sample_read(&self) -> Option<&Arc<dyn SampleData>> {
+        self.sample.get()?.as_ref()
+    }
+
+    /// What the Sample data switch says about where values come from.
+    fn sample_note(&self) -> &'static str {
+        if self.screens.sample_data.is_some() {
+            "Give template properties nothing sets a plausible game value: state flags such as IsLocked off, texts filled, the minimap ring from the game's own assets"
+        } else {
+            "Give template properties nothing sets a plausible game value: state flags such as IsLocked off, texts filled. This game's assets give no screen content (no minimap ring)"
+        }
+    }
+
+    /// Enum entry names and widget types, read from `install`'s Phoenix
+    /// sources (30 small files) on first use. Everything that names an
+    /// enum entry or groups by widget type reads them through here.
+    pub fn sources(&self, install: &Install) -> &Arc<phx::Sources> {
+        self.sources
+            .get_or_init(|| Arc::new(phx::Sources::load(install, &self.screens.sources)))
+    }
+
+    fn catalog(&self, install: &Install) -> Arc<bindings::Catalog> {
+        self.catalog
+            .get_or_init(|| {
+                let (generated, fields) = (self.screens.generated, self.screens.data_fields);
+                Arc::new(bindings::Catalog::build(install, generated, fields))
+            })
+            .clone()
+    }
+}
 
 /// Built-in names, which embed the harvested corpus. `ANNO_PHX_NAMES` points
 /// at a fresher `phx_names_corpus.json` to merge on top while harvesting.
@@ -150,7 +243,7 @@ pub struct UiEditor {
     /// The canvas simulates input (hover, press) instead of editing.
     interact: bool,
     /// Interaction states held on template instances.
-    sims: Vec<anno_formats::phx::layout::Sim>,
+    sims: Vec<layout::Sim>,
     /// Other screens stacked around this one, and the reference shot.
     game: game_view::GameView,
     /// Timeline clips and playback.
@@ -353,13 +446,29 @@ impl UiEditor {
 }
 
 impl UiEditor {
-    fn load(install: Arc<Install>, path: &str) -> Result<Self> {
+    /// The game the open file is from.
+    fn module(&self) -> &'static dyn anno_core::game::Module {
+        self.images.shared.module
+    }
+
+    fn screens(&self) -> &'static Screens {
+        self.images.shared.screens
+    }
+
+    /// The open file's install's enum names and widget types.
+    fn sources(&self) -> &phx::Sources {
+        self.images.shared.sources(&self.install)
+    }
+
+    fn load(shared: Arc<Shared>, install: Arc<Install>, path: &str) -> Result<Self> {
         let asset = Asset::parse(install.read(path)?)?;
-        // Enum entry names and widget types live only in the shipped
-        // Phoenix sources (30 small files); everything shown after this
-        // reads them (`short`, the widget library).
-        anno_formats::phx::register_sources(&install);
-        let texts = Arc::new(load_texts(&install));
+        // Read once here, before anything shown asks.
+        shared.sources(&install);
+        let texts = Arc::new(
+            (shared.module.database())
+                .map(|d| load_texts(&install, d.texts_path))
+                .unwrap_or_default(),
+        );
         let mut tree = Tree::default();
         tree.expand(0);
         let mut editor = Self {
@@ -386,7 +495,7 @@ impl UiEditor {
             keep_in_place: true,
             pivot_drag: false,
             install,
-            images: scene::Images::default(),
+            images: scene::Images::new(shared),
             texts,
             nodes: Vec::new(),
             parents: Vec::new(),
@@ -545,6 +654,9 @@ impl UiEditor {
         let design = self.canvas.design_view;
         // "This file" of clips and held states is the edited template.
         let own = |file: Option<anno_formats::phx::Guid>| file.or(scope.map(|s| s.0));
+        if self.sample {
+            self.images.shared.sample(&self.install);
+        }
         let (nodes, frames) = scene::layout(
             asset,
             &self.install,
@@ -553,7 +665,7 @@ impl UiEditor {
             scene::View {
                 design,
                 bindings: self.bindings,
-                play: self.player.play().map(|p| phx::layout::Play {
+                play: self.player.play().map(|p| layout::Play {
                     file: own(p.file),
                     ..p
                 }),
@@ -562,7 +674,7 @@ impl UiEditor {
                 sims: self
                     .sims
                     .iter()
-                    .map(|s| phx::layout::Sim {
+                    .map(|s| layout::Sim {
                         file: own(s.file),
                         ..*s
                     })
@@ -851,7 +963,8 @@ impl UiEditor {
         };
         let old_asset = std::mem::replace(&mut self.asset, asset);
         let old_history = std::mem::replace(&mut self.history, history);
-        let old_path = std::mem::replace(&mut self.path, format!("{GENERATED}{g}"));
+        let path = format!("{}{g}", self.screens().generated);
+        let old_path = std::mem::replace(&mut self.path, path);
         match self.scope.replace((g, key)) {
             // From another template: it keeps its edits for later.
             Some((was, _)) => {
@@ -909,7 +1022,7 @@ impl UiEditor {
     }
 
     fn editable(&self) -> bool {
-        self.install.game().profile().phx_untyped_editable || self.asset.typed()
+        self.screens().untyped_editable || self.asset.typed()
     }
 
     /// Refuses an edit of a file whose schema version the editor does not
@@ -1049,7 +1162,7 @@ impl UiEditor {
     /// many files were staged.
     pub fn stage(&mut self, project: &mut Project) -> Result<usize> {
         anyhow::ensure!(
-            project.game() == self.install.game(),
+            project.game() == self.module().game(),
             "UI asset and project belong to different games"
         );
         self.ensure_editable()?;
@@ -1066,9 +1179,10 @@ impl UiEditor {
             r.history.mark_saved();
             staged += 1;
         }
+        let generated = self.screens().generated;
         for (g, (asset, history)) in &mut self.edited {
             if history.dirty() {
-                project.stage(&format!("{GENERATED}{g}"), asset.encode());
+                project.stage(&format!("{generated}{g}"), asset.encode());
                 history.mark_saved();
                 staged += 1;
             }
@@ -1114,7 +1228,7 @@ impl UiEditor {
         match &s.record {
             Record::Header => format!("header PHX{}", self.asset.header().kind_str()),
             Record::Types => format!("class table ({})", self.asset.types().len()),
-            Record::Layout => format!("layout ({} tokens)", self.asset.layout().tokens.len()),
+            Record::Heap => format!("heap ({} allocations)", self.asset.heap().allocations.len()),
             Record::Object(o) => format!("{} · {} props", self.name(o.class), o.prop_count),
             Record::Str(r) => format!("\"{}\"", r.text),
             Record::Ref(r) => format!("→ {} {}", self.name(r.class), r.id),
@@ -1122,7 +1236,7 @@ impl UiEditor {
             Record::Value(v) => format!("{v:?}"),
             Record::Null => "null".into(),
             Record::Count(n) => format!("{n} elements"),
-            Record::Default(v) => format!("default {}", default_text(v)),
+            Record::Default(v) => format!("default {}", default_text(self.sources(), v)),
             Record::Bytes => format!("{} bytes", s.range.len()),
             Record::Opaque => format!("opaque {} B", s.range.len()),
         }
@@ -1137,11 +1251,11 @@ impl UiEditor {
         if let Record::Default(DefaultValue::U32(id)) = self.asset.spans().get(span)?.record
             && let Some(name) = self
                 .span_enum(span)
-                .and_then(|g| phx::enum_entry_name(g, id))
+                .and_then(|g| self.sources().enum_entry_name(g, id))
         {
-            return Some(name);
+            return Some(name.to_owned());
         }
-        typed_text(&self.asset, span)
+        typed_text(self.sources(), &self.asset, span)
     }
 
     /// The enum whose entry the value at `span` is, when that is known: a
@@ -1248,7 +1362,9 @@ impl UiEditor {
             }
             // An enum entry by its name, any case, where its enum is known.
             Record::Default(DefaultValue::U32(_))
-                if let Some(e) = self.span_enum(span).and_then(phx::enum_info)
+                if let Some(e) = self
+                    .span_enum(span)
+                    .and_then(|g| self.sources().enum_info(g))
                     && text.trim().parse::<u32>().is_err() =>
             {
                 let t = text.trim();
@@ -1272,7 +1388,7 @@ impl UiEditor {
             },
             Record::Value(old) => Edit::Value {
                 span,
-                value: parse_value(old, text)?,
+                value: parse_value(self.sources(), old, text)?,
             },
             _ => bail!("This record is read-only"),
         };
@@ -1505,15 +1621,15 @@ impl UiEditor {
 
 /// `texts_english.xml`, the language the editor shows labels in.
 // TODO(alex): follow the game's language setting.
-fn load_texts(install: &Install) -> std::collections::HashMap<i64, String> {
+fn load_texts(install: &Install, texts_path: &str) -> std::collections::HashMap<i64, String> {
     install
-        .read(install.game().profile().texts_path)
+        .read(texts_path)
         .map(|b| phx::parse_texts(&String::from_utf8_lossy(&b)))
         .unwrap_or_default()
 }
 
 /// Editable text for a scalar value; `None` for read-only kinds.
-fn value_text(v: &Value) -> Option<String> {
+fn value_text(sources: &phx::Sources, v: &Value) -> Option<String> {
     let join = |xs: &[f32]| {
         xs.iter()
             .map(|x| format!("{x}"))
@@ -1533,9 +1649,10 @@ fn value_text(v: &Value) -> Option<String> {
         Value::Vec4(x) => join(x),
         // By the entry's name where the game ships one (a label's
         // HorizontalOverflow 4 is Ellipsis).
-        Value::Enum { ty, value } => anno_formats::phx::enum_of_type(*ty)
-            .and_then(|e| e.entries.into_iter().find(|x| x.id == *value))
-            .map_or_else(|| value.to_string(), |x| x.name),
+        Value::Enum { ty, value } => sources
+            .enum_of_type(*ty)
+            .and_then(|e| e.entries.iter().find(|x| x.id == *value))
+            .map_or_else(|| value.to_string(), |x| x.name.clone()),
         _ => return None,
     })
 }
@@ -1572,10 +1689,11 @@ pub(super) fn release_heap(now: bool) -> bool {
         let Ok(mut last) = LAST.lock() else {
             return false;
         };
-        if !now && last.is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(2)) {
+        let at = std::time::Instant::now();
+        if !trim_due(*last, at, now) {
             return false;
         }
-        *last = Some(std::time::Instant::now());
+        *last = Some(at);
         unsafe extern "C" {
             fn malloc_trim(pad: usize) -> i32;
         }
@@ -1590,24 +1708,31 @@ pub(super) fn release_heap(now: bool) -> bool {
     }
 }
 
+/// Whether a heap trim may run `at`, the last having run at `last`: every
+/// 2 s at most, unless forced.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn trim_due(last: Option<std::time::Instant>, at: std::time::Instant, forced: bool) -> bool {
+    forced || last.is_none_or(|t| at.duration_since(t) >= std::time::Duration::from_secs(2))
+}
+
 /// Span `span`'s value as a field shows it for typing, when it can be typed
 /// over: text, a colour, a scalar, a default (scalar, vector as
 /// `[255, 255, 255]`, text bare), or a colour constant's own colour. The
 /// graph offers a fixed value on a pin as a field only when this has one.
 // `span` is `asset`'s: a span of another (a template's clip key) must not
 // index it, or panic past its end.
-pub(super) fn typed_text(asset: &Asset, span: usize) -> Option<String> {
+pub(super) fn typed_text(sources: &phx::Sources, asset: &Asset, span: usize) -> Option<String> {
     let rgb = |[r, g, b]: [u8; 3]| format!("{r:02x}{g:02x}{b:02x}");
     match &asset.spans().get(span)?.record {
         Record::Str(r) => Some(r.text.clone()),
         Record::Color(c) => Some(rgb(*c)),
-        Record::Value(v) => value_text(v),
+        Record::Value(v) => value_text(sources, v),
         Record::Default(
             v @ (DefaultValue::Bool(_)
             | DefaultValue::S32(_)
             | DefaultValue::U32(_)
             | DefaultValue::F32(_)),
-        ) => Some(default_text(v)),
+        ) => Some(default_text(sources, v)),
         Record::Default(DefaultValue::Vec(v)) => Some(format!(
             "[{}]",
             v.iter()
@@ -1759,7 +1884,7 @@ pub(super) fn parse_default(old: &DefaultValue, text: &str) -> Result<DefaultVal
 }
 
 /// Parses `text` as a value of the same kind as `old`.
-fn parse_value(old: &Value, text: &str) -> Result<Value> {
+fn parse_value(sources: &phx::Sources, old: &Value, text: &str) -> Result<Value> {
     let t = text.trim();
     let floats = |n: usize| -> Result<Vec<f32>> {
         let xs: Vec<f32> = t
@@ -1788,7 +1913,7 @@ fn parse_value(old: &Value, text: &str) -> Result<Value> {
         // An entry by its name too, any case; the names in the refusal.
         Value::Enum { ty, .. } => Value::Enum {
             ty: *ty,
-            value: match (t.parse(), anno_formats::phx::enum_of_type(*ty)) {
+            value: match (t.parse(), sources.enum_of_type(*ty)) {
                 (Ok(v), _) => v,
                 (Err(_), Some(e)) => e
                     .entries
@@ -1809,23 +1934,29 @@ fn parse_value(old: &Value, text: &str) -> Result<Value> {
 /// A template property's default as the inspector and tree show it: an
 /// enum entry by name, by the property's own enum (round 15: the inspector
 /// said 1403909053 where Bindings said Begin).
-pub(super) fn property_default_text(asset: &Asset, p: &phx::CustomProperty) -> String {
+pub(super) fn property_default_text(
+    sources: &phx::Sources,
+    asset: &Asset,
+    p: &phx::CustomProperty,
+) -> String {
     let v = asset.property_default(p);
     if let (DefaultValue::U32(id), Some(e)) = (v, p.enum_asset)
-        && let Some(name) = phx::enum_entry_name(e.id, *id)
+        && let Some(name) = sources.enum_entry_name(e.id, *id)
     {
-        return name;
+        return name.to_owned();
     }
-    default_text(v)
+    default_text(sources, v)
 }
 
-fn default_text(v: &DefaultValue) -> String {
+fn default_text(sources: &phx::Sources, v: &DefaultValue) -> String {
     match v {
         DefaultValue::None => "none".into(),
         DefaultValue::Bool(b) => (*b != 0).to_string(),
         DefaultValue::S32(v) => v.to_string(),
         // A hashed enum entry by its name (see `short`).
-        DefaultValue::U32(v) => phx::unique_entry_name(*v).unwrap_or_else(|| v.to_string()),
+        DefaultValue::U32(v) => sources
+            .unique_entry_name(*v)
+            .map_or_else(|| v.to_string(), str::to_owned),
         DefaultValue::F32(bits) => f32::from_bits(*bits).to_string(),
         DefaultValue::Vec(v) => format!(
             "({})",
@@ -1854,20 +1985,37 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 impl Editor {
+    /// The open game's UI facts; only games with UI screens reach the UI
+    /// workspace.
+    fn ui_screens(&self) -> &'static Screens {
+        self.module.ui().expect("a game with UI screens").screens()
+    }
+
+    /// A screen as the UI files list names it, else its file name.
+    pub(crate) fn screen_name(&self, path: &str) -> String {
+        (self.ui_find.display_name(path))
+            .unwrap_or_else(|| path.rsplit('/').next().unwrap_or(path).to_owned())
+    }
+
+    /// Opens the screen at `path`, asking first when the open one has
+    /// edits (`Editor::leave`).
     pub fn open_ui_asset(&mut self, path: &str, cx: &mut Context<Self>) {
+        self.leave(crate::editor::Leave::Screen(path.to_owned()), cx);
+    }
+
+    /// Loads the screen at `path` off the UI thread; it replaces the open
+    /// one when it arrives. `discarded`: see `Editor::go`.
+    pub(crate) fn load_ui_asset(&mut self, path: &str, discarded: bool, cx: &mut Context<Self>) {
+        if !self.require_workspace(Workspace::Ui) {
+            return;
+        }
         // The preview was of the file being opened, or of one passed over.
         self.ui_peek = None;
         self.ensure_ui_index(cx);
         let Some(install) = self.install.clone() else {
             return self.message("No install is open", true);
         };
-        if self.ui.as_ref().is_some_and(|u| u.dirty()) {
-            return self.message(
-                "Save the open UI asset (Ctrl S) before opening another",
-                true,
-            );
-        }
-        let path = path.to_owned();
+        let (shared, path) = (self.ui_find.shared(self.module), path.to_owned());
         cx.spawn(async move |this, cx| {
             let loaded = cx
                 .background_executor()
@@ -1879,7 +2027,7 @@ impl Editor {
                         // (Construction Menu, Options): report it as a failed
                         // open instead of taking the editor down with it.
                         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            UiEditor::load(install, &path)
+                            UiEditor::load(shared, install, &path)
                         }))
                         .unwrap_or_else(|panic| {
                             // The panic text is for the log; the status bar
@@ -1894,6 +2042,13 @@ impl Editor {
                 })
                 .await;
             this.update(cx, |this, cx| {
+                // Edited while this loaded, and not by a choice to discard:
+                // ask again instead of dropping the new edits.
+                if loaded.is_ok() && !discarded && this.ui.as_ref().is_some_and(|u| u.dirty()) {
+                    this.leaving = Some(crate::editor::Leave::Screen(path.clone()));
+                    cx.notify();
+                    return;
+                }
                 match loaded {
                     Ok(mut ui) => {
                         // The game view outlives the file it was built around.
@@ -1908,11 +2063,7 @@ impl Editor {
                             // tree do, so the three agree.
                             format!(
                                 "Opened {} · {} · {}{}",
-                                this.ui_find.display_name(&path).unwrap_or_else(|| path
-                                    .rsplit('/')
-                                    .next()
-                                    .unwrap_or("")
-                                    .to_owned()),
+                                this.screen_name(&path),
                                 crate::project::plural(
                                     ui.nodes
                                         .iter()
@@ -2096,19 +2247,38 @@ impl Editor {
             }
         };
         let drag = ui.drag_preview();
-        let mut children = vec![ui.canvas.view.page()];
+        let view = &ui.canvas.view;
+        let mut children = vec![view.page()];
+        // On the GPU the canvas is one texture over the page, the page
+        // included: add and multiply images blend with what is under them.
+        let mut scene = gpu::enabled().then(|| {
+            let o = view.to_screen(0., 0.);
+            let mut scene = gpu::Scene::new([f32::from(o.x), f32::from(o.y)], view.zoom);
+            let (page, border) = (theme::get().artboard, theme::get().border);
+            // As GPUI draws the colours: through HSLA.
+            let color = |c: Rgba| Rgba::from(Hsla::from(c));
+            scene.fill(gpu::Fill {
+                at: o,
+                size: [view.size[0] * view.zoom, view.size[1] * view.zoom],
+                clip: None,
+                color: color(page),
+                border: Some((1., color(border))),
+            });
+            scene
+        });
         // What the game draws is cut to the screen it draws on.
-        let mut drawn = ui.game_view_elements();
+        let mut drawn = ui.game_view_elements(scene.as_mut());
         let (content, handles) = canvas::render(
             &ui.canvas,
             &ui.nodes,
             &ui.in_scope,
             drag.as_ref().map(|d| (d.0, d.1)),
             ui.visible_region(),
-            &ui.gpu,
+            scene.as_mut(),
             Some(on_handle),
         );
         drawn.extend(content);
+        drawn.extend(scene.map(|scene| ui.gpu.element(scene)));
         children.push(ui.canvas.view.clip_to_page(drawn));
         children.extend(canvas::chrome(ui, drag.as_ref()));
         children.extend(placement::overlay(ui, entity.clone()));
@@ -2347,7 +2517,7 @@ impl Editor {
         ui: &UiEditor,
         prop: &phx::PropValue,
         label: String,
-        bound: Option<phx::binding::Bound>,
+        bound: Option<evaluate::Bound>,
         cx: &mut Context<Self>,
     ) -> Div {
         let span = prop.span;
@@ -2447,15 +2617,22 @@ impl Editor {
             })
     }
 
-    /// Ends typing in the UI workspace's fields and searches, applying the
-    /// value as a click elsewhere would; the keys stay where they are.
-    /// Save, leaving (quit, open, switch game) and the workspace switch go
-    /// through here.
+    /// Ends typing in the UI and Map workspaces' fields and the searches,
+    /// applying the value as a click elsewhere would; the keys stay where
+    /// they are. Save and leaving (quit, open, switch game) go through
+    /// here. A value its field refuses stays typed, the field keeping the
+    /// keys, and the error says why: the caller stops, since going on
+    /// would drop it.
     // TODO(alex): the island's fields and filter are not ended here; Ctrl S
     // in the Island workspace saves without a half-typed island value.
-    pub(crate) fn end_typing(&mut self) {
+    pub(crate) fn end_typing(&mut self) -> Result<(), String> {
+        if let Some(ui) = &mut self.ui {
+            ui.apply_typing().map_err(|e| format!("Not applied: {e}"))?;
+        }
+        self.end_map_typing()?;
         let keys = self.ui.as_ref().map(|u| u.keys).unwrap_or_default();
         self.keys_to(keys);
+        Ok(())
     }
 
     /// A click took the keys for `keys`: the UI files search stops typing,
@@ -2522,6 +2699,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let generated = self.ui_screens().generated;
         self.ensure_flag_probe(cx);
         if let Some(ui) = &mut self.ui
             && ui.names.is_empty()
@@ -2707,7 +2885,7 @@ impl Editor {
                         .when_some(
                             node.owners.first().copied().zip(template_name),
                             |d, ((g, key), name)| {
-                                let target = format!("{GENERATED}{g}");
+                                let target = format!("{generated}{g}");
                                 d.child(
                                     button(format!("Edit {name} here"), false)
                                         .tooltip(gpui_editor_kit::widgets::Tooltip::text(
@@ -2876,7 +3054,7 @@ impl Editor {
                 );
             }
             if let Record::Ref(r) = s.record {
-                let target = format!("{GENERATED}{}", r.id);
+                let target = format!("{generated}{}", r.id);
                 body = body.child(button("Open target", false).on_click(cx.listener(
                     move |this, _, _, cx| {
                         this.follow(target.clone(), cx);
@@ -2913,7 +3091,7 @@ impl Editor {
                 let span = prop.default;
                 // Name and value in words; the type only when it is known,
                 // and an empty default as "not set".
-                let value = property_default_text(a, prop);
+                let value = property_default_text(ui.sources(), a, prop);
                 let value = if value == "none" {
                     "not set".to_owned()
                 } else {
@@ -3023,7 +3201,7 @@ impl Editor {
             // look-up is fine for the handful of references a screen has.
             let index = self.ui_find.index.clone();
             for (class, guid, count) in refs.assets.iter().take(64) {
-                let target = format!("{GENERATED}{guid}");
+                let target = format!("{generated}{guid}");
                 let id = guid.to_string();
                 let name = index
                     .as_ref()
@@ -3076,7 +3254,7 @@ impl Editor {
                         .tooltip(gpui_editor_kit::widgets::Tooltip::text(
                             "Open",
                             "",
-                            format!("{GENERATED}{id}"),
+                            format!("{generated}{id}"),
                         ))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.follow(target.clone(), cx);
@@ -3183,9 +3361,20 @@ mod tests {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     #[test]
     fn heap_release_is_throttled_but_a_probe_forces_it() {
-        assert!(super::release_heap(true));
-        assert!(!super::release_heap(false), "within 2 s");
-        assert!(super::release_heap(true), "forced");
+        // By given instants: two real calls 2 s apart failed on a loaded
+        // machine, where the trim between them took that long.
+        use std::time::{Duration, Instant};
+        let t = Instant::now();
+        assert!(super::trim_due(None, t, false), "the first");
+        assert!(
+            !super::trim_due(Some(t), t + Duration::from_millis(1999), false),
+            "within 2 s"
+        );
+        assert!(
+            super::trim_due(Some(t), t + Duration::from_secs(2), false),
+            "after 2 s"
+        );
+        assert!(super::trim_due(Some(t), t, true), "forced");
     }
 
     // While a field is typing, chords it ignores stop there; undo, redo,
@@ -3211,14 +3400,20 @@ mod tests {
 
     #[test]
     fn installed_1800_ui_edits_save_into_a_separate_mod() {
-        let Some(dir) = std::env::var_os("ANNO1800_DIR") else {
+        let Some(dir) = anno_formats::vfs::install_dir("ANNO1800_DIR") else {
             return;
         };
-        let install = Arc::new(Install::open(dir).unwrap());
-        let game = anno_formats::game::Game::Anno1800;
+        let families = crate::games::profile(anno_core::game::Game::Anno1800).archive_families;
+        let install = Arc::new(Install::open(dir, families).unwrap());
+        let game = anno_core::game::Game::Anno1800;
         let path = "data/ui/studio/generated/006956b4-ff57-46d4-b278-0c4dbe18b722";
         let original = install.read(path).unwrap();
-        let mut ui = UiEditor::load(install.clone(), path).unwrap();
+        let mut ui = UiEditor::load(
+            crate::ui::test_support::shared(&install),
+            install.clone(),
+            path,
+        )
+        .unwrap();
         assert!(!ui.nodes.is_empty());
         assert!(!ui.texts.is_empty());
         let (span, value) = ui
@@ -3240,38 +3435,44 @@ mod tests {
         assert_eq!(ui.asset.bytes(), original);
         assert!(ui.undo(true));
         let config = tempfile::tempdir().unwrap();
-        let mut project = crate::project::Project::load(config.path(), game);
+        let mut project =
+            crate::project::Project::load(config.path(), crate::games::module(game)).unwrap();
         ui.stage(&mut project).unwrap();
         let folder = project.write().unwrap();
         assert_eq!(std::fs::read(folder.join(path)).unwrap(), changed);
-        install.mount_mod(&folder).unwrap();
-        let reopened = UiEditor::load(install.clone(), path).unwrap();
+        install.mount_mods(&[folder.as_path()], &["data"]).unwrap();
+        let reopened = UiEditor::load(
+            crate::ui::test_support::shared(&install),
+            install.clone(),
+            path,
+        )
+        .unwrap();
         assert_eq!(reopened.asset.bytes(), changed);
         // Mounting is only an editor overlay; shipped archive data stays intact.
         assert_eq!(
             install.read_file(install.file(path).unwrap()).unwrap(),
             original
         );
-        let mut foreign =
-            crate::project::Project::load(config.path(), anno_formats::game::Game::Anno117);
+        let mut foreign = crate::project::Project::load(config.path(), &anno117::MODULE).unwrap();
         assert!(ui.stage(&mut foreign).is_err());
     }
 
     #[test]
     fn installed_1800_unknown_schema_is_read_only() {
-        let Some(dir) = std::env::var_os("ANNO1800_DIR") else {
+        let Some(dir) = anno_formats::vfs::install_dir("ANNO1800_DIR") else {
             return;
         };
-        let install = Arc::new(Install::open(dir).unwrap());
+        let families = crate::games::profile(anno_core::game::Game::Anno1800).archive_families;
+        let install = Arc::new(Install::open(dir, families).unwrap());
         let path = "data/ui/studio/generated/00dba1a6-05b4-464d-94f7-2f2bfeda2609";
-        let mut ui = UiEditor::load(install, path).unwrap();
+        let mut ui =
+            UiEditor::load(crate::ui::test_support::shared(&install), install, path).unwrap();
         assert!(!ui.editable());
         assert!((0..ui.asset.spans().len()).all(|i| ui.edit_text(i).is_none()));
         let err = ui.commit(0, "test").unwrap_err();
         assert!(err.to_string().contains("read-only"));
         let config = tempfile::tempdir().unwrap();
-        let mut project =
-            crate::project::Project::load(config.path(), anno_formats::game::Game::Anno1800);
+        let mut project = crate::project::Project::load(config.path(), &anno1800::MODULE).unwrap();
         assert!(ui.stage(&mut project).is_err());
         assert!(project.files.is_empty());
     }
@@ -3287,9 +3488,9 @@ mod tests {
         let original = ui.asset.encode();
         let text = ui
             .asset
-            .strings()
-            .find(|(_, s)| s.with_crc && s.text.len() > 3)
-            .map(|(i, _)| i)
+            .spans()
+            .iter()
+            .position(|s| matches!(&s.record, Record::Str(s) if s.with_crc && s.text.len() > 3))
             .expect("an editable string");
         ui.commit(text, "RenamedByTest").unwrap();
         assert!(
@@ -3341,16 +3542,17 @@ mod tests {
 
     #[test]
     fn values_parse_to_their_own_kind() {
+        let none = anno_formats::phx::Sources::default();
         assert_eq!(
-            parse_value(&Value::Vec3([0.; 3]), "1, 2,3").unwrap(),
+            parse_value(&none, &Value::Vec3([0.; 3]), "1, 2,3").unwrap(),
             Value::Vec3([1., 2., 3.])
         );
-        assert!(parse_value(&Value::Vec2([0.; 2]), "1").is_err());
+        assert!(parse_value(&none, &Value::Vec2([0.; 2]), "1").is_err());
         assert_eq!(
-            parse_value(&Value::Bool(false), "yes").unwrap(),
+            parse_value(&none, &Value::Bool(false), "yes").unwrap(),
             Value::Bool(true)
         );
-        assert!(parse_value(&Value::Str("a".into()), "b").is_err());
+        assert!(parse_value(&none, &Value::Str("a".into()), "b").is_err());
         assert_eq!(hex(&[1, 2]), "01 02");
     }
 
@@ -3465,13 +3667,19 @@ mod tests {
         let Some(install) = install() else {
             return;
         };
-        anno_formats::phx::register_sources(&install);
+        let sources =
+            anno_formats::phx::Sources::load(&install, &crate::ui::test_support::screens().sources);
         let ty = anno_formats::phx::name_crc(b"HorizontalOverflow");
         let v = |value| Value::Enum { ty, value };
-        assert_eq!(super::value_text(&v(4)).as_deref(), Some("Ellipsis"));
-        assert_eq!(parse_value(&v(0), "wrap").unwrap(), v(1));
-        assert_eq!(parse_value(&v(0), "3").unwrap(), v(3));
-        let said = parse_value(&v(0), "sideways").unwrap_err().to_string();
+        assert_eq!(
+            super::value_text(&sources, &v(4)).as_deref(),
+            Some("Ellipsis")
+        );
+        assert_eq!(parse_value(&sources, &v(0), "wrap").unwrap(), v(1));
+        assert_eq!(parse_value(&sources, &v(0), "3").unwrap(), v(3));
+        let said = parse_value(&sources, &v(0), "sideways")
+            .unwrap_err()
+            .to_string();
         assert!(
             said.starts_with("HorizontalOverflow takes DeprecatedAutosize, Wrap"),
             "{said}"

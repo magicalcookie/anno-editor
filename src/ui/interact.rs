@@ -5,8 +5,9 @@
 // a state is the matching clip held at its end on that button's template
 // instance (`layout::Sim`). The search walks outward from the innermost
 // template, so a plain image inside a button template still hovers it.
+use super::layout::Sim;
 use super::{UiEditor, timeline::ClipRef};
-use anno_formats::phx::{Guid, layout::Sim};
+use anno_formats::phx::Guid;
 use gpui_editor_kit::gpui::{Pixels, Point};
 
 /// Clip names per state, in preference order (shipped spellings).
@@ -154,12 +155,18 @@ mod tests {
     // clip on that one instance, which changes how the button draws.
     #[test]
     fn hovering_a_button_applies_its_enter_clip() {
-        let Some(dir) = std::env::var_os("ANNO117_DIR") else {
+        let Some(dir) = anno_formats::vfs::install_dir("ANNO117_DIR") else {
             eprintln!("skipping: ANNO117_DIR unset");
             return;
         };
-        let install = Arc::new(Install::open(dir).unwrap());
-        let mut ui = UiEditor::load(install, "data/ui/studio/generated/maintitlescene").unwrap();
+        let families = crate::games::profile(anno_core::game::Game::Anno117).archive_families;
+        let install = Arc::new(Install::open(dir, families).unwrap());
+        let mut ui = UiEditor::load(
+            crate::ui::test_support::shared(&install),
+            install,
+            "data/ui/studio/generated/maintitlescene",
+        )
+        .unwrap();
         let looks = |ui: &UiEditor| {
             ui.nodes
                 .iter()
@@ -213,12 +220,18 @@ mod tests {
     // hovered whichever was on top, sectors away from the pointer.
     #[test]
     fn hovering_a_minimap_button_picks_its_own_sector() {
-        let Some(dir) = std::env::var_os("ANNO117_DIR") else {
+        let Some(dir) = anno_formats::vfs::install_dir("ANNO117_DIR") else {
             eprintln!("skipping: ANNO117_DIR unset");
             return;
         };
-        let install = Arc::new(Install::open(dir).unwrap());
-        let ui = UiEditor::load(install, "data/ui/studio/generated/minimapscene").unwrap();
+        let families = crate::games::profile(anno_core::game::Game::Anno117).archive_families;
+        let install = Arc::new(Install::open(dir, families).unwrap());
+        let ui = UiEditor::load(
+            crate::ui::test_support::shared(&install),
+            install,
+            "data/ui/studio/generated/minimapscene",
+        )
+        .unwrap();
         // A ring entry is an instance of the sector template.
         let entry = |owners: &[(anno_formats::phx::Guid, u64)]| {
             owners

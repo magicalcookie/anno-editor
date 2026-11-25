@@ -3,8 +3,9 @@
 // Snapshots are whole documents. Keep large immutable payloads behind `Arc`
 // in the document type so a checkpoint copies handles, not bytes.
 
-/// Undo depth. Documents that hold editable geometry are large even when
-/// payloads are shared; 32 steps has been enough for terrain sculpting.
+/// Default undo depth. Documents that hold editable geometry are large even
+/// when payloads are shared; 32 steps has been enough for terrain sculpting.
+/// Small documents pick a deeper one with `with_depth`.
 pub const DEPTH: usize = 32;
 
 struct Snapshot<T> {
@@ -23,17 +24,24 @@ pub struct History<T> {
     revision: u64,
     next_revision: u64,
     saved: Option<u64>,
+    depth: usize,
 }
 
 impl<T: Clone> History<T> {
     /// `saved` says whether the initial document matches a file on disk.
     pub fn new(saved: bool) -> Self {
+        Self::with_depth(saved, DEPTH)
+    }
+
+    /// As `new`, keeping at most `depth` undo steps (at least one).
+    pub fn with_depth(saved: bool, depth: usize) -> Self {
         Self {
             past: vec![],
             future: vec![],
             revision: 0,
             next_revision: 1,
             saved: saved.then_some(0),
+            depth: depth.max(1),
         }
     }
 
@@ -44,7 +52,7 @@ impl<T: Clone> History<T> {
 
     /// Records a snapshot taken earlier, such as the start of a drag gesture.
     pub fn checkpoint_owned(&mut self, document: T) {
-        if self.past.len() == DEPTH {
+        if self.past.len() == self.depth {
             self.past.remove(0);
         }
         self.past.push(Snapshot {
@@ -192,5 +200,21 @@ mod tests {
         assert_eq!(undone, DEPTH);
         assert_eq!(doc, 10);
         assert!(history.dirty());
+    }
+
+    #[test]
+    fn a_depth_given_at_construction_bounds_undo() {
+        let mut doc = 0;
+        let mut history = History::with_depth(true, 100);
+        for i in 1..=150 {
+            history.checkpoint(&doc);
+            doc = i;
+        }
+        let mut undone = 0;
+        while history.undo(&mut doc) {
+            undone += 1;
+        }
+        assert_eq!(undone, 100);
+        assert_eq!(doc, 50);
     }
 }

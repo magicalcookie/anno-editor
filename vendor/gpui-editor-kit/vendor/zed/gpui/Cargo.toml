@@ -132,9 +132,9 @@ scap = { git = "https://github.com/zed-industries/scap", rev = "b5c86ec58dd4b6b7
 [target."cfg(any(target_os = \"linux\", target_os = \"android\"))".dependencies]
 libc = { version = "0.2" }
 
-# Viewport hook (GpuCanvas): canvases draw with GPUI's wgpu device, on the
-# platforms whose windows render through gpui_wgpu.
-[target."cfg(any(target_os = \"linux\", target_os = \"windows\"))".dependencies]
+# Texture handoff (TextureHandoff): textures another thread renders on GPUI's
+# wgpu device, on the platforms whose windows render through gpui_wgpu.
+[target."cfg(any(target_os = \"linux\", target_os = \"windows\", target_os = \"macos\"))".dependencies]
 wgpu = { git = "https://github.com/gfx-rs/wgpu", rev = "cddb2f5d80dc0009b2ef6767635140cacf90a007", default-features = false }
 
 [target."cfg(target_os = \"windows\")".dependencies]

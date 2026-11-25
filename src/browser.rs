@@ -2,6 +2,9 @@
 // selection, and the preview pane (textures, text, hex, archive layers).
 // Opening an island or a compiled UI asset hands off to its workspace.
 use crate::editor::{Editor, empty_pane};
+use anno_core::files::{self, Group, Kind, View as Shows};
+use anno_core::game::Module;
+use anno_formats::model::Model;
 use anno_formats::vfs::{FileId, FolderId, Install, Node};
 use gpui_editor_kit::{
     code::{Code, Language, code_view},
@@ -9,13 +12,13 @@ use gpui_editor_kit::{
     gpu::{self, Mesh, MeshData},
     gpui::{prelude::*, *},
     icon::Icon,
-    math::{self, Mat4},
+    math::{self, Mat4, Vec3},
     model_view::ModelView,
     texture, theme,
     tree::{self, Nav, Row, Tree},
     widgets::{self, hint, info_row},
 };
-use std::sync::Arc;
+use std::{borrow::Cow, sync::Arc};
 
 /// Search stops after this many hits; more than a screenful of thousands of
 /// rows only means the query is too broad.
@@ -103,17 +106,109 @@ impl Types {
         1 << self as u8
     }
 
-    fn admits(self, path: &str) -> bool {
-        let ext = path.rsplit('.').next().unwrap_or_default();
-        match self {
-            Types::All => true,
-            Types::Textures => matches!(ext, "dds" | "png" | "jpg" | "jpeg"),
-            Types::Models => matches!(ext, "cfg" | "prp" | "rdm" | "rdp" | "fc"),
-            Types::Islands => matches!(ext, "a7m" | "a7t" | "a7me" | "a7te"),
-            Types::Ui => kind(path) == "ui",
-            Types::Text => matches!(ext, "xml" | "json" | "txt" | "lua" | "ini" | "loca"),
+    /// The chip that lists `group`.
+    fn of(group: Group) -> Types {
+        match group {
+            Group::Textures => Types::Textures,
+            Group::Models => Types::Models,
+            Group::Islands => Types::Islands,
+            Group::Ui => Types::Ui,
+            Group::Text => Types::Text,
         }
     }
+
+    /// Whether the chip lists a file of `kind`; All lists every file, of
+    /// a kind or not.
+    fn admits(self, kind: Option<&Kind>) -> bool {
+        self == Types::All || kind.is_some_and(|k| Types::of(k.group) == self)
+    }
+}
+
+/// The open game's file kinds, its own then `files::GENERIC`, as the list
+/// classifies them: every file of the install (~440k on 117) goes through
+/// `get` on the first type shown as a tree, so extensions are packed into
+/// a `u64` and binary-searched instead of walking each kind's list.
+/// Answers as `files::kind_of` does (tested).
+#[derive(Default)]
+struct Kinds {
+    /// (packed extension, index into `list`), sorted and unique: the first
+    /// kind to name an extension owns it.
+    exts: Vec<(u64, u16)>,
+    /// Folder markers in list order.
+    folders: Vec<(&'static str, u16)>,
+    list: Vec<&'static Kind>,
+}
+
+impl Kinds {
+    fn new(module: &dyn Module) -> Kinds {
+        let list: Vec<&'static Kind> = module.files().iter().chain(files::GENERIC).collect();
+        let mut exts = Vec::new();
+        let mut folders = Vec::new();
+        for (i, k) in list.iter().enumerate() {
+            exts.extend(k.exts.iter().filter_map(|e| Some((pack(e)?, i as u16))));
+            folders.extend(k.folder.map(|f| (f, i as u16)));
+        }
+        // By extension, then list order: dedup keeps the earliest kind.
+        exts.sort_unstable();
+        exts.dedup_by_key(|(e, _)| *e);
+        Kinds {
+            exts,
+            folders,
+            list,
+        }
+    }
+
+    fn get(&self, path: &str) -> Option<&'static Kind> {
+        let by_ext = pack(files::extension(path))
+            .and_then(|e| self.exts.binary_search_by_key(&e, |&(x, _)| x).ok())
+            .map(|i| self.exts[i].1);
+        let by_folder = (self.folders.iter())
+            .find(|(f, _)| path.contains(f))
+            .map(|&(_, i)| i);
+        let i = match (by_ext, by_folder) {
+            (Some(a), Some(b)) => a.min(b),
+            (a, b) => a.or(b)?,
+        };
+        Some(self.list[i as usize])
+    }
+}
+
+/// An extension of up to eight bytes, lower-cased, as one integer; `None`
+/// for longer ones, which no kind has, or none at all.
+fn pack(ext: &str) -> Option<u64> {
+    if ext.is_empty() || ext.len() > 8 {
+        return None;
+    }
+    let mut b = [0u8; 8];
+    b[..ext.len()].copy_from_slice(ext.as_bytes());
+    Some(u64::from_le_bytes(b.map(|c| c.to_ascii_lowercase())))
+}
+
+/// Whether a previewed file offers "Place on an island": a drawn model the
+/// island's Place tool takes (a `.cfg`), in a game that edits islands and
+/// their objects.
+fn offers_place(module: &dyn Module, path: &str, shown: Option<&Content>) -> bool {
+    module.islands().is_some_and(|i| i.places_objects())
+        && module.database().is_some()
+        && files::kind_of(module, path).is_some_and(|k| k.id == files::CFG.id)
+        && matches!(shown, Some(Content::Model { .. }))
+}
+
+/// The workspace that opens `path` in `module`: its kind's view, where the
+/// game has that capability. `None` previews it in Assets.
+pub(crate) fn editor_for(module: &dyn Module, path: &str) -> Option<crate::editor::Workspace> {
+    use crate::editor::Workspace;
+    match files::kind_of(module, path)?.view? {
+        Shows::Island if module.islands().is_some() => Some(Workspace::Island),
+        Shows::Map if module.islands().and_then(|i| i.maps()).is_some() => Some(Workspace::Map),
+        Shows::Screen if module.ui().is_some() => Some(Workspace::Ui),
+        _ => None,
+    }
+}
+
+/// A model's cfg, or a prop's prp: what the Model workspace opens.
+pub(crate) fn is_model(path: &str) -> bool {
+    path.ends_with(".cfg") || path.ends_with(".prp")
 }
 
 /// Image memory the thumbnails may hold; past it the cache starts over.
@@ -162,36 +257,54 @@ struct RowThumbs {
 }
 
 fn decode_thumb(
+    module: &dyn Module,
     install: &Install,
     file: FileId,
     side: u32,
 ) -> (Option<Arc<RenderImage>>, Option<SharedString>, bool) {
+    let path = install.file_path(file);
+    let Some(kind) = files::kind_of(module, &path) else {
+        return (None, None, false);
+    };
     let Some(bytes) = install.read_file(file).ok() else {
         return (None, None, false);
     };
-    let Ok(dds) = texture::Dds::parse(&bytes) else {
-        return (None, None, false);
-    };
-    let size = if dds.width == dds.height {
-        // As the preview writes it, so one size reads one way.
-        format!("{}×{}", dds.width, dds.height)
-    } else {
-        format!("{}×{}", dds.width, dds.height)
-    };
-    let format = match dds.format {
-        texture::Format::Block(b) => format!("{b:?}"),
-        f => format!("{f:?}"),
-    }
-    .to_uppercase();
     let (mut flat, mut light) = (false, false);
-    let image = dds.decode(&bytes, dds.mip_for(side)).ok().map(|mut i| {
-        one_channel_as_grey(dds.format, &mut i.rgba);
-        // A thumbnail only: heights and masks often use a narrow band, and
-        // grey at one level read as an unloaded tile. The preview shows the
-        // true values.
-        if dds.format == texture::Format::Block(texture::Block::Bc4) {
-            flat = !stretch_grey(&mut i.rgba);
+    let (decoded, size, format) = match kind.view {
+        Some(Shows::Texture) => {
+            let Ok(dds) = texture::Dds::parse(&bytes) else {
+                return (None, None, false);
+            };
+            let format = match dds.format {
+                texture::Format::Block(b) => format!("{b:?}"),
+                f => format!("{f:?}"),
+            }
+            .to_uppercase();
+            let decoded = dds.decode(&bytes, dds.mip_for(side)).ok().map(|mut i| {
+                one_channel_as_grey(dds.format, &mut i.rgba);
+                // A thumbnail only: heights and masks often use a narrow
+                // band, and grey at one level read as an unloaded tile. The
+                // preview shows the true values.
+                if dds.format == texture::Format::Block(texture::Block::Bc4) {
+                    flat = !stretch_grey(&mut i.rgba);
+                }
+                i
+            });
+            // As the preview writes it, so one size reads one way.
+            (decoded, format!("{}×{}", dds.width, dds.height), format)
         }
+        // 2070's masks, and cursors.
+        Some(Shows::Picture) => match picture(kind, &bytes) {
+            Ok((i, _)) => {
+                let size = format!("{}×{}", i.width, i.height);
+                let ext = files::extension(&path);
+                (Some(i), size, ext.to_uppercase())
+            }
+            Err(_) => return (None, None, false),
+        },
+        _ => return (None, None, false),
+    };
+    let image = decoded.map(|mut i| {
         light = wants_light(&i.rgba);
         bleed_clear(&mut i.rgba, i.width as usize, i.height as usize);
         // Flattened onto the tile's own backdrop and letterboxed to a square
@@ -332,6 +445,8 @@ pub struct Browser {
     /// it: what lets the tree drop folders a type has nothing in. One
     /// pass over every file, on the first type shown as a tree.
     folder_kinds: Arc<Vec<u8>>,
+    /// The open game's kinds, shared with the list's row closures.
+    kinds: Arc<Kinds>,
     /// Files per type, by `Types as usize`, from the same pass: the Tree
     /// view's footer, as the flat views count theirs.
     kind_counts: [usize; 6],
@@ -365,8 +480,9 @@ impl Browser {
             .map(|e| e as &mut dyn gpui_editor_kit::field::InputBuffer)
     }
 
-    pub fn attach(&mut self, install: &Arc<Install>) {
+    pub fn attach(&mut self, install: &Arc<Install>, module: &dyn Module) {
         self.install = Some(install.clone());
+        self.kinds = Arc::new(Kinds::new(module));
         self.names = None;
         self.folder_kinds = Arc::default();
         self.tree.collapse_all();
@@ -447,29 +563,15 @@ impl Browser {
         if !self.folder_kinds.is_empty() {
             return;
         }
-        const KINDS: [Types; 5] = [
-            Types::Textures,
-            Types::Models,
-            Types::Islands,
-            Types::Ui,
-            Types::Text,
-        ];
         let mut kinds = vec![0u8; 1];
         let mut counts = [0usize; 6];
         for f in (0..install.file_count() as u32).map(FileId) {
-            let path = install.file_path(f);
-            let bits = KINDS
-                .iter()
-                .filter(|t| t.admits(path))
-                .fold(0u8, |b, &t| b | t.bit());
-            if bits == 0 {
+            let Some(kind) = self.kinds.get(&install.file_path(f)) else {
                 continue;
-            }
-            for t in KINDS {
-                if bits & t.bit() != 0 {
-                    counts[t as usize] += 1;
-                }
-            }
+            };
+            let t = Types::of(kind.group);
+            let bits = t.bit();
+            counts[t as usize] += 1;
             let mut folder = Some(install.file_folder(f));
             while let Some(d) = folder {
                 let i = d.0 as usize;
@@ -504,7 +606,7 @@ impl Browser {
             .map(|d| format!("{}/", install.folder_path(d)));
         let shown = |f: FileId| {
             (!self.overrides_only || install.layers(f).len() > 1)
-                && types.admits(install.file_path(f))
+                && types.admits(self.kinds.get(&install.file_path(f)))
                 && prefix
                     .as_deref()
                     .is_none_or(|p| install.file_path(f).starts_with(p))
@@ -599,7 +701,7 @@ impl Browser {
             // A type's tree reveals the pick only when it is one of that
             // type; otherwise the chip would fall back to every file.
             (Some(file), Some(install))
-                if !self.flat() && self.types.admits(install.file_path(file)) =>
+                if !self.flat() && self.types.admits(self.kinds.get(&install.file_path(file))) =>
             {
                 let path = install.file_path(file).to_owned();
                 self.select_path(&path);
@@ -647,7 +749,7 @@ impl Browser {
         // stays when the file is one (the Tree view of a type), else the
         // tree is every file's.
         self.query.clear();
-        if !self.types.admits(path) {
+        if !self.types.admits(self.kinds.get(path)) {
             self.types = Types::All;
         }
         if self.types == Types::All {
@@ -710,7 +812,13 @@ impl Browser {
 /// below it: "3 folders", "9 files" or both.
 /// With a type in the tree, only what holds or is that type, as the rows
 /// under it show; "9 folders" over three shown read as a broken filter.
-fn folder_counts(install: &Install, f: FolderId, types: Types, kinds: &[u8]) -> String {
+fn folder_counts(
+    install: &Install,
+    table: &Kinds,
+    f: FolderId,
+    types: Types,
+    kinds: &[u8],
+) -> String {
     let (folders, files) = if types == Types::All {
         (install.subfolders(f).len(), install.folder_files(f).len())
     } else {
@@ -723,7 +831,7 @@ fn folder_counts(install: &Install, f: FolderId, types: Types, kinds: &[u8]) -> 
                 })
                 .count(),
             (install.folder_files(f).iter())
-                .filter(|&&file| types.admits(install.file_path(file)))
+                .filter(|&&file| types.admits(table.get(&install.file_path(file))))
                 .count(),
         )
     };
@@ -908,19 +1016,6 @@ fn folder_key(node: &Node) -> Option<FolderId> {
     match node {
         Node::Folder(f) => Some(*f),
         Node::File(_) => None,
-    }
-}
-
-fn kind(path: &str) -> &'static str {
-    let ext = path.rsplit('.').next().unwrap_or_default();
-    match ext {
-        "dds" => "texture",
-        "png" | "jpg" | "jpeg" => "image",
-        "a7m" | "a7t" => "island",
-        "cfg" | "rdm" => "model",
-        "a7me" | "a7te" | "xml" | "json" | "txt" | "lua" | "ini" | "fxh" | "hlsl" => "text",
-        _ if path.contains("/ui/studio/generated/") => "ui",
-        _ => "binary",
     }
 }
 
@@ -1176,6 +1271,7 @@ fn stretch_grey(rgba: &mut [u8]) -> bool {
 /// logical, and 1:1 or fitted), so it is enlarged here, texel by texel, to
 /// the whole number of device pixels each texel takes on screen.
 fn load_preview(
+    module: &dyn Module,
     install: &Install,
     file: FileId,
     mip: Option<u32>,
@@ -1196,12 +1292,28 @@ fn load_preview(
         }
     };
     let size = bytes.len();
-    let content = match kind(path) {
-        "texture" => match texture::Dds::parse(&bytes).and_then(|dds| {
-            // The asked-for mip, else the largest within 1024 px.
-            let mip = mip.map_or_else(|| dds.mip_for(1024), |m| m.min(dds.mips - 1));
-            let mut image = dds.decode(&bytes, mip)?;
-            one_channel_as_grey(dds.format, &mut image.rgba);
+    let kind = files::kind_of(module, &path);
+    let content = match kind.and_then(|k| k.view.map(|v| (k, v))) {
+        Some((kind, view @ (Shows::Texture | Shows::Picture))) => match (|| -> anyhow::Result<_> {
+            // The facts in one line, as the list names them; the raw DXGI
+            // code was engine detail beside them.
+            let (mut image, dims, mips, mip, facts) = if view == Shows::Picture {
+                let (image, facts) = picture(kind, &bytes)?;
+                let dims = (image.width, image.height);
+                (image, dims, 1, 0, facts)
+            } else {
+                let dds = texture::Dds::parse(&bytes)?;
+                // The asked-for mip, else the largest within 1024 px.
+                let mip = mip.map_or_else(|| dds.mip_for(1024), |m| m.min(dds.mips - 1));
+                let mut image = dds.decode(&bytes, mip)?;
+                one_channel_as_grey(dds.format, &mut image.rgba);
+                let format = match dds.format {
+                    texture::Format::Block(b) => format!("{b:?}").to_uppercase(),
+                    f => format!("{f:?}"),
+                };
+                let facts = format!("{format} · {} mips", dds.mips);
+                (image, (dds.width, dds.height), dds.mips, mip, facts)
+            };
             channel.apply(&mut image.rgba);
             // Device pixels per texel as drawn: whole, as fit_scale makes
             // them; the GPU's linear sampler then draws square texels, where
@@ -1227,45 +1339,34 @@ fn load_preview(
             } else {
                 image
             };
-            Ok((dds, mip, image, light))
-        }) {
-            Ok((dds, mip, image, light)) => Content::Texture {
+            Ok(Content::Texture {
                 light,
                 image: image.render_image(),
-                mips: dds.mips,
+                mips,
                 mip,
-                dims: (dds.width, dds.height),
-                // The facts in one line, as the list names them; the raw
-                // DXGI code was engine detail beside them.
-                summary: format!(
-                    "{}×{} · {} · {} mips · {}",
-                    dds.width,
-                    dds.height,
-                    match dds.format {
-                        texture::Format::Block(b) => format!("{b:?}").to_uppercase(),
-                        f => format!("{f:?}"),
-                    },
-                    dds.mips,
-                    human(size as u64),
-                ),
-            },
+                dims,
+                summary: format!("{}×{} · {facts} · {}", dims.0, dims.1, human(size as u64)),
+            })
+        })() {
+            Ok(content) => content,
             Err(e) => Content::Error(format!("{e:#}")),
         },
-        "island" => Content::Island,
-        "model" => load_model(install, path, &bytes),
-        "image" => Content::Image(Arc::new(Image::from_bytes(
-            if path.ends_with(".png") {
+        // Without the capability, the file shows as its bytes.
+        Some((_, Shows::Island)) if module.islands().is_some() => Content::Island,
+        Some((_, Shows::Model)) => load_model(module, install, &path, &bytes),
+        Some((kind, Shows::Image)) => Content::Image(Arc::new(Image::from_bytes(
+            if kind.id == "png" {
                 ImageFormat::Png
             } else {
                 ImageFormat::Jpeg
             },
             bytes,
         ))),
-        "ui" => {
+        Some((_, Shows::Screen)) if module.ui().is_some() => {
             Content::UiAsset(String::from_utf8_lossy(&bytes[..bytes.len().min(5)]).into_owned())
         }
-        _ => match text_head(&bytes) {
-            Some(text) => text_content(path, text, size),
+        _ => match readable(&bytes) {
+            Some(text) => text_content(&path, text, size),
             _ => Content::Hex(hex_dump(&bytes[..bytes.len().min(HEX_BYTES)])),
         },
     };
@@ -1276,65 +1377,342 @@ fn load_preview(
     }
 }
 
-/// The `.cfg` an `.rdm` most likely belongs to, and which of its detail
-/// levels the file is: `…/olive_trees/rdm/olive_01_lod2.rdm` is level 2 of
-/// `…/olive_trees/olive_01.cfg`. The game keeps that layout; a cfg named
-/// otherwise is not found and the mesh shows as clay.
-fn owning_cfg(path: &str) -> Option<(String, &str, usize)> {
-    let (dir, file) = path.rsplit_once('/')?;
-    let stem = file.strip_suffix(".rdm")?;
-    let (base, level) = match stem.rsplit_once("_lod") {
-        Some((base, n)) if n.len() == 1 => (base, n.parse().ok()?),
-        _ => (stem, 0),
+/// A picture of `kind` and what it is: the game's own format through the
+/// kind's decoder, else a Windows cursor (`.cur`) or animated one (`.ani`),
+/// of which the first frame shows. Those read through the `image` crate,
+/// which only the shell links.
+fn picture(kind: &Kind, bytes: &[u8]) -> anyhow::Result<(texture::Texture, String)> {
+    use anyhow::{Context, ensure};
+    if let Some(decode) = kind.decode {
+        return decode(bytes);
+    }
+    let cursor = |bytes: &[u8]| -> anyhow::Result<texture::Texture> {
+        let image = image::load_from_memory_with_format(bytes, image::ImageFormat::Ico)?;
+        let image = image.to_rgba8();
+        texture::Texture::from_rgba(image.width(), image.height(), image.into_raw())
     };
-    let mesh = &path[..dir.len() + 1 + base.len()];
+    // A cursor's first directory entry holds its hotspot where an icon's
+    // holds planes and bit depth.
+    let hotspot = |bytes: &[u8]| -> String {
+        let at = |i: usize| {
+            bytes
+                .get(i..i + 2)
+                .map(|b| u16::from_le_bytes([b[0], b[1]]))
+        };
+        match (at(2), at(10), at(12)) {
+            (Some(2), Some(x), Some(y)) => format!("cursor, hotspot {x}, {y}"),
+            _ => "icon".to_owned(),
+        }
+    };
+    match kind.id {
+        "cur" => Ok((cursor(bytes)?, hotspot(bytes))),
+        "ani" => {
+            // RIFF "ACON": a `LIST` of type `fram` holds one `icon` chunk
+            // per frame, each a whole .cur or .ico file.
+            ensure!(
+                bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"ACON",
+                "not an animated cursor"
+            );
+            fn chunks(mut data: &[u8]) -> impl Iterator<Item = ([u8; 4], &[u8])> {
+                std::iter::from_fn(move || {
+                    let id: [u8; 4] = data.get(..4)?.try_into().ok()?;
+                    let len = u32::from_le_bytes(data.get(4..8)?.try_into().ok()?) as usize;
+                    let body = data.get(8..8 + len)?;
+                    // Chunks start on even offsets.
+                    data = data.get(8 + len + (len & 1)..).unwrap_or_default();
+                    Some((id, body))
+                })
+            }
+            let frames: Vec<&[u8]> = chunks(&bytes[12..])
+                .filter(|(id, body)| id == b"LIST" && body.starts_with(b"fram"))
+                .flat_map(|(_, body)| chunks(&body[4..]))
+                .filter(|(id, _)| id == b"icon")
+                .map(|(_, body)| body)
+                .collect();
+            let first = frames.first().context("animated cursor has no frames")?;
+            let facts = format!(
+                "animated {} · {} · first shown",
+                hotspot(first),
+                crate::project::plural(frames.len(), "frame", "frames"),
+            );
+            Ok((cursor(first)?, facts))
+        }
+        _ => anyhow::bail!("no picture decoder for {}", kind.label),
+    }
+}
+
+/// A texture's or picture's texels as PNG: mip `mip` (a texture's; a
+/// picture has one) in `channel`, unenlarged, so what the preview shows is
+/// what a paint program opens. Pixels only: DDS out stays a byte copy
+/// (Extract), since nothing here encodes block formats.
+fn png_of(
+    module: &dyn Module,
+    install: &Install,
+    file: FileId,
+    mip: u32,
+    channel: Channel,
+) -> anyhow::Result<Vec<u8>> {
+    use anyhow::Context;
+    let path = install.file_path(file);
+    let kind = files::kind_of(module, &path);
+    let bytes = install.read_file(file)?;
+    let mut image = match (kind, kind.and_then(|k| k.view)) {
+        (_, Some(Shows::Texture)) => {
+            let dds = texture::Dds::parse(&bytes)?;
+            let mut image = dds.decode(&bytes, mip.min(dds.mips - 1))?;
+            one_channel_as_grey(dds.format, &mut image.rgba);
+            image
+        }
+        (Some(kind), Some(Shows::Picture)) => picture(kind, &bytes)?.0,
+        _ => anyhow::bail!("{path} is not a texture or picture"),
+    };
+    channel.apply(&mut image.rgba);
+    let (w, h) = (image.width, image.height);
+    let image = image::RgbaImage::from_raw(w, h, image.rgba).context("texels short of the size")?;
+    let mut png = std::io::Cursor::new(Vec::new());
+    image.write_to(&mut png, image::ImageFormat::Png)?;
+    Ok(png.into_inner())
+}
+
+/// The drawn parts (mesh and its place in model space) as one binary glTF:
+/// positions, normals and UVs, one mesh per part, baked into model space
+/// and mirrored on X into glTF's right-handed frame (Anno's models are
+/// left-handed; the winding flips with them). Geometry only: no materials,
+/// textures, levels or animation.
+fn glb_of(parts: &[(Arc<Mesh>, Mat4)]) -> anyhow::Result<Vec<u8>> {
+    use serde_json::{Value, json};
+    let mut bin: Vec<u8> = Vec::new();
+    let (mut views, mut accessors, mut meshes, mut nodes) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    // A buffer view and its accessor over `bytes` (4-aligned: f32 and u32).
+    let mut push = |bytes: &[u8], count: usize, ty: &str, component: u32, extra: Value| {
+        let view = json!({"buffer": 0, "byteOffset": bin.len(), "byteLength": bytes.len()});
+        bin.extend_from_slice(bytes);
+        views.push(view);
+        let mut accessor = json!({"bufferView": views.len() - 1, "count": count, "type": ty, "componentType": component});
+        if let (Value::Object(a), Value::Object(e)) = (&mut accessor, extra) {
+            a.extend(e);
+        }
+        accessors.push(accessor);
+        accessors.len() - 1
+    };
+    const FLOAT: u32 = 5126;
+    const UINT: u32 = 5125;
+    for (mesh, local) in parts {
+        // Decoded: loaded meshes keep their geometry packed (`compact`).
+        let data = mesh.geometry();
+        if data.indices.is_empty() {
+            continue;
+        }
+        let mirror = |v: Vec3| [-v[0], v[1], v[2]];
+        let positions: Vec<Vec3> = (data.positions.iter())
+            .map(|&p| mirror(math::transform(local, p)))
+            .collect();
+        let [lo, hi] = math::bounds(positions.iter().copied());
+        let floats = |v: &[f32]| v.iter().flat_map(|f| f.to_le_bytes()).collect::<Vec<u8>>();
+        let mut attributes = serde_json::Map::new();
+        let at = push(
+            &floats(positions.as_flattened()),
+            positions.len(),
+            "VEC3",
+            FLOAT,
+            json!({"min": lo, "max": hi}),
+        );
+        attributes.insert("POSITION".into(), at.into());
+        if data.normals.len() == positions.len() {
+            // Directions: the matrix without its translation.
+            let turn =
+                |n: Vec3| math::sub(math::transform(local, n), math::transform(local, [0.; 3]));
+            let normals: Vec<Vec3> = (data.normals.iter())
+                .map(|&n| mirror(math::normalize(turn(n)).unwrap_or([0., 1., 0.])))
+                .collect();
+            let at = push(
+                &floats(normals.as_flattened()),
+                normals.len(),
+                "VEC3",
+                FLOAT,
+                json!({}),
+            );
+            attributes.insert("NORMAL".into(), at.into());
+        }
+        if data.uvs.len() == positions.len() {
+            let at = push(
+                &floats(data.uvs.as_flattened()),
+                data.uvs.len(),
+                "VEC2",
+                FLOAT,
+                json!({}),
+            );
+            attributes.insert("TEXCOORD_0".into(), at.into());
+        }
+        let indices: Vec<u8> = (data.indices.as_chunks::<3>().0.iter())
+            .flat_map(|&[a, b, c]| [a, c, b])
+            .flat_map(u32::to_le_bytes)
+            .collect();
+        let at = push(
+            &indices,
+            data.indices.len() / 3 * 3,
+            "SCALAR",
+            UINT,
+            json!({}),
+        );
+        meshes.push(json!({"primitives": [{"attributes": attributes, "indices": at, "mode": 4}]}));
+        nodes.push(json!({"mesh": meshes.len() - 1}));
+    }
+    anyhow::ensure!(!meshes.is_empty(), "nothing to export");
+    let doc = json!({
+        "asset": {"version": "2.0", "generator": "Anno editor"},
+        "scene": 0,
+        "scenes": [{"nodes": (0..nodes.len()).collect::<Vec<_>>()}],
+        "nodes": nodes,
+        "meshes": meshes,
+        "accessors": accessors,
+        "bufferViews": views,
+        "buffers": [{"byteLength": bin.len()}],
+    });
+    let mut text = serde_json::to_vec(&doc)?;
+    // Chunks are 4-aligned: JSON pads with spaces, the binary with zeros.
+    text.resize(text.len().next_multiple_of(4), b' ');
+    bin.resize(bin.len().next_multiple_of(4), 0);
+    let total = 12 + 8 + text.len() + 8 + bin.len();
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(b"glTF");
+    out.extend_from_slice(&2u32.to_le_bytes());
+    out.extend_from_slice(&u32::try_from(total)?.to_le_bytes());
+    for (chunk, kind) in [(&text, b"JSON"), (&bin, b"BIN\0")] {
+        out.extend_from_slice(&(chunk.len() as u32).to_le_bytes());
+        out.extend_from_slice(kind);
+        out.extend_from_slice(chunk);
+    }
+    Ok(out)
+}
+
+/// Where a PNG export of `path` goes under the extract folder: beside the
+/// extracted original, named for the mip and channel when not the first
+/// and all of them, so exports of one texture don't overwrite each other.
+fn png_name(path: &str, mip: u32, channel: Channel) -> String {
+    let mut name = path.to_owned();
+    if mip > 0 {
+        name += &format!(".mip{mip}");
+    }
+    name += match channel {
+        Channel::Rgb => "",
+        Channel::R => ".r",
+        Channel::G => ".g",
+        Channel::B => ".b",
+        Channel::A => ".a",
+    };
+    name + ".png"
+}
+
+/// The `.cfg` files that may draw an `.rdm`, likeliest first: the one named
+/// after its family beside its `rdm/` folder (`…/olive_trees/rdm/
+/// olive_01_lod2.rdm` → `…/olive_trees/olive_01.cfg`), then that folder's
+/// other cfgs, which is where a part of a several-part model finds its
+/// owner (2070's `…_podest_lod0.rdm`).
+fn owning_cfgs(install: &Install, path: &str) -> Vec<String> {
+    let Some((dir, _)) = path.rsplit_once('/') else {
+        return Vec::new();
+    };
+    let family = files::mesh_stem(path);
+    let name = &family[dir.len() + 1..];
     let dir = dir.strip_suffix("/rdm").unwrap_or(dir);
-    Some((format!("{dir}/{base}.cfg"), mesh, level))
+    let mut cfgs = vec![format!("{dir}/{name}.cfg")];
+    let others = install.list(dir).into_iter();
+    let others = others.filter(|p| p.ends_with(".cfg") && *p != cfgs[0]);
+    // A folder of hundreds of props would parse each; the owner is almost
+    // always the first.
+    let others: Vec<String> = others.take(64).collect();
+    cfgs.extend(others);
+    cfgs
+}
+
+/// A file dragged out of the Asset browser, by virtual path.
+#[derive(Clone, Debug)]
+pub struct AssetDrag(pub String);
+
+impl Editor {
+    /// The picture of the texture at `path` as the browser's rows show it,
+    /// asked for when not decoded yet (it arrives on a later frame).
+    pub(crate) fn texture_thumb(
+        &self,
+        path: &str,
+        cx: &mut Context<Self>,
+    ) -> Option<Arc<RenderImage>> {
+        let f = self.install.as_ref()?.file(path)?;
+        let mut t = self.browser.thumbs.borrow_mut();
+        if let Some(image) = t.done.get(&f) {
+            return image.clone();
+        }
+        t.wanted.push(f);
+        drop(t);
+        self.poll_row_thumbs(cx);
+        None
+    }
+}
+
+/// The look the model preview draws `module`'s models in, its meshes in
+/// the families the model view then draws with: the game's own (2070's
+/// building family, 117's and 1800's a7m model family), glowing by the
+/// look's strength.
+fn preview_look(module: &dyn Module) -> files::ModelLook {
+    module.model_look()
 }
 
 /// A `.cfg` as the island draws it, textured, nested props and all. A bare
-/// `.rdm` borrows the materials of the `.cfg` that uses it, else shows as
-/// grey clay. A `.cfg` that is not a model shows as text.
-fn load_model(install: &Install, path: &str, bytes: &[u8]) -> Content {
-    let text = || text_head(bytes);
+/// `.rdm` borrows the materials of the `.cfg` part it is a level of, else
+/// shows as grey clay. A `.cfg` that is not a model shows as text.
+fn load_model(module: &dyn Module, install: &Install, path: &str, bytes: &[u8]) -> Content {
+    let text = || readable(bytes);
+    let cache = crate::island::models::Cache::new(&preview_look(module));
     let mut borrowed = None;
     let parts: Vec<(Arc<Mesh>, Mat4)> = if path.ends_with(".rdm") {
-        // The owning cfg's pieces drawn from this file: the full mesh, or
-        // the shipped level the file is. Levels the renderer keeps no room
-        // for (a tree's lod3) show as clay.
-        let textured: Vec<_> = owning_cfg(path)
-            .and_then(|(cfg, mesh, level)| {
-                let pieces =
-                    crate::island::models::load(install, &Default::default(), &cfg, 1.).ok()?;
-                let parts: Vec<_> = pieces
+        let rdm = match anno_formats::rdm::Rdm::parse(bytes) {
+            Ok(rdm) => rdm,
+            Err(e) => return Content::Error(format!("{e:#}")),
+        };
+        // The owner's part with this file as its mesh: the full mesh or
+        // any shipped level, each drawn with the part's materials.
+        let family = files::mesh_stem(path);
+        // A parse, not the kind's `deps`: those also name animation meshes,
+        // and skip a mesh whose name has a space (`wooden _beam_ornament`).
+        let owner = owning_cfgs(install, path).into_iter().find_map(|cfg| {
+            let parsed = Model::parse(&install.read(&cfg).ok()?).ok()?;
+            (parsed.parts.iter())
+                .any(|p| files::mesh_stem(&p.rdm) == family)
+                .then_some(cfg)
+        });
+        let textured = owner.and_then(|cfg| {
+            let mut model = Model::load(install, &cfg).ok()?;
+            let part = (model.parts.drain(..)).find(|p| files::mesh_stem(&p.rdm) == family)?;
+            model.parts.push(anno_formats::model::Part {
+                rdm: path.to_owned(),
+                mesh: Some(rdm.clone()),
+                ..part
+            });
+            model.props.clear();
+            model.decals.clear();
+            let pieces = crate::island::models::build(install, &cache, &model, 1., false);
+            borrowed = Some(cfg);
+            Some(
+                pieces
                     .into_iter()
-                    .filter(|p| {
-                        let stem = p.rdm.strip_suffix(".rdm").unwrap_or(&p.rdm);
-                        stem.strip_suffix("_lod0").unwrap_or(stem) == mesh
-                    })
-                    .filter_map(|p| match level {
-                        0 => Some((p.mesh, p.local)),
-                        k => p.lods.get(k - 1).map(|m| (m.clone(), p.local)),
-                    })
-                    .collect();
-                borrowed = Some(cfg);
-                Some(parts)
-            })
-            .unwrap_or_default();
-        if textured.is_empty() {
-            borrowed = None;
-            match anno_formats::rdm::Rdm::parse(bytes) {
-                Ok(rdm) => clay(&rdm)
+                    .map(|p| (p.mesh, p.local))
+                    .collect::<Vec<_>>(),
+            )
+        });
+        match textured {
+            Some(parts) if !parts.is_empty() => parts,
+            _ => {
+                borrowed = None;
+                clay(&rdm)
                     .into_iter()
                     .map(|m| (m, math::IDENTITY))
-                    .collect(),
-                Err(e) => return Content::Error(format!("{e:#}")),
+                    .collect()
             }
-        } else {
-            textured
         }
     } else {
-        match crate::island::models::load(install, &Default::default(), path, 1.) {
+        match crate::island::models::load(install, &cache, path, 1.) {
             Ok(pieces) => pieces.into_iter().map(|p| (p.mesh, p.local)).collect(),
             Err(_) => Vec::new(),
         }
@@ -1377,7 +1755,7 @@ fn load_model(install: &Install, path: &str, bytes: &[u8]) -> Content {
         parts,
         source: text()
             .filter(|_| path.ends_with(".cfg"))
-            .map(|t| Arc::new(Code::new(t, Language::Xml))),
+            .map(|t| Arc::new(Code::new(&t.text, Language::Xml))),
     }
 }
 
@@ -1396,22 +1774,134 @@ fn clay(rdm: &anno_formats::rdm::Rdm) -> Option<Arc<Mesh>> {
     Mesh::compact(data).ok().map(Arc::new)
 }
 
-/// The first `TEXT_BYTES` as text, a character cut at the end dropped;
-/// `None` for binary (invalid UTF-8 or a NUL).
-fn text_head(bytes: &[u8]) -> Option<&str> {
-    let head = &bytes[..bytes.len().min(TEXT_BYTES)];
-    let text = match std::str::from_utf8(head) {
-        Ok(t) => t,
-        // Cut inside a character at the end: the rest is fine.
-        Err(e) if e.error_len().is_none() => std::str::from_utf8(&head[..e.valid_up_to()]).ok()?,
-        Err(_) => return None,
-    };
-    (!text.contains('\0')).then_some(text)
+/// A file's head decoded for the text view, and how.
+struct Readable<'a> {
+    text: Cow<'a, str>,
+    /// What the view shows differently from the bytes, for the summary.
+    note: Option<&'static str>,
 }
 
-fn text_content(path: &str, text: &str, size: usize) -> Content {
-    let language = Language::guess(path, text);
-    let code = Code::new(text, language);
+/// The first `TEXT_BYTES` as text, a character cut at the end dropped;
+/// `None` for binary. UTF-8 as is; UTF-16 by its byte order mark (2070's
+/// loca files); anything else past ASCII as Windows-1252 (2070's German
+/// comments in scripts and shaders). Binary values 2070's serializer
+/// writes into XML (`CDATA[<u32 length><bytes>]`: islands, AI layouts,
+/// scenario maps, 2070 and 1800 `.fc` files) show as their numbers.
+fn readable(bytes: &[u8]) -> Option<Readable<'_>> {
+    let head = &bytes[..bytes.len().min(TEXT_BYTES)];
+    if let Some(units) = head.strip_prefix(b"\xff\xfe") {
+        let units = units
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&c| u16::from_le_bytes(c));
+        let text: String = char::decode_utf16(units)
+            .map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER))
+            .collect();
+        return (!text.contains('\0')).then_some(Readable {
+            text: Cow::Owned(text),
+            note: None,
+        });
+    }
+    let (head, blobs) = match cdata_values(head) {
+        Some(text) => (Cow::Owned(text), true),
+        None => (Cow::Borrowed(head), false),
+    };
+    let binary = |b: &[u8]| {
+        let control = b
+            .iter()
+            .filter(|&&c| c < 0x20 && !b"\t\n\r\x0c".contains(&c));
+        b.contains(&0) || control.count() * 100 > b.len()
+    };
+    if binary(&head) {
+        return None;
+    }
+    let text = match head {
+        Cow::Borrowed(b) => match std::str::from_utf8(b) {
+            Ok(t) => Some(Cow::Borrowed(t)),
+            // Cut inside a character at the end: the rest is fine.
+            Err(e) if e.error_len().is_none() => std::str::from_utf8(&b[..e.valid_up_to()])
+                .ok()
+                .map(Cow::Borrowed),
+            Err(_) => None,
+        },
+        Cow::Owned(b) => String::from_utf8(b).ok().map(Cow::Owned),
+    };
+    Some(match text {
+        Some(text) => Readable {
+            text,
+            note: blobs.then_some("binary values shown as numbers"),
+        },
+        None => Readable {
+            text: Cow::Owned(windows_1252(&bytes[..bytes.len().min(TEXT_BYTES)])),
+            note: Some("Windows-1252"),
+        },
+    })
+}
+
+/// `bytes` with each of the serializer's `>CDATA[<u32 length><bytes>]`
+/// blobs written out as numbers; `None` when there are none. Up to 16
+/// words show as floats when every one is a plausible float (positions,
+/// 1800's dummies), else as signed integers (2070's fixed point, 4096 to
+/// the metre); longer blobs (grids) show their size and first bytes.
+fn cdata_values(bytes: &[u8]) -> Option<Vec<u8>> {
+    const OPEN: &[u8] = b">CDATA[";
+    let mut out = Vec::new();
+    let mut at = 0;
+    let mut found = false;
+    while let Some(i) = bytes[at..].windows(OPEN.len()).position(|w| w == OPEN) {
+        let start = at + i + OPEN.len();
+        let blob = (bytes.get(start..start + 4))
+            .map(|n| u32::from_le_bytes([n[0], n[1], n[2], n[3]]) as usize)
+            .and_then(|n| Some((n, bytes.get(start + 4..start + 4 + n)?)))
+            .filter(|(n, _)| bytes.get(start + 4 + n) == Some(&b']'));
+        out.extend_from_slice(&bytes[at..start]);
+        at = start;
+        let Some((n, blob)) = blob else { continue };
+        found = true;
+        at = start + 4 + n;
+        let words = blob.as_chunks::<4>().0;
+        let floats = words.iter().map(|w| f32::from_le_bytes(*w));
+        let plausible = |v: f32| v == 0. || (v.is_finite() && (1e-4..1e7).contains(&v.abs()));
+        let shown = if n % 4 == 0 && n <= 64 && n > 0 && floats.clone().all(plausible) {
+            floats.map(|v| v.to_string()).collect::<Vec<_>>().join(" ")
+        } else if n % 4 == 0 && n <= 64 {
+            (words.iter().map(|w| i32::from_le_bytes(*w).to_string()))
+                .collect::<Vec<_>>()
+                .join(" ")
+        } else {
+            let hex: Vec<String> = blob.iter().take(16).map(|b| format!("{b:02x}")).collect();
+            let more = if n > 16 { " …" } else { "" };
+            format!(
+                "{} bytes: {}{more}",
+                crate::project::count(n),
+                hex.join(" ")
+            )
+        };
+        out.extend_from_slice(shown.as_bytes());
+    }
+    out.extend_from_slice(&bytes[at..]);
+    found.then_some(out)
+}
+
+/// Windows-1252, which differs from Latin-1 in 0x80..0x9f.
+fn windows_1252(bytes: &[u8]) -> String {
+    const HIGH: [char; 32] = [
+        '€', '\u{81}', '‚', 'ƒ', '„', '…', '†', '‡', 'ˆ', '‰', 'Š', '‹', 'Œ', '\u{8d}', 'Ž',
+        '\u{8f}', '\u{90}', '‘', '’', '“', '”', '•', '–', '—', '˜', '™', 'š', '›', 'œ', '\u{9d}',
+        'ž', 'Ÿ',
+    ];
+    (bytes.iter())
+        .map(|&b| match b {
+            0x80..=0x9f => HIGH[b as usize - 0x80],
+            _ => b as char,
+        })
+        .collect()
+}
+
+fn text_content(path: &str, text: Readable, size: usize) -> Content {
+    let language = Language::guess(path, &text.text);
+    let code = Code::new(&text.text, language);
     let mut summary = format!(
         "{}{}",
         match language {
@@ -1426,12 +1916,15 @@ fn text_content(path: &str, text: &str, size: usize) -> Content {
             n => format!("{} lines", crate::project::count(n)),
         },
     );
-    if size > text.len() {
+    if size > TEXT_BYTES {
         summary += &format!(
             " · first {} of {}",
-            human(text.len() as u64),
+            human(TEXT_BYTES as u64),
             human(size as u64)
         );
+    }
+    if let Some(note) = text.note {
+        summary += &format!(" · {note}");
     }
     // The view looks like an editor; edits start with Extract, said where
     // the reader is looking. Use in mod is named once it is on screen.
@@ -1466,6 +1959,34 @@ fn hex_dump(bytes: &[u8]) -> String {
 }
 
 impl Editor {
+    /// Sorts every file by name off the UI thread, ~60 ms for 440k files,
+    /// so the first search or filter does not wait for it. One asked for
+    /// before this lands sorts on the spot, as before.
+    pub(crate) fn order_names(&mut self, cx: &mut Context<Self>) {
+        let Some(install) = self.browser.install.clone() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let names = cx
+                .background_spawn({
+                    let install = install.clone();
+                    async move { NameOrder::new(&install) }
+                })
+                .await;
+            this.update(cx, |this, _| {
+                let b = &mut this.browser;
+                // Another install attached meanwhile, or a list sorted first.
+                let same = b.install.as_ref().is_some_and(|i| Arc::ptr_eq(i, &install));
+                if !same || b.names.is_some() {
+                    return;
+                }
+                b.names = Some(names);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     pub fn browser_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
         let (used, file) = self.browser.key_down(event, cx);
         if let Some(file) = file {
@@ -1569,10 +2090,13 @@ impl Editor {
         );
         self.browser.generation += 1;
         let generation = self.browser.generation;
+        let module = self.module;
         cx.spawn(async move |this, cx| {
             let preview = cx
                 .background_executor()
-                .spawn(async move { load_preview(&install, file, mip, channel, dpr, native) })
+                .spawn(
+                    async move { load_preview(module, &install, file, mip, channel, dpr, native) },
+                )
                 .await;
             this.update(cx, |this, cx| {
                 if this.browser.generation != generation {
@@ -1583,8 +2107,17 @@ impl Editor {
                 }
                 let mut preview = preview;
                 if let Content::Model { parts, .. } = &mut preview.content {
+                    // By day, in the game's first player colour, in the
+                    // families the look's meshes draw in.
+                    let look = preview_look(&*this.module);
+                    let families = look.families();
+                    if !Arc::ptr_eq(&this.browser.model.families(), &families) {
+                        this.browser.model = ModelView::with_families(families);
+                    }
+                    this.browser.model.glow = look.glow(&look.scene_glow());
                     // Anno's models are left-handed, as the island views.
-                    this.browser.model.show(std::mem::take(parts), true);
+                    // The preview keeps its parts for glTF export.
+                    this.browser.model.show(parts.clone(), true);
                 }
                 if let Some(Preview {
                     content: Content::Texture { image, .. },
@@ -1600,16 +2133,17 @@ impl Editor {
         .detach();
     }
 
-    fn open_selected(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn open_selected(&mut self, cx: &mut Context<Self>) {
         let (Some(install), Some(file)) = (self.install.clone(), self.browser.selected) else {
             return;
         };
         let path = install.file_path(file).to_owned();
-        match kind(&path) {
-            "island" => self.open_island(&path, cx),
-            "ui" => self.open_ui_asset(&path, cx),
-            // Nothing else has an editor; the preview is the view.
-            _ => {}
+        // Islands, maps, screens and models open in their workspace,
+        // through the one dispatch every Open uses; nothing else has an
+        // editor, and the preview is the view.
+        let model = is_model(&path) && self.supports(crate::editor::Workspace::Model);
+        if model || editor_for(self.module, &path).is_some() {
+            self.open_path(&path, cx);
         }
     }
 
@@ -1644,6 +2178,54 @@ impl Editor {
                 self.browser.extracted = Some((file, target));
             }
             Err(e) => self.message(format!("Extract failed: {e:#}"), true),
+        }
+    }
+
+    /// Writes the shown texture or picture, at its mip and channel, as a
+    /// PNG under the extract folder. A re-export overwrites: the PNG is
+    /// derived, not a copy someone edits in place of the original.
+    fn export_png(&mut self) {
+        let (Some(install), Some(file)) = (self.install.clone(), self.browser.selected) else {
+            return;
+        };
+        let Some(Content::Texture { mip, .. }) = self.browser.preview.as_ref().map(|p| &p.content)
+        else {
+            return;
+        };
+        let channel = self.browser.channel;
+        let path = install.file_path(file);
+        let target = (self.config.join("extracted")).join(png_name(&path, *mip, channel));
+        let result = png_of(self.module, &install, file, *mip, channel).and_then(|png| {
+            std::fs::create_dir_all(target.parent().expect("extracted paths have a parent"))?;
+            std::fs::write(&target, png)?;
+            Ok(())
+        });
+        match result {
+            Ok(()) => self.message(format!("Exported to {}", target.display()), false),
+            Err(e) => self.message(format!("PNG export failed: {e:#}"), true),
+        }
+    }
+
+    /// Writes the shown model's drawn parts as `<path>.glb` under the
+    /// extract folder (`glb_of`), overwriting an earlier export.
+    fn export_gltf(&mut self) {
+        let (Some(install), Some(file)) = (self.install.clone(), self.browser.selected) else {
+            return;
+        };
+        let Some(Content::Model { parts, .. }) = self.browser.preview.as_ref().map(|p| &p.content)
+        else {
+            return;
+        };
+        let path = install.file_path(file);
+        let target = (self.config.join("extracted")).join(format!("{path}.glb"));
+        let result = glb_of(parts).and_then(|glb| {
+            std::fs::create_dir_all(target.parent().expect("extracted paths have a parent"))?;
+            std::fs::write(&target, glb)?;
+            Ok(())
+        });
+        match result {
+            Ok(()) => self.message(format!("Exported to {}", target.display()), false),
+            Err(e) => self.message(format!("glTF export failed: {e:#}"), true),
         }
     }
 
@@ -1728,6 +2310,7 @@ impl Editor {
             thumbs.borrow_mut().polling = false;
             return;
         };
+        let module = self.module;
         cx.spawn(async move |this, cx| {
             let mut idle = 0;
             while idle < 30 {
@@ -1750,11 +2333,14 @@ impl Editor {
                 }
                 idle = 0;
                 let install = install.clone();
+                // Across cores: 44 diffuse maps took 18 ms one after
+                // another (45 ms cold), 7 ms in parallel.
                 let decoded = cx
                     .background_spawn(async move {
+                        use rayon::prelude::*;
                         batch
-                            .into_iter()
-                            .map(|f| (f, decode_thumb(&install, f, side)))
+                            .into_par_iter()
+                            .map(|f| (f, decode_thumb(module, &install, f, side)))
                             .collect::<Vec<_>>()
                     })
                     .await;
@@ -2062,21 +2648,24 @@ impl Editor {
         let searching = b.flat();
         let list_install = install.clone();
         let (list_types, list_kinds) = (b.types, b.folder_kinds.clone());
+        let list_table = b.kinds.clone();
         let info_thumbs = b.thumbs.clone();
         let click_rows = rows.clone();
         // A mark per row for what it is, matching the type filter.
         let glyph_rows = rows.clone();
-        let glyph_install = install.clone();
+        let (glyph_install, glyph_kinds) = (install.clone(), b.kinds.clone());
         let (note_rows, note_install) = (rows.clone(), install.clone());
         // Texture rows in a flat list carry their picture: sibling textures
         // share names and sizes, and only the image tells them apart.
         let pictures = searching && b.types == Types::Textures;
         let (thumb_rows, thumb_install, thumbs) = (rows.clone(), install.clone(), b.thumbs.clone());
+        let thumb_kinds = b.kinds.clone();
         let picture = std::rc::Rc::new(move |i: usize| -> Option<Arc<RenderImage>> {
             let Node::File(f) = thumb_rows[i].node else {
                 return None;
             };
-            if !pictures || !thumb_install.file_path(f).ends_with(".dds") {
+            let view = (thumb_kinds.get(&thumb_install.file_path(f))).and_then(|k| k.view);
+            if !pictures || !matches!(view, Some(Shows::Texture | Shows::Picture)) {
                 return None;
             }
             let mut t = thumbs.borrow_mut();
@@ -2119,7 +2708,8 @@ impl Editor {
                     .take(400)
                     .filter_map(|r| match r.node {
                         Node::File(f) => {
-                            let dir = install.file_path(f).rsplit_once('/')?.0;
+                            let dir = install.folder_path(install.file_folder(f));
+                            let dir = Some(dir).filter(|d| !d.is_empty())?;
                             let mut parts = dir.rsplitn(3, '/');
                             let (last, parent) = (parts.next()?, parts.next().unwrap_or(""));
                             // A same-named neighbour's note starts at the
@@ -2432,7 +3022,7 @@ impl Editor {
                         // Medium and large tiles have the room for what a
                         // replacement must match, after the folder.
                         detail: {
-                            let folder = cut_middle(&tile_note(path), "", &tile_room);
+                            let folder = cut_middle(&tile_note(&path), "", &tile_room);
                             match (large_tiles, grid_info.borrow().info.get(&f)) {
                                 (true, Some(info)) => format!("{folder} · {info}").into(),
                                 _ => folder.into(),
@@ -2445,7 +3035,7 @@ impl Editor {
                             match grid_info.borrow().info.get(&f) {
                                 Some(info) => format!(
                                     "{info} · {}\n{path}",
-                                    human(grid_install.winner(f).raw_size)
+                                    human(grid_install.winner(f).raw_size.into())
                                 ),
                                 None => path.to_owned(),
                             }
@@ -2512,7 +3102,7 @@ impl Editor {
                         },
                         // Direct contents, split so "12" is not read as the
                         // files below it.
-                        folder_counts(&list_install, f, list_types, &list_kinds),
+                        folder_counts(&list_install, &list_table, f, list_types, &list_kinds),
                         folder == Some(f),
                     ),
                     // The name whole in a flat list too, its folder muted
@@ -2553,7 +3143,7 @@ impl Editor {
                                     .get(&f)
                                     .map_or_else(|| "…".to_owned(), |i| i.to_string())
                             };
-                            let size = || human(list_install.winner(f).raw_size);
+                            let size = || human(list_install.winner(f).raw_size.into());
                             if show_pixels {
                                 format!("{}\t{}", info(), size())
                             } else if pictures {
@@ -2597,7 +3187,8 @@ impl Editor {
                             }
                             _ => None,
                         });
-                    folder_note(note_install.file_path(f), &note_room, twin).map(SharedString::from)
+                    folder_note(&note_install.file_path(f), &note_room, twin.as_deref())
+                        .map(SharedString::from)
                 }
                 _ => None,
             },
@@ -2606,6 +3197,13 @@ impl Editor {
         // is cut; a patched file says what its ◆ means.
         .decorate(move |i, row| match tip_rows[i].node {
             Node::File(f) => {
+                // Files drag into the Model workspace: a prop or effect onto
+                // the model, any file onto a path field.
+                let path = tip_install.file_path(f);
+                let name: SharedString = path.rsplit('/').next().unwrap_or(&path).to_owned().into();
+                let row = row.on_drag(AssetDrag(path), move |_, _, _, cx| {
+                    cx.new(|_| widgets::DragLabel(name.clone()))
+                });
                 let patched = tip_install.layers(f).len() > 1;
                 if !searching && !patched {
                     return row;
@@ -2665,14 +3263,16 @@ impl Editor {
             Some(match glyph_rows[i].node {
                 Node::Folder(_) => Icon::FOLDER,
                 Node::File(f) => {
-                    let path = glyph_install.file_path(f);
-                    match kind(path) {
-                        "texture" | "image" => Icon::IMAGE,
-                        "island" => Icon::ISLAND,
-                        "ui" => Icon::LAYOUT,
-                        _ if Types::Models.admits(path) => Icon::CUBE,
-                        "text" => Icon::TEXT,
-                        _ => Icon::FILE,
+                    match glyph_kinds
+                        .get(&glyph_install.file_path(f))
+                        .map(|k| k.group)
+                    {
+                        Some(Group::Textures) => Icon::IMAGE,
+                        Some(Group::Islands) => Icon::ISLAND,
+                        Some(Group::Ui) => Icon::LAYOUT,
+                        Some(Group::Models) => Icon::CUBE,
+                        Some(Group::Text) => Icon::TEXT,
+                        None => Icon::FILE,
                     }
                 }
             })
@@ -2785,8 +3385,8 @@ impl Editor {
         let mut kinds: Vec<(&'static str, usize)> = Vec::new();
         let mut bytes = 0u64;
         for &f in files {
-            bytes += install.winner(f).raw_size;
-            let k = kind(install.file_path(f));
+            bytes += u64::from(install.winner(f).raw_size);
+            let k = (self.browser.kinds.get(&install.file_path(f))).map_or("other", |k| k.label);
             match kinds.iter_mut().find(|(name, _)| *name == k) {
                 Some((_, n)) => *n += 1,
                 None => kinds.push((k, 1)),
@@ -2835,7 +3435,7 @@ impl Editor {
                 let label = install.folder_name(sub).to_owned();
                 // As the tree counts it: "0 files" on a folder of folders
                 // read as empty.
-                let detail = folder_counts(install, sub, Types::All, &[]);
+                let detail = folder_counts(install, &self.browser.kinds, sub, Types::All, &[]);
                 body = body.child(
                     div()
                         .id(("folder-summary-sub", n))
@@ -2913,7 +3513,28 @@ impl Editor {
                 // Only where such files are listed.
                 .when(
                     matches!(types, Types::All | Types::Islands | Types::Ui),
-                    |d| d.child(hint("Islands and UI screens open in their editors.")),
+                    |d| {
+                        // Only the kinds this game has an editor for.
+                        let mut kinds = Vec::new();
+                        if self.module.islands().is_some() {
+                            kinds.push("Islands");
+                        }
+                        if self.maps().is_some() {
+                            kinds.push("maps");
+                        }
+                        if self.module.ui().is_some() {
+                            kinds.push("UI screens");
+                        }
+                        // "Islands" or "UI screens" leads, capitalised.
+                        let said = match kinds.as_slice() {
+                            [] => String::new(),
+                            [one] => format!("{one} open in their editor."),
+                            [rest @ .., last] => {
+                                format!("{} and {last} open in their editors.", rest.join(", "))
+                            }
+                        };
+                        d.when(!said.is_empty(), |d| d.child(hint(said)))
+                    },
                 )
                 // Where a replacement goes, before the first one.
                 .child(hint(format!(
@@ -2960,6 +3581,11 @@ impl Editor {
                 .into_any_element();
         };
         let path = install.file_path(file).to_owned();
+        let place = offers_place(
+            self.module,
+            &path,
+            self.browser.preview.as_ref().map(|p| &p.content),
+        );
         let layers = install.layers(file);
         let mut body = div()
             .id("preview")
@@ -2997,9 +3623,10 @@ impl Editor {
                             // it there (or on the next island opened), as the
                             // Library's cards do.
                             .when_some(
-                                match kind(&path) {
-                                    "island" => Some("Open in Island editor"),
-                                    "ui" => Some("Open in UI editor"),
+                                match editor_for(self.module, &path) {
+                                    Some(crate::editor::Workspace::Island) => Some("Open in Island editor"),
+                                    Some(crate::editor::Workspace::Map) => Some("Open in Map editor"),
+                                    Some(crate::editor::Workspace::Ui) => Some("Open in UI editor"),
                                     _ => None,
                                 },
                                 |d, label| {
@@ -3070,7 +3697,7 @@ impl Editor {
                                     // model's Place, text's Extract.
                                     if match self.browser.preview.as_ref().map(|p| &p.content) {
                                         Some(Content::Text { .. }) => true,
-                                        Some(Content::Model { .. }) => path.ends_with(".cfg"),
+                                        Some(Content::Model { .. }) => place,
                                         _ => false,
                                     } {
                                         widgets::Tone::Secondary
@@ -3083,7 +3710,7 @@ impl Editor {
                                     }));
                                 d.child(extract).child(replace)
                             })
-                            .when(path.ends_with(".cfg") && matches!(self.browser.preview.as_ref().map(|p| &p.content), Some(Content::Model { .. })), |d| {
+                            .when(place, |d| {
                                 let cfg = path.clone();
                                 let open = self.island.is_some();
                                 // Named for the island it lands on; with none
@@ -3091,7 +3718,7 @@ impl Editor {
                                 let label = match &self.island {
                                     Some(i) => format!(
                                         "Place on {}",
-                                        crate::island::island_title(&i.path)
+                                        crate::island::island_title(self.asset_words(), &i.path)
                                     ),
                                     None => "Place on an island…".to_owned(),
                                 };
@@ -3133,7 +3760,8 @@ impl Editor {
                 let folder = path.rsplit_once('/').map_or("", |(d, _)| d);
                 // The folder, the archive and size, then the actions on it.
                 let line = folder.to_owned();
-                let size = (kind(&path) != "texture").then(|| human(install.winner(file).raw_size));
+                let view = self.browser.kinds.get(&path).and_then(|k| k.view);
+                let size = (!matches!(view, Some(Shows::Texture | Shows::Picture))).then(|| human(install.winner(file).raw_size.into()));
                 let archive = archive.to_string();
                 let (copied, button_copy) = (path.clone(), path.clone());
                 let line_el = div()
@@ -3297,7 +3925,7 @@ impl Editor {
                     )
                 },
             );
-        let staged = self.project.files.contains_key(&path);
+        let staged = self.project.has_file(&path);
         if layers.len() > 1 {
             // Folded to one line by default: open, five patch archives took
             // a quarter of the pane above the preview.
@@ -3357,7 +3985,7 @@ impl Editor {
                                 if layer.is_tombstone() {
                                     "deleted".into()
                                 } else {
-                                    human(layer.raw_size)
+                                    human(layer.raw_size.into())
                                 },
                             )),
                     );
@@ -3532,6 +4160,29 @@ impl Editor {
                                 },
                             )
                             .min_w(px(150.)),
+                        )
+                        .child(widgets::toolbar_separator())
+                        // Beside the mip and channel it takes them from.
+                        .child(
+                            widgets::action("Export PNG", widgets::Tone::Secondary)
+                                .tooltip(widgets::Tooltip::text(
+                                    "Export as PNG",
+                                    "",
+                                    format!(
+                                        "The mip and channel shown, at their own size, to {}",
+                                        crate::project::short_path(
+                                            &self.config.join("extracted").join(png_name(
+                                                &path,
+                                                *mip,
+                                                self.browser.channel
+                                            ))
+                                        )
+                                    ),
+                                ))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.export_png();
+                                    cx.notify();
+                                })),
                         ),
                 )
                 .child({
@@ -3705,7 +4356,29 @@ impl Editor {
             ),
             // The caption rides in the view's own row, beside Find.
             Some((Content::Text { code, summary }, _)) => {
-                body.child(self.code_box(code.clone(), Some(summary.clone().into()), window, cx))
+                // A cfg with nothing to draw (an effect, a light, sound
+                // anchors) still edits in the Model workspace.
+                let edit_model = (self.browser.preview.as_ref())
+                    .and_then(|p| self.install.as_ref().map(|i| i.file_path(p.file)))
+                    .filter(|p| is_model(p))
+                    .filter(|_| self.supports(crate::editor::Workspace::Model));
+                body.when_some(edit_model, |d, path| {
+                    d.child(
+                        div().flex().justify_end().child(
+                            widgets::action("Edit model", widgets::Tone::Primary)
+                                .tooltip(widgets::Tooltip::text(
+                                    "Edit model",
+                                    "Ctrl 5",
+                                    "Opens it in the Model workspace; saving puts the edited copy in the mod",
+                                ))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.open_model(&path, cx);
+                                    cx.notify();
+                                })),
+                        ),
+                    )
+                })
+                .child(self.code_box(code.clone(), Some(summary.clone().into()), window, cx))
             }
             Some((Content::Hex(hex), size)) => body
                 .child(info_row(
@@ -3724,6 +4397,11 @@ impl Editor {
                 _,
             )) => {
                 let source = source.clone().filter(|_| self.browser.model_source);
+                // A cfg or prp opens in the Model workspace where the game edits.
+                let edit_model = (self.browser.preview.as_ref())
+                    .and_then(|p| self.install.as_ref().map(|i| i.file_path(p.file)))
+                    .filter(|p| is_model(p))
+                    .filter(|_| self.supports(crate::editor::Workspace::Model));
                 let has_source = matches!(
                     self.browser.preview.as_ref().map(|p| &p.content),
                     Some(Content::Model {
@@ -3743,6 +4421,32 @@ impl Editor {
                                 .child(widgets::meta_line(summary)),
                         )
                         .child(div().flex_1())
+                        .when_some(edit_model, |d, path| {
+                            d.child(
+                                widgets::action("Edit model", widgets::Tone::Primary)
+                                    .tooltip(widgets::Tooltip::text(
+                                        "Edit model",
+                                        "Ctrl 5",
+                                        "Opens it in the Model workspace; saving puts the edited copy in the mod",
+                                    ))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.open_model(&path, cx);
+                                        cx.notify();
+                                    })),
+                            )
+                        })
+                        .child(
+                            widgets::action("Export glTF", widgets::Tone::Secondary)
+                                .tooltip(widgets::Tooltip::text(
+                                    "Export as glTF",
+                                    "",
+                                    "The drawn meshes, without materials, as a .glb beside the extracted files",
+                                ))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.export_gltf();
+                                    cx.notify();
+                                })),
+                        )
                         // A .cfg is also the XML a modder edits: both, one
                         // click apart.
                         .when(has_source, |d| {
@@ -3883,7 +4587,54 @@ pub(crate) fn pack_name(folder: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Room, folder_note, hex_dump, human, kind, owning_cfg, pack_name};
+    use super::{
+        Browser, Content, Install, Kinds, Room, Types, folder_note, hex_dump, human, pack_name,
+        readable,
+    };
+    use anno_core::files::{self, Group, Kind, View};
+    use anno_core::game::{Game, Module, Profile};
+    use anno_core::text::GameText;
+    use anno_formats::rda::{PackOptions, Packer};
+    use std::sync::Arc;
+
+    /// A game that claims `.dds` as a picture of its own and lists nothing
+    /// else: what a game kind over a generic one looks like.
+    struct Claims;
+    static CLAIMS: Claims = Claims;
+    static CLAIMED: &[Kind] = &[Kind {
+        id: "own-dds",
+        label: "Own texture",
+        group: Group::Textures,
+        exts: &["dds"],
+        folder: None,
+        view: Some(View::Picture),
+        decode: None,
+        deps: None,
+    }];
+    impl Module for Claims {
+        fn game(&self) -> Game {
+            Game::Anno117
+        }
+        fn profile(&self) -> &'static Profile {
+            anno117::MODULE.profile()
+        }
+        fn text(&self) -> &'static GameText {
+            anno117::MODULE.text()
+        }
+        fn card_art(&self) -> &'static [u8] {
+            &[]
+        }
+        fn accent(&self) -> [u32; 2] {
+            [0; 2]
+        }
+        fn files(&self) -> &'static [Kind] {
+            CLAIMED
+        }
+    }
+
+    fn id(module: &dyn Module, path: &str) -> Option<&'static str> {
+        files::kind_of(module, path).map(|k| k.id)
+    }
 
     /// A column `chars` wide where every char is 1 px.
     fn room(chars: usize) -> Room {
@@ -3905,28 +4656,415 @@ mod tests {
 
     #[test]
     fn kinds_follow_extension_and_ui_folder() {
-        assert_eq!(kind("data/a/b.dds"), "texture");
-        assert_eq!(kind("data/a/rdm/b_lod0.rdm"), "model");
+        let m = &anno117::MODULE;
+        assert_eq!(id(m, "data/a/b.dds"), Some("dds"));
+        assert_eq!(id(m, "data/a/B.DDS"), Some("dds"));
+        assert_eq!(id(m, "data/a/rdm/b_lod0.rdm"), Some("rdm"));
+        assert_eq!(id(m, "data/x/islands/i/i.a7m"), Some("a7m"));
         assert_eq!(
-            owning_cfg("data/trees/olive/rdm/olive_01_lod2.rdm"),
-            Some((
-                "data/trees/olive/olive_01.cfg".to_owned(),
-                "data/trees/olive/rdm/olive_01",
-                2
-            ))
+            id(m, "data/ui/studio/generated/00214ce2-8775"),
+            Some("screen")
         );
-        assert_eq!(
-            owning_cfg("data/rocks/rock_06_a.rdm"),
-            Some((
-                "data/rocks/rock_06_a.cfg".to_owned(),
-                "data/rocks/rock_06_a",
-                0
-            ))
-        );
-        assert_eq!(kind("data/x/islands/i/i.a7m"), "island");
-        assert_eq!(kind("data/ui/studio/generated/00214ce2-8775"), "ui");
-        assert_eq!(kind("data/ui/fonts/a.ttf"), "binary");
+        assert_eq!(id(m, "data/ui/fonts/a.ttf"), None);
+        // A dot in a folder name is no extension.
+        assert_eq!(id(m, "data/v1.2/readme"), None);
         assert_eq!(human(1536), "1.5 KB");
+    }
+
+    // 2070's masks, islands and text formats are 2070's; 1800's props and
+    // the generated UI folder are no 2070 file. Before, one list of every
+    // game's extensions ran for all of them.
+    #[test]
+    fn each_game_lists_only_its_own_kinds() {
+        let (m117, m1800, m2070) = (&anno117::MODULE, &anno1800::MODULE, &anno2070::MODULE);
+        let view = |m: &dyn Module, path| files::kind_of(m, path).and_then(|k| k.view);
+        let abm = "data/graphics/ui/camctrl/circle.abm";
+        assert_eq!(view(m2070, abm), Some(View::Picture));
+        assert_eq!(id(m117, abm), None);
+        let prp = "data/graphics/props/grass/grass_01.prp";
+        assert_eq!(view(m1800, prp), Some(View::Model));
+        assert_eq!(id(m117, prp), None);
+        assert_eq!(id(m2070, prp), None);
+        let screen = "data/ui/studio/generated/00214ce2-8775";
+        assert_eq!(view(m117, screen), Some(View::Screen));
+        assert_eq!(view(m1800, screen), Some(View::Screen));
+        assert_eq!(id(m2070, screen), None);
+        // 2070's islands open in the island editor, its worlds in the map
+        // editor, as 117's and 1800's templates do.
+        let isd = "data/levels/islands/normal/n_l01.isd";
+        let k = files::kind_of(m2070, isd).unwrap();
+        assert_eq!((k.group, k.view), (Group::Islands, Some(View::Island)));
+        assert_eq!(
+            super::editor_for(m2070, isd),
+            Some(crate::editor::Workspace::Island)
+        );
+        assert_eq!(super::editor_for(m117, isd), None);
+        let maps = |m: &dyn Module| {
+            (m.islands().and_then(|i| i.maps())).map(|_| crate::editor::Workspace::Map)
+        };
+        let www = "data/levels/scenarios/singleplayer/06.www";
+        assert_eq!(view(m2070, www), Some(View::Map));
+        assert_eq!(super::editor_for(m2070, www), maps(m2070));
+        for path in ["data/x/t/t.a7t", "data/x/t/t.a7tinfo"] {
+            assert_eq!(view(m117, path), Some(View::Map), "{path}");
+            assert_eq!(view(m1800, path), Some(View::Map), "{path}");
+            assert_eq!(super::editor_for(m117, path), maps(m117), "{path}");
+        }
+        assert_eq!(id(m117, isd), None);
+        assert_eq!(id(m2070, "data/gui/x.tpl"), Some("text"));
+        assert_eq!(id(m1800, "data/gui/x.tpl"), None);
+        // Generic kinds belong to no game's list.
+        for m in [m117 as &dyn Module, m1800, m2070] {
+            for k in m.files() {
+                for g in files::GENERIC {
+                    assert!(
+                        !k.exts.iter().any(|e| g.exts.contains(e)),
+                        "{} lists .{:?}, a generic kind's",
+                        k.id,
+                        k.exts
+                    );
+                }
+            }
+            assert_eq!(id(m, "data/x.dds"), Some("dds"));
+            assert_eq!(id(m, "data/x.cur"), Some("cur"));
+        }
+    }
+
+    #[test]
+    fn a_game_kind_wins_over_a_generic_one() {
+        let k = files::kind_of(&CLAIMS, "data/x/a_0.dds").unwrap();
+        assert_eq!((k.id, k.view), ("own-dds", Some(View::Picture)));
+        assert_eq!(
+            Kinds::new(&CLAIMS).get("data/x/a_0.dds").unwrap().id,
+            "own-dds"
+        );
+        // What it doesn't claim stays generic.
+        assert_eq!(id(&CLAIMS, "data/x/a.png"), Some("png"));
+    }
+
+    // A game the registry doesn't know, in an install of its own: the list
+    // holds its kinds and the generic ones, each chip lists what they claim
+    // (not 117's cfg or screen beside them), its picture decodes through
+    // its own reader, its mesh shows as text, and staged into one of its
+    // projects the mesh is a model with the files it names.
+    #[test]
+    fn the_browser_lists_previews_and_stages_a_skeleton_install() {
+        use crate::games::fixtures::{SKELETON, SKELETON_FILES, install};
+        use anno_formats::vfs::Node;
+        let dir = tempfile::tempdir().unwrap();
+        let install = Arc::new(install(&dir.path().join("game"), SKELETON_FILES));
+        let mut b = Browser::default();
+        b.attach(&install, &SKELETON);
+        let ids: Vec<&str> = b.kinds.list.iter().map(|k| k.id).collect();
+        let generic = files::GENERIC.iter().map(|k| k.id);
+        assert_eq!(
+            ids,
+            ["ski", "skm", "skt"]
+                .into_iter()
+                .chain(generic)
+                .collect::<Vec<_>>()
+        );
+        let listed = |b: &mut Browser, types| {
+            b.types = types;
+            b.rebuild();
+            let paths: Vec<String> = (b.rows.iter())
+                .map(|r| match r.node {
+                    Node::File(f) => install.file_path(f).to_string(),
+                    Node::Folder(_) => panic!("a flat list holds files"),
+                })
+                .collect();
+            paths
+        };
+        assert_eq!(listed(&mut b, Types::Models), ["content/meshes/rock.skm"]);
+        assert_eq!(
+            listed(&mut b, Types::Textures),
+            ["content/textures/rock.skt"]
+        );
+        assert!(listed(&mut b, Types::Ui).is_empty());
+        assert_eq!(
+            listed(&mut b, Types::Text),
+            ["skeleton/captions.xml", "skeleton/library.xml"]
+        );
+
+        let preview = |path| {
+            let file = install.file(path).unwrap();
+            super::load_preview(
+                &SKELETON,
+                &install,
+                file,
+                None,
+                super::Channel::Rgb,
+                1.,
+                None,
+            )
+            .content
+        };
+        let Content::Texture { dims, summary, .. } = preview("content/textures/rock.skt") else {
+            panic!("the picture didn't decode");
+        };
+        assert_eq!(dims, (2, 1));
+        assert!(summary.contains("skeleton text picture"), "{summary}");
+        let Content::Text { summary, .. } = preview("content/meshes/rock.skm") else {
+            panic!("the mesh isn't text");
+        };
+        assert!(summary.contains("lines"), "{summary}");
+
+        let folder = dir.path().join("project");
+        let mut project =
+            crate::project::Project::create(&folder, "Rocks", "rocks", &SKELETON).unwrap();
+        for path in ["content/meshes/rock.skm", "content/textures/rock.skt"] {
+            project.stage(path, install.read(path).unwrap());
+        }
+        // The texture's mips are staged too, as an import would.
+        project.stage("content/textures/rock_0.dds", b"mip".to_vec());
+        let models = project.models();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].cfg, "content/meshes/rock.skm");
+        assert_eq!(
+            models[0].files,
+            ["content/meshes/rock.skm", "content/textures/rock_0.dds"]
+        );
+    }
+
+    // The tree's per-folder bits and per-type counts come from the packed
+    // extension table; they must say what the per-file lookup says, for
+    // every game, on a layout with folder markers, upper case, long and
+    // missing extensions.
+    #[test]
+    fn the_folder_index_agrees_with_the_per_file_lookup() {
+        let mut paths: Vec<String> = Vec::new();
+        let modules: [&'static dyn Module; 4] = [
+            &anno117::MODULE,
+            &anno1800::MODULE,
+            &anno2070::MODULE,
+            &CLAIMS,
+        ];
+        for m in modules {
+            for k in m.files().iter().chain(files::GENERIC) {
+                for e in k.exts {
+                    paths.push(format!("data/{}/a.{e}", k.id));
+                    paths.push(format!("data/{}/upper/B.{}", k.id, e.to_uppercase()));
+                }
+            }
+        }
+        paths.extend(
+            [
+                "data/ui/studio/generated/00214ce2-8775",
+                "data/ui/studio/generated/b.dds",
+                "data/ui/studio/generated/c.xml",
+                "data/ui/fonts/a.ttf",
+                "data/v1.2/readme",
+                "data/x/a.extension",
+                "data/x/noext",
+            ]
+            .map(String::from),
+        );
+        paths.sort();
+        paths.dedup();
+        let dir = tempfile::tempdir().unwrap();
+        let mut pack = Packer::new(PackOptions::default());
+        for p in &paths {
+            pack.add(p, b"x").unwrap();
+        }
+        let archives = dir.path().join("maindata");
+        std::fs::create_dir(&archives).unwrap();
+        std::fs::write(archives.join("data0.rda"), pack.encode().unwrap()).unwrap();
+        let install = Arc::new(Install::open(dir.path(), &[]).unwrap());
+        for m in modules {
+            let mut b = Browser::default();
+            b.attach(&install, m);
+            b.index_folder_kinds(&install);
+            let mut counts = [0usize; 6];
+            for f in (0..install.file_count() as u32).map(anno_formats::vfs::FileId) {
+                let path = install.file_path(f);
+                let want = files::kind_of(m, &path);
+                let got = b.kinds.get(&path);
+                assert_eq!(got.map(|k| k.id), want.map(|k| k.id), "{path}");
+                let Some(k) = want else { continue };
+                let t = Types::of(k.group);
+                counts[t as usize] += 1;
+                let folder = install.file_folder(f);
+                assert!(b.folder_kinds[folder.0 as usize] & t.bit() != 0, "{path}");
+            }
+            assert_eq!(b.kind_counts, counts);
+        }
+        // The shipped installs too, where present: every file, no reads.
+        for (var, m) in [
+            ("ANNO117_DIR", &anno117::MODULE as &'static dyn Module),
+            ("ANNO1800_DIR", &anno1800::MODULE),
+        ] {
+            let Some(dir) = anno_formats::vfs::install_dir(var) else {
+                continue;
+            };
+            let install = Install::open(dir, m.profile().archive_families).unwrap();
+            let kinds = Kinds::new(m);
+            for f in (0..install.file_count() as u32).map(anno_formats::vfs::FileId) {
+                let path = install.file_path(f);
+                assert_eq!(
+                    kinds.get(&path).map(|k| k.id),
+                    files::kind_of(m, &path).map(|k| k.id),
+                    "{path}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn models_offer_place_where_islands_keep_placed_objects() {
+        let model = Content::Model {
+            parts: Vec::new(),
+            summary: String::new(),
+            source: None,
+        };
+        let cfg = "data/graphics/buildings/ecos/production/bakery_ecos/bakery_ecos.cfg";
+        assert!(super::offers_place(&anno2070::MODULE, cfg, Some(&model)));
+        assert!(super::offers_place(&anno117::MODULE, cfg, Some(&model)));
+        assert!(super::offers_place(&anno1800::MODULE, cfg, Some(&model)));
+        // A cfg that showed as text, a bare mesh, and a game with screens
+        // but no islands.
+        assert!(!super::offers_place(
+            &anno117::MODULE,
+            cfg,
+            Some(&Content::Hex(String::new()))
+        ));
+        assert!(!super::offers_place(
+            &anno117::MODULE,
+            "data/x/rdm/a.rdm",
+            Some(&model)
+        ));
+        let screens = &crate::games::fixtures::PartialGame::Screens;
+        assert!(!super::offers_place(screens, cfg, Some(&model)));
+    }
+
+    // A picture exports as what the preview shows, at its own size: a
+    // 2070 mask's set bits white, its clear ones clear; its alpha channel
+    // alone as grey. A texture exports one mip (where an install is set).
+    #[test]
+    fn textures_and_pictures_export_as_png() {
+        use super::{Channel, png_name, png_of};
+        let mut mask = b"ABM\x01\x0a\x00\x00\x00\x02\x00\x00\x00".to_vec();
+        mask.extend([0b0000_0001, 0b0000_0010, 0b0000_0010, 0]);
+        let dir = tempfile::tempdir().unwrap();
+        let archives = dir.path().join("maindata");
+        std::fs::create_dir(&archives).unwrap();
+        let mut pack = Packer::new(PackOptions::default());
+        pack.add("data/gui/mask.abm", &mask).unwrap();
+        pack.add("data/gui/notes.txt", b"text").unwrap();
+        std::fs::write(archives.join("data0.rda"), pack.encode().unwrap()).unwrap();
+        let install = Install::open(dir.path(), &[]).unwrap();
+        let file = install.file("data/gui/mask.abm").unwrap();
+        let png = png_of(&anno2070::MODULE, &install, file, 0, Channel::Rgb).unwrap();
+        let image = image::load_from_memory(&png).unwrap().to_rgba8();
+        assert_eq!(image.dimensions(), (10, 2));
+        assert_eq!(image.get_pixel(9, 0).0, [255; 4]);
+        assert_eq!(image.get_pixel(1, 0).0, [0; 4]);
+        let png = png_of(&anno2070::MODULE, &install, file, 0, Channel::A).unwrap();
+        let image = image::load_from_memory(&png).unwrap().to_rgba8();
+        assert_eq!(image.get_pixel(1, 0).0, [0, 0, 0, 255]);
+        // The same file is no picture to a game that doesn't list it.
+        assert!(png_of(&anno117::MODULE, &install, file, 0, Channel::Rgb).is_err());
+        let text = install.file("data/gui/notes.txt").unwrap();
+        assert!(png_of(&anno2070::MODULE, &install, text, 0, Channel::Rgb).is_err());
+        assert_eq!(
+            png_name("data/a_0.dds", 0, Channel::Rgb),
+            "data/a_0.dds.png"
+        );
+        assert_eq!(
+            png_name("data/a_0.dds", 2, Channel::A),
+            "data/a_0.dds.mip2.a.png"
+        );
+        let Some(dir) = anno_formats::vfs::install_dir("ANNO117_DIR") else {
+            return;
+        };
+        let families = crate::games::profile(anno_core::game::Game::Anno117).archive_families;
+        let install = Install::open(dir, families).unwrap();
+        let file = (0..install.file_count() as u32)
+            .map(anno_formats::vfs::FileId)
+            .find(|&f| install.file_path(f).ends_with("_0.dds"))
+            .unwrap();
+        let bytes = install.read_file(file).unwrap();
+        let dds = gpui_editor_kit::texture::Dds::parse(&bytes).unwrap();
+        let mip = dds.mips.min(2) - 1;
+        let png = png_of(&anno117::MODULE, &install, file, mip, Channel::Rgb).unwrap();
+        let image = image::load_from_memory(&png).unwrap();
+        assert_eq!(
+            (image.width(), image.height()),
+            ((dds.width >> mip).max(1), (dds.height >> mip).max(1))
+        );
+    }
+
+    // Needs Anno 1800 (ANNO1800_DIR): a prop file draws in 3D, as the island
+    // draws it, where it once showed as XML.
+    #[test]
+    fn an_1800_prp_previews_as_a_model() {
+        let Some(dir) = anno_formats::vfs::install_dir("ANNO1800_DIR") else {
+            return;
+        };
+        let families = crate::games::profile(anno_core::game::Game::Anno1800).archive_families;
+        let install = Install::open(dir, families).unwrap();
+        let file = (0..install.file_count() as u32)
+            .map(anno_formats::vfs::FileId)
+            .find(|&f| install.file_path(f).ends_with(".prp"))
+            .expect("1800 ships props");
+        let preview = super::load_preview(
+            &anno1800::MODULE,
+            &install,
+            file,
+            None,
+            super::Channel::Rgb,
+            1.,
+            None,
+        );
+        match preview.content {
+            Content::Model { parts, summary, .. } => assert!(!parts.is_empty(), "{summary}"),
+            Content::Error(e) => panic!("{}: {e}", install.file_path(file)),
+            _ => panic!("{}: not a model", install.file_path(file)),
+        }
+    }
+
+    // UTF-16 by its mark, Windows-1252 where UTF-8 fails, and NULs or
+    // control bytes as binary.
+    #[test]
+    fn text_reads_in_each_encoding_the_games_use() {
+        let utf16: Vec<u8> = b"\xff\xfe"
+            .iter()
+            .copied()
+            .chain("Grüße\r\n".encode_utf16().flat_map(u16::to_le_bytes))
+            .collect();
+        let t = readable(&utf16).unwrap();
+        assert_eq!((t.text.as_ref(), t.note), ("Grüße\r\n", None));
+        let t = readable(b"// wird einmal f\xfcr \x80 5").unwrap();
+        assert_eq!(t.text, "// wird einmal für € 5");
+        assert_eq!(t.note, Some("Windows-1252"));
+        assert_eq!(readable(b"plain").unwrap().note, None);
+        assert!(readable(b"PHX\x00\x01").is_none());
+        assert!(readable(b"\x89PNG\r\n\x1a\n\x02\x03\x04\x05").is_none());
+    }
+
+    // 2070's XML binary blobs: three floats as floats, fixed point as
+    // integers, a grid by its size and first bytes; a `]` the length does
+    // not reach is left as written.
+    #[test]
+    fn binary_cdata_shows_as_numbers() {
+        let mut xml = b"<P>CDATA[\x0c\x00\x00\x00".to_vec();
+        for v in [844.5f32, 11.25, -744.] {
+            xml.extend(v.to_le_bytes());
+        }
+        xml.extend(b"]</P>\r\n<Q>CDATA[\x08\x00\x00\x00");
+        for v in [18432i32, -4096] {
+            xml.extend(v.to_le_bytes());
+        }
+        xml.extend(b"]</Q>\r\n<G>CDATA[\x48\x00\x00\x00");
+        xml.extend(0u8..72);
+        xml.extend(b"]</G><T>CDATA[short]</T>");
+        let t = readable(&xml).unwrap();
+        assert_eq!(
+            t.text,
+            "<P>CDATA[844.5 11.25 -744]</P>\r\n<Q>CDATA[18432 -4096]</Q>\r\n\
+             <G>CDATA[72 bytes: 00 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f …]</G>\
+             <T>CDATA[short]</T>"
+        );
+        assert_eq!(t.note, Some("binary values shown as numbers"));
     }
 
     #[test]
@@ -4052,6 +5190,133 @@ mod tests {
         assert!(!wants_light(opaque_dark.as_flattened()));
     }
 
+    fn install_2070() -> Option<Install> {
+        use crate::games::GameExt;
+        let dir = anno_formats::vfs::install_dir("ANNO2070_DIR")?;
+        let families = anno_core::game::Game::Anno2070.profile().archive_families;
+        Some(Install::open(&dir, families).unwrap())
+    }
+
+    fn preview(install: &Install, path: &str) -> Content {
+        let file = install.file(path).unwrap_or_else(|| panic!("no {path}"));
+        super::load_preview(
+            &anno2070::MODULE,
+            install,
+            file,
+            None,
+            super::Channel::Rgb,
+            1.,
+            None,
+        )
+        .content
+    }
+
+    // Needs Anno 2070 (ANNO2070_DIR): a building's cfg previews as its
+    // meshes in place, the way a 117 or 1800 cfg does, its parts textured
+    // with normal maps, its ground decal under it.
+    #[test]
+    fn a_2070_cfg_previews_as_its_meshes() {
+        let Some(install) = install_2070() else {
+            return;
+        };
+        let path = "addondata/graphics/buildings/others/public/underwater_markethouse_small_others/underwater_markethouse_small_others.cfg";
+        let Content::Model { parts, summary, .. } = preview(&install, path) else {
+            panic!("not a model");
+        };
+        assert!(parts.len() >= 2, "{summary}");
+        assert!(summary.contains("meshes"), "{summary}");
+        // The building has a normal map; its podest does not.
+        assert!(parts.iter().all(|(m, _)| m.data().texture.is_some()));
+        let bumped = parts.iter().filter(|(m, _)| m.data().normal_map.is_some());
+        assert_eq!(bumped.count(), 1, "{summary}");
+        let path = "data/graphics/buildings/ecos/production/bakery_ecos/bakery_ecos.cfg";
+        let Content::Model { parts, .. } = preview(&install, path) else {
+            panic!("not a model");
+        };
+        let decals = parts
+            .iter()
+            .filter(|(m, _)| !matches!(m.data().material, super::gpu::Material::Lit));
+        assert_eq!(decals.count(), 1);
+    }
+
+    // Needs Anno 2070: every shipped level of a mesh takes its cfg's
+    // textures, and so does a part's mesh of a several-part model, named
+    // after the part, from the cfg in the folder above. A big-endian mesh
+    // previews too.
+    #[test]
+    fn a_2070_rdm_borrows_its_parts_materials() {
+        let Some(install) = install_2070() else {
+            return;
+        };
+        let bakery = "data/graphics/buildings/ecos/production/bakery_ecos/rdm/bakery_ecos";
+        let podest = "addondata/graphics/buildings/others/public/underwater_markethouse_small_others/rdm/underwater_markethouse_small_others_podest_lod0.rdm";
+        for (path, cfg) in [
+            (format!("{bakery}_lod0.rdm"), "bakery_ecos.cfg"),
+            (format!("{bakery}_lod1.rdm"), "bakery_ecos.cfg"),
+            (format!("{bakery}_lod2.rdm"), "bakery_ecos.cfg"),
+            (podest.to_owned(), "underwater_markethouse_small_others.cfg"),
+        ] {
+            let Content::Model { parts, summary, .. } = preview(&install, &path) else {
+                panic!("{path}: not a model");
+            };
+            assert!(
+                summary.contains(&format!("materials from {cfg}")),
+                "{summary}"
+            );
+            assert!(parts.iter().all(|(m, _)| m.data().texture.is_some()));
+        }
+        let path = "data/graphics/buildings/tycoons/props/submarine/rdm/submarine.rdm";
+        let Content::Model { summary, .. } = preview(&install, path) else {
+            panic!("{path}: not a model");
+        };
+        assert!(
+            summary.contains("materials from submarine.cfg"),
+            "{summary}"
+        );
+    }
+
+    // Needs Anno 2070: its UTF-16 loca text, its Windows-1252 AI scripts,
+    // its worlds, its masks and its cursors all
+    // preview as what they are.
+    #[test]
+    fn every_kind_of_2070_file_previews() {
+        let Some(install) = install_2070() else {
+            return;
+        };
+        let text = |path: &str, note: Option<&str>| match preview(&install, path) {
+            Content::Text { summary, code } => {
+                assert!(code.line_count() > 1, "{path}");
+                if let Some(note) = note {
+                    assert!(summary.contains(note), "{path}: {summary}");
+                }
+            }
+            _ => panic!("{path}: not text"),
+        };
+        text("data/loca/eng/txt/credits.txt", None);
+        text("data/ai/autorun.csl", Some("Windows-1252"));
+        // An island opens in the island editor rather than previewing.
+        assert!(matches!(
+            preview(
+                &install,
+                "addondata/levels/islands/third parties/u_x03_rift.isd"
+            ),
+            Content::Island
+        ));
+        text("data/levels/scenarios/singleplayer/06.www", None);
+        text("data/config/ai/eco_harbour6x3_1.rsd", Some("binary values"));
+        for (path, facts) in [
+            ("data/graphics/ui/camctrl/circle.abm", "64×64 · 1-bit mask"),
+            ("data/graphics/ui/mousepointer/move.cur", "cursor, hotspot"),
+            ("data/graphics/ui/mousepointer/follow.ani", "frames"),
+        ] {
+            match preview(&install, path) {
+                Content::Texture { summary, .. } => assert!(summary.contains(facts), "{summary}"),
+                Content::Error(e) => panic!("{path}: {e}"),
+                _ => panic!("{path}: not a picture"),
+            }
+        }
+    }
+
     #[test]
     fn grey_thumbnails_stretch_to_the_full_range() {
         use super::stretch_grey;
@@ -4097,5 +5362,287 @@ mod tests {
         assert_eq!(pack_name("cdlc01").as_deref(), Some("Cosmetic DLC 1"));
         assert_eq!(pack_name("data"), None);
         assert_eq!(pack_name("dlcx"), None);
+    }
+
+    /// How many pixels of two renders of one view differ by more than a
+    /// tenth of white, summed over the channels.
+    fn changed_pixels(a: &[u8], b: &[u8]) -> usize {
+        (a.as_chunks::<4>().0.iter().zip(b.as_chunks::<4>().0))
+            .filter(|(a, b)| (0..3).map(|i| a[i].abs_diff(b[i]) as u32).sum::<u32>() > 76)
+            .count()
+    }
+
+    // Needs 117 and a Vulkan device: a tile oven's fire, which glows by
+    // day, glows in its Library thumbnail as in the Assets preview, both in
+    // the game's look. Thumbnails drew a plain look before: the kit's glow
+    // strength and 1800's colour rule. Glow pixels are those that change
+    // when the look's glow goes to 0. (117's lit windows light only by
+    // night, and previews show the day.)
+    #[test]
+    fn a_library_thumbnail_glows_like_the_preview() {
+        use gpui_editor_kit::camera::{Camera, Extent};
+        use gpui_editor_kit::gpu::{Batch, Glow, Instances, Light, Offscreen, Renderer, Scene};
+        use gpui_editor_kit::math;
+        let Some(dir) = anno_formats::vfs::install_dir("ANNO117_DIR") else {
+            eprintln!("skip: ANNO117_DIR unset");
+            return;
+        };
+        let families = crate::games::profile(anno_core::game::Game::Anno117).archive_families;
+        let install = Install::open(dir, families).unwrap();
+        let module = &anno117::MODULE;
+        let cfg = "data/base/graphics/roman/buildings/production/construction/tiles/oven2.cfg";
+        let look = module.model_look();
+        let dark = files::ModelLook { glow: 0., ..look };
+        let side = crate::island::catalog::THUMB * 2;
+        let mut target = Offscreen::new(side, side).unwrap();
+
+        // The preview: the browser's parts, lit and glowing as the model
+        // view draws them.
+        let bytes = install.read(cfg).unwrap();
+        let Content::Model { parts, .. } = super::load_model(module, &install, cfg, &bytes) else {
+            panic!("{cfg} previews as a model");
+        };
+        let [lo, hi] = math::bounds(
+            (parts.iter())
+                .flat_map(|(m, l)| math::corners(m.bounds()).map(|c| math::transform(l, c))),
+        );
+        let mut preview = |glow: Glow| {
+            let renderer = Renderer::with_families(look.families());
+            renderer.set_scene(&Scene {
+                batches: (parts.iter())
+                    .map(|(mesh, local)| {
+                        let at = Instances {
+                            matrices: vec![*local],
+                            ids: vec![None],
+                        };
+                        Batch::new(mesh.clone(), Arc::new(at))
+                    })
+                    .collect(),
+                light: Light {
+                    sun_color: [0.62; 3],
+                    sky: [0.55; 3],
+                    ground: [0.32; 3],
+                    ..Default::default()
+                },
+                glow,
+                ..Default::default()
+            });
+            let camera = Camera {
+                yaw: 0.6,
+                tilt: 0.95,
+                mirror: true,
+                ..Default::default()
+            };
+            let extent = Extent {
+                center: std::array::from_fn(|i| (lo[i] + hi[i]) / 2.),
+                size: (0..3).map(|i| hi[i] - lo[i]).fold(0.01, f32::max) * 1.2,
+            };
+            target.render(&renderer, camera, extent).unwrap()
+        };
+        let glow = |look: &files::ModelLook| look.glow(&look.scene_glow());
+        let shown = changed_pixels(&preview(glow(&look)), &preview(glow(&dark)));
+
+        let mut thumb = |look: &files::ModelLook| {
+            let renderer = Renderer::with_families(look.families());
+            let rendered = crate::island::catalog::render_thumbnail(
+                &install,
+                &mut target,
+                &renderer,
+                cfg,
+                look,
+            );
+            rendered.unwrap().expect("a thumbnail").0.into_raw()
+        };
+        let lit = thumb(&look);
+        let library = changed_pixels(&lit, &thumb(&dark));
+        // The thumbnail takes the look it is given, not a plain one.
+        let plain = changed_pixels(&lit, &thumb(&files::ModelLook::PLAIN));
+        eprintln!("glow pixels: preview {shown}, thumbnail {library}; plain differs in {plain}");
+        assert!(shown >= 100, "the preview glows in {shown} pixels");
+        assert!(library >= 25, "the thumbnail glows in {library} pixels");
+        assert!(plain >= 10, "a plain look changes {plain} thumbnail pixels");
+    }
+
+    // Needs 2070 and a Vulkan device: a 2070 building previews in 3D from
+    // its cfg, big-endian meshes and DDS textures, in 2070's look: its parts
+    // as recorded (mesh count and a digest of the drawn geometry and
+    // placements), dressed in 2070's building family, and its windows
+    // glowing where the normal map's blue says by the look's strength,
+    // which a look without glow leaves dark.
+    #[test]
+    fn a_2070_building_previews_in_its_own_look() {
+        use gpui_editor_kit::camera::{Camera, Extent};
+        use gpui_editor_kit::gpu::{Batch, Instances, Light, Offscreen, Renderer, Scene};
+        use gpui_editor_kit::math;
+        let Some(dir) = anno_formats::vfs::install_dir("ANNO2070_DIR") else {
+            eprintln!("skip: ANNO2070_DIR unset");
+            return;
+        };
+        let module = &anno2070::MODULE;
+        let install = Install::open(&dir, module.profile().archive_families).unwrap();
+        let cfg = "data/graphics/buildings/techs/production/carbon_factory_techs/carbon_factory_techs.cfg";
+        // A rock's meshes are big-endian, which the preview reads sniffed.
+        let rock = "data/graphics/landscape/stones/north/nature_stones/n_nature_stone_big_01.cfg";
+        let rock_bytes = install.read(rock).unwrap();
+        let rdm = &anno_formats::model::Model::parse(&rock_bytes)
+            .unwrap()
+            .parts[0]
+            .rdm;
+        assert_eq!(install.read(rdm).unwrap()[..4], *b"RDM\0");
+        let Content::Model { parts, .. } = super::load_model(module, &install, rock, &rock_bytes)
+        else {
+            panic!("{rock} previews as a model");
+        };
+        assert!(parts.iter().all(|(m, _)| m.triangles() > 0) && !parts.is_empty());
+
+        let bytes = install.read(cfg).unwrap();
+        let Content::Model { parts, summary, .. } =
+            super::load_model(module, &install, cfg, &bytes)
+        else {
+            panic!("{cfg} previews as a model");
+        };
+        let mut h = 0xcbf29ce484222325u64;
+        let mut eat = |bits: u32| {
+            for b in bits.to_le_bytes() {
+                h ^= u64::from(b);
+                h = h.wrapping_mul(0x100000001b3);
+            }
+        };
+        for (mesh, local) in &parts {
+            let g = mesh.geometry();
+            g.positions
+                .iter()
+                .flatten()
+                .chain(g.uvs.iter().flatten())
+                .for_each(|v| eat(v.to_bits()));
+            g.indices.iter().for_each(|&i| eat(i));
+            local.iter().for_each(|v| eat(v.to_bits()));
+        }
+        eprintln!("{summary}: {} meshes, digest {h:016x}", parts.len());
+        assert_eq!((parts.len(), h), (2, 0x20aa_9b89_9333_500b), "{summary}");
+        // In 2070's own family set: its building family, not the kit's.
+        use anno_render::a2070_buildings::{NAME, families};
+        let building = families().id(NAME);
+        assert!(
+            parts
+                .iter()
+                .any(|(m, _)| Some(m.geometry().family) == building),
+            "no part draws in the building family"
+        );
+
+        let [lo, hi] = math::bounds(
+            (parts.iter())
+                .flat_map(|(m, l)| math::corners(m.bounds()).map(|c| math::transform(l, c))),
+        );
+        let mut target = Offscreen::new(256, 256).unwrap();
+        let mut render = |look: files::ModelLook| {
+            let renderer = Renderer::with_families(look.families());
+            renderer.set_scene(&Scene {
+                batches: (parts.iter())
+                    .map(|(mesh, local)| {
+                        let at = Instances {
+                            matrices: vec![*local],
+                            ids: vec![None],
+                        };
+                        Batch::new(mesh.clone(), Arc::new(at))
+                    })
+                    .collect(),
+                light: Light {
+                    sun_color: [0.62; 3],
+                    sky: [0.55; 3],
+                    ground: [0.32; 3],
+                    ..Default::default()
+                },
+                glow: look.glow(&look.scene_glow()),
+                ..Default::default()
+            });
+            let camera = Camera {
+                yaw: 0.6,
+                tilt: 0.95,
+                mirror: true,
+                ..Default::default()
+            };
+            let extent = Extent {
+                center: std::array::from_fn(|i| (lo[i] + hi[i]) / 2.),
+                size: (0..3).map(|i| hi[i] - lo[i]).fold(0.01, f32::max) * 1.2,
+            };
+            target.render(&renderer, camera, extent).unwrap()
+        };
+        let look = module.model_look();
+        let glowing = changed_pixels(
+            &render(look),
+            &render(files::ModelLook { glow: 0., ..look }),
+        );
+        eprintln!("{glowing} glowing pixels");
+        assert!(glowing >= 50, "{glowing} glowing pixels");
+    }
+
+    // A model's drawn parts exported as glTF read back through the kit's
+    // glTF reader (the `gltf` crate): every triangle, placed by its part's
+    // matrix, mirrored on X and wound the other way. The shipped olive tree
+    // too, when 117 is installed.
+    #[test]
+    fn exported_gltf_reads_back_as_the_drawn_triangles() {
+        use gpui_editor_kit::gpu::{Mesh, MeshData};
+        use gpui_editor_kit::heightfield::files::load_mesh;
+        use gpui_editor_kit::math;
+        let dir = tempfile::tempdir().unwrap();
+        let read = |parts: &[(Arc<Mesh>, math::Mat4)]| {
+            let file = dir.path().join("model.glb");
+            std::fs::write(&file, super::glb_of(parts).unwrap()).unwrap();
+            load_mesh(&file, false).unwrap()
+        };
+        let triangle = Arc::new(
+            Mesh::new(MeshData {
+                positions: vec![[0., 0., 0.], [1., 0., 0.], [0., 1., 0.]],
+                normals: vec![[0., 0., 1.]; 3],
+                uvs: vec![[0., 0.], [1., 0.], [0., 1.]],
+                indices: vec![0, 1, 2],
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let parts = [
+            (triangle.clone(), math::IDENTITY),
+            (triangle, math::translate([5., 0., 2.])),
+        ];
+        let (positions, indices) = read(&parts);
+        assert_eq!(indices.len(), 6);
+        let corner = |t: usize, k: usize| positions[indices[t * 3 + k] as usize];
+        // Each part's mesh in the reader's order; find the moved one by X.
+        let moved = (0..2).find(|&t| corner(t, 0)[0] < -1.).unwrap();
+        assert_eq!(
+            [corner(moved, 0), corner(moved, 1), corner(moved, 2)],
+            [[-5., 0., 2.], [-5., 1., 2.], [-6., 0., 2.]]
+        );
+        // Nothing to draw is an error, not an empty file.
+        assert!(super::glb_of(&[]).is_err());
+
+        let Some(dir) = anno_formats::vfs::install_dir("ANNO117_DIR") else {
+            eprintln!("skip the shipped model: ANNO117_DIR unset");
+            return;
+        };
+        let families = crate::games::profile(anno_core::game::Game::Anno117).archive_families;
+        let install = Install::open(dir, families).unwrap();
+        let cfg = "data/base/graphics/roman/environment/props/vegetation/trees/olive_trees/olive_tree_07.cfg";
+        let bytes = install.read(cfg).unwrap();
+        let Content::Model { parts, .. } =
+            super::load_model(&anno117::MODULE, &install, cfg, &bytes)
+        else {
+            panic!("{cfg} previews as a model");
+        };
+        let drawn: usize = parts.iter().map(|(m, _)| m.triangles() * 3).sum();
+        let (positions, indices) = read(&parts);
+        assert_eq!(indices.len(), drawn);
+        let [lo, hi] = math::bounds(positions.iter().copied());
+        let [want_lo, want_hi] = math::bounds(parts.iter().flat_map(|(m, l)| {
+            m.geometry().positions.into_iter().map(|p| {
+                let p = math::transform(l, p);
+                [-p[0], p[1], p[2]]
+            })
+        }));
+        for i in 0..3 {
+            assert!((lo[i] - want_lo[i]).abs() < 1e-3 && (hi[i] - want_hi[i]).abs() < 1e-3);
+        }
     }
 }

@@ -3,7 +3,10 @@
 // Built once from the install off the UI thread (a few seconds) and cached
 // in the config folder, as are the thumbnails rendered for it.
 use super::models::{self, Cache};
-use anno_formats::{adf::Adf, objects::Objects, rda::Archive, vfs::Install};
+use anno_core::files::ModelLook;
+use anno_core::game::IslandRules;
+use anno_core::island::objects::Objects;
+use anno_formats::{adf::Adf, rda::Archive, vfs::Install};
 use anyhow::{Context as _, Result};
 use gpui_editor_kit::{
     camera::{Camera, Extent},
@@ -12,13 +15,9 @@ use gpui_editor_kit::{
     math,
     texture::Texture,
 };
-use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
-
-/// Bumped when the cache's shape or contents change.
-const VERSION: u32 = 3;
 
 /// The Library pane's lists.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,7 +29,7 @@ pub enum Kind {
     Mod,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PropEntry {
     /// `.cfg` path as the rd3d `PropGrid/FileNames` store it.
     pub path: String,
@@ -40,9 +39,13 @@ pub struct PropEntry {
     /// models at three times their size, so a model's height alone says
     /// little about how tall it stands.
     pub scale: f32,
+    /// Provinces whose shipped islands place it (`roman`, `colony01`, …),
+    /// sorted. Shared library folders hide that Latium's maritime pines
+    /// grow on no Albion island; this does not.
+    pub regions: Vec<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ObjectEntry {
     pub guid: u32,
     /// A shipped island with one, to copy its record from.
@@ -52,7 +55,7 @@ pub struct ObjectEntry {
 
 /// A model placed through a generic object (`SimpleCfg` and the like) with
 /// its own `DynamicVariation/ConfigFilename`: most shipped decoration.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct DecorEntry {
     pub config: String,
     /// The object asset carrying it.
@@ -61,11 +64,8 @@ pub struct DecorEntry {
     pub uses: u32,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Catalog {
-    version: u32,
-    /// Install file count when built; a patched install rebuilds it.
-    stamp: usize,
     /// Most used first.
     pub props: Vec<PropEntry>,
     pub objects: Vec<ObjectEntry>,
@@ -73,26 +73,8 @@ pub struct Catalog {
 }
 
 impl Catalog {
-    /// The cached catalog when it matches the install, else a fresh scan,
-    /// written back to `cache`.
-    pub fn load_or_build(install: &Install, cache: &Path) -> Result<Catalog> {
-        if let Ok(bytes) = std::fs::read(cache)
-            && let Ok(c) = serde_json::from_slice::<Catalog>(&bytes)
-            && c.version == VERSION
-            && c.stamp == install.file_count()
-        {
-            return Ok(c);
-        }
-        let c = Catalog::build(install)?;
-        if let Some(dir) = cache.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        std::fs::write(cache, serde_json::to_vec(&c)?)?;
-        Ok(c)
-    }
-
     /// Scans every shipped island's prop grid and objects.
-    pub fn build(install: &Install) -> Result<Catalog> {
+    pub fn build(rules: &IslandRules, install: &Install) -> Result<Catalog> {
         let islands: Vec<String> = install
             .search(".a7m", 100_000)
             .into_iter()
@@ -122,8 +104,8 @@ impl Catalog {
                 .flat_map(|w| w.join().expect("catalog worker"))
                 .collect()
         });
-        // Per model: instances and their vertical scales.
-        let mut props: BTreeMap<String, (u32, Vec<f32>)> = BTreeMap::new();
+        // Per model: instances, their vertical scales, the provinces.
+        let mut props: BTreeMap<String, (u32, Vec<f32>, Vec<String>)> = BTreeMap::new();
         let mut objects: HashMap<u32, ObjectEntry> = HashMap::new();
         let mut decorations: HashMap<String, DecorEntry> = HashMap::new();
         for s in scanned {
@@ -138,10 +120,14 @@ impl Catalog {
                     })
                     .uses += n;
             }
+            let region = rules.island_region(&s.path).to_ascii_lowercase();
             for (path, (n, scales)) in s.props {
                 let e = props.entry(path).or_default();
                 e.0 += n;
                 e.1.extend(scales);
+                if !e.2.contains(&region) {
+                    e.2.push(region.clone());
+                }
             }
             for (guid, n) in s.objects {
                 objects
@@ -156,10 +142,14 @@ impl Catalog {
         }
         let mut props: Vec<PropEntry> = props
             .into_iter()
-            .map(|(path, (uses, scales))| PropEntry {
-                path,
-                uses,
-                scale: median(scales),
+            .map(|(path, (uses, scales, mut regions))| {
+                regions.sort_unstable();
+                PropEntry {
+                    path,
+                    uses,
+                    scale: median(scales),
+                    regions,
+                }
             })
             .collect();
         props.sort_by(|a, b| b.uses.cmp(&a.uses).then(a.path.cmp(&b.path)));
@@ -168,11 +158,100 @@ impl Catalog {
         let mut decorations: Vec<DecorEntry> = decorations.into_values().collect();
         decorations.sort_by(|a, b| b.uses.cmp(&a.uses).then(a.config.cmp(&b.config)));
         Ok(Catalog {
-            version: VERSION,
-            stamp: install.file_count(),
             props,
             objects,
             decorations,
+        })
+    }
+}
+
+impl Catalog {
+    /// `module`'s catalog over what `install` ships. A game whose own codec
+    /// reads its islands (2070) is scanned through it: every prop's model
+    /// and every object's (by its asset in `assets`, the install's database)
+    /// counts as a prop, since conversion places either kind by model.
+    /// Others read their a7m prop grids and object stores (`build`).
+    pub fn of(
+        module: &dyn anno_core::game::Module,
+        install: &Install,
+        assets: Option<&anno_formats::assets::Assets>,
+    ) -> Result<Catalog> {
+        let islands = module.islands().context("this game has no islands")?;
+        let Some(codec) = islands.codec().own() else {
+            return Self::build(islands.rules(), install);
+        };
+        let shipped = islands.shipped(install, assets);
+        let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let chunk = shipped.len().div_ceil(threads).max(1);
+        // Per island: model, instances and their vertical scales.
+        let scanned: Vec<(&str, HashMap<String, (u32, Vec<f32>)>)> = std::thread::scope(|scope| {
+            let workers: Vec<_> = (shipped.chunks(chunk))
+                .map(|list| {
+                    scope.spawn(move || {
+                        let mut out = Vec::new();
+                        for s in list {
+                            let island = match codec.read(install, &s.path, assets) {
+                                Ok(island) => island,
+                                Err(e) => {
+                                    eprintln!("catalog: {}: {e:#}", s.path);
+                                    continue;
+                                }
+                            };
+                            let doc = &island.doc;
+                            let mut models: HashMap<String, (u32, Vec<f32>)> = HashMap::new();
+                            for p in doc.props.iter() {
+                                if let Some(m) = doc.meshes.get(p.source.file as usize) {
+                                    let e = models.entry(m.clone()).or_default();
+                                    e.0 += 1;
+                                    e.1.push(p.source.scale[1]);
+                                }
+                            }
+                            for o in doc.objects.iter() {
+                                let cfg = (assets.and_then(|a| a.get(o.guid)))
+                                    .filter(|a| !a.cfgs.is_empty())
+                                    .map(|a| a.cfgs[o.variation as usize % a.cfgs.len()].clone());
+                                if let Some(cfg) = cfg {
+                                    let e = models.entry(cfg.replace('\\', "/")).or_default();
+                                    e.0 += 1;
+                                    e.1.push(o.scale[1]);
+                                }
+                            }
+                            out.push((s.region.as_str(), models));
+                        }
+                        out
+                    })
+                })
+                .collect();
+            (workers.into_iter())
+                .flat_map(|w| w.join().expect("catalog worker"))
+                .collect()
+        });
+        let mut props: BTreeMap<String, (u32, Vec<f32>, Vec<String>)> = BTreeMap::new();
+        for (region, models) in scanned {
+            for (path, (n, scales)) in models {
+                let e = props.entry(path).or_default();
+                e.0 += n;
+                e.1.extend(scales);
+                if !e.2.iter().any(|r| r == region) {
+                    e.2.push(region.to_owned());
+                }
+            }
+        }
+        let mut props: Vec<PropEntry> = (props.into_iter())
+            .map(|(path, (uses, scales, mut regions))| {
+                regions.sort_unstable();
+                PropEntry {
+                    path,
+                    uses,
+                    scale: median(scales),
+                    regions,
+                }
+            })
+            .collect();
+        props.sort_by(|a, b| b.uses.cmp(&a.uses).then(a.path.cmp(&b.path)));
+        Ok(Catalog {
+            props,
+            ..Catalog::default()
         })
     }
 }
@@ -211,8 +290,8 @@ pub fn island_models(install: &Install, path: &str) -> Result<Vec<String>> {
 /// One island's prop files with instance counts, and object guids with
 /// counts. Reads only the two ADF trees, not the whole island model.
 fn scan(install: &Install, path: &str) -> Result<Scan> {
-    let archive = Archive::from_bytes(install.read(path)?, path)?;
-    let rd = Adf::decode(&archive.read_path("rd3d.data")?)?;
+    let archive = Archive::parse(install.read(path)?, path)?;
+    let rd = Adf::parse(&archive.read_path("rd3d.data")?)?;
     let grid = rd
         .child_node(rd.root(), "PropGrid")
         .context("no PropGrid")?;
@@ -239,7 +318,7 @@ fn scan(install: &Install, path: &str) -> Result<Scan> {
         .zip(counts)
         .filter(|(_, n)| n.0 > 0)
         .collect();
-    let gamedata = Adf::decode(&archive.read_path("gamedata.data")?)?;
+    let gamedata = Adf::parse(&archive.read_path("gamedata.data")?)?;
     let mut objects = HashMap::new();
     let mut decorations: HashMap<String, (u32, u32)> = HashMap::new();
     if let Ok(store) = Objects::read(&gamedata) {
@@ -265,8 +344,9 @@ fn scan(install: &Install, path: &str) -> Result<Scan> {
 
 /// Thumbnail side in pixels, as cached and shown.
 pub const THUMB: u32 = 96;
-/// Bumped when thumbnails should re-render (camera, lighting, size).
-const THUMB_VERSION: u32 = 5;
+/// Bumped when thumbnails should re-render (camera, lighting, size). 6: the
+/// game's model look, dye and glow as the Assets preview draws them.
+const THUMB_VERSION: u32 = 6;
 
 /// What a prop looks like, for matching props across games: measured from
 /// its thumbnail and model bounds when the thumbnail renders, and cached
@@ -442,40 +522,58 @@ pub struct Thumbs {
     small: HashMap<String, Arc<RenderImage>>,
     looks: HashMap<String, Look>,
     requested: HashSet<String>,
-    send: Option<mpsc::Sender<Vec<String>>>,
-    done: mpsc::Receiver<(String, Option<image::RgbaImage>, Option<Look>)>,
+    send: mpsc::Sender<Vec<String>>,
+    done: mpsc::Receiver<(String, Finished)>,
     worker: Option<std::thread::JoinHandle<()>>,
     /// The PNG cache, keyed like the worker keys it.
     dir: PathBuf,
 }
 
+// Dropping closes both queues and does not wait: the worker ends after the
+// render it is on, when its answer finds nobody listening. Joining it here
+// held the dropping thread, the UI's on a game switch, for that render:
+// 0.45 s for a first one, which also builds its pipelines. Exit still
+// waits for it (gpu::join_at_exit): a worker ending while exit tore the GPU
+// driver down crashed the process.
 impl Drop for Thumbs {
-    // Closing the queue ends the worker; wait so it frees its Vulkan device
-    // before the process tears the driver down (at most one render).
     fn drop(&mut self) {
-        self.send = None;
         if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
+            gpui_editor_kit::gpu::join_at_exit(worker);
         }
     }
 }
 
+/// Where a test holds the worker inside a render: the worker says it got
+/// there on the first and waits on the second, until a message comes or
+/// the sender goes, so a failed test cannot strand it.
+type RenderGate = (mpsc::Sender<()>, mpsc::Receiver<()>);
+
 impl Thumbs {
-    /// Starts the worker; it exits when this is dropped.
-    pub fn start(install: Arc<Install>, dir: PathBuf) -> Thumbs {
+    /// Starts the worker, drawing models with `look`; it exits when this
+    /// is dropped.
+    pub fn new(install: Arc<Install>, dir: PathBuf, look: ModelLook) -> Thumbs {
+        Thumbs::spawn(install, dir, look, None)
+    }
+
+    fn spawn(
+        install: Arc<Install>,
+        dir: PathBuf,
+        look: ModelLook,
+        gate: Option<RenderGate>,
+    ) -> Thumbs {
         let (send, requests) = mpsc::channel();
         let (finished, done) = mpsc::channel();
         let cache = dir.clone();
         let worker = std::thread::Builder::new()
             .name("thumbnails".into())
-            .spawn(move || thumbnail_worker(&install, &dir, requests, finished))
+            .spawn(move || thumbnail_worker(&install, &dir, &look, requests, finished, gate))
             .expect("spawn thumbnail thread");
         Thumbs {
             images: HashMap::new(),
             small: HashMap::new(),
             looks: HashMap::new(),
             requested: HashSet::new(),
-            send: Some(send),
+            send,
             done,
             worker: Some(worker),
             dir: cache,
@@ -519,34 +617,22 @@ impl Thumbs {
             .filter(|c| self.requested.insert((*c).to_owned()))
             .map(str::to_owned)
             .collect();
-        if let (false, Some(send)) = (fresh.is_empty(), &self.send) {
-            let _ = send.send(fresh);
+        if !fresh.is_empty() {
+            let _ = self.send.send(fresh);
         }
     }
 
     /// Takes finished thumbnails; true if there were any.
     pub fn receive(&mut self) -> bool {
         let mut any = false;
-        while let Ok((cfg, img, look)) = self.done.try_recv() {
-            // Models get the rim; island maps sit on their own sea blue.
-            let model = look.is_some();
-            if let Some(look) = look {
+        while let Ok((cfg, done)) = self.done.try_recv() {
+            if let Some(look) = done.look {
                 self.looks.insert(cfg.clone(), look);
             }
-            if let Some(img) = &img
-                && let Some(small) = shrink_thin(img, 3, model)
-            {
+            if let Some(small) = done.small {
                 self.small.insert(cfg.clone(), small);
             }
-            let image = img.and_then(|img| {
-                let (w, h) = img.dimensions();
-                let mut raw = img.into_raw();
-                if model {
-                    halo(&mut raw, w, h);
-                }
-                Some(Texture::from_rgba(w, h, raw).ok()?.render_image())
-            });
-            self.images.insert(cfg, image);
+            self.images.insert(cfg, done.image);
             any = true;
         }
         any
@@ -564,11 +650,39 @@ impl Thumbs {
     }
 }
 
+/// A thumbnail ready to draw, both sizes.
+struct Finished {
+    image: Option<Arc<RenderImage>>,
+    small: Option<Arc<RenderImage>>,
+    look: Option<Look>,
+}
+
+impl Finished {
+    /// Made on the worker: the rim and the shrink touch every pixel, and a
+    /// pane of cached thumbnails arrives in one frame.
+    fn new(img: Option<image::RgbaImage>, look: Option<Look>) -> Finished {
+        // Models get the rim; island maps sit on their own sea blue.
+        let model = look.is_some();
+        let small = img.as_ref().and_then(|img| shrink_thin(img, 3, model));
+        let image = img.and_then(|img| {
+            let (w, h) = img.dimensions();
+            let mut raw = img.into_raw();
+            if model {
+                halo(&mut raw, w, h);
+            }
+            Some(Texture::from_rgba(w, h, raw).ok()?.render_image())
+        });
+        Finished { image, small, look }
+    }
+}
+
 fn thumbnail_worker(
     install: &Install,
     dir: &Path,
+    look: &ModelLook,
     requests: mpsc::Receiver<Vec<String>>,
-    finished: mpsc::Sender<(String, Option<image::RgbaImage>, Option<Look>)>,
+    finished: mpsc::Sender<(String, Finished)>,
+    gate: Option<RenderGate>,
 ) {
     // Batches newest last; work takes the front of the newest.
     let mut batches: Vec<VecDeque<String>> = Vec::new();
@@ -616,13 +730,13 @@ fn thumbnail_worker(
                     let made = map_thumbnail(install, &cfg);
                     let _ = std::fs::create_dir_all(dir);
                     let _ = match &made {
-                        Some(img) => img.save(&file).map_err(anyhow::Error::from),
-                        None => std::fs::write(&file, []).map_err(anyhow::Error::from),
+                        Some(img) => save_png(img, &file),
+                        None => write_atomic(&file, &[]).map_err(anyhow::Error::from),
                     };
                     made
                 }
             };
-            if finished.send((cfg, image, None)).is_err() {
+            if finished.send((cfg, Finished::new(image, None))).is_err() {
                 break;
             }
             continue;
@@ -649,7 +763,11 @@ fn thumbnail_worker(
             None => {
                 if gpu.is_none() {
                     match Offscreen::new(THUMB * 2, THUMB * 2) {
-                        Ok(target) => gpu = Some((target, Renderer::default())),
+                        Ok(target) => {
+                            // The families the look's meshes draw in.
+                            let renderer = Renderer::with_families(look.families());
+                            gpu = Some((target, renderer))
+                        }
                         Err(e) => {
                             eprintln!("thumbnails: {e:#}");
                             broken = true;
@@ -657,20 +775,27 @@ fn thumbnail_worker(
                         }
                     }
                 }
+                // Exit waits for a render that has its Busy; past exit's
+                // start there are no more.
+                let Some(_busy) = gpui_editor_kit::gpu::busy() else {
+                    break;
+                };
                 let (target, renderer) = gpu.as_mut().expect("created above");
-                let rendered = render_thumbnail(install, target, renderer, &cfg)
+                if let Some((reached, go)) = &gate {
+                    let _ = reached.send(());
+                    let _ = go.recv();
+                }
+                let rendered = render_thumbnail(install, target, renderer, &cfg, look)
                     .map_err(|e| eprintln!("thumbnail {cfg}: {e:#}"))
                     .ok()
                     .flatten();
                 let look = (rendered.as_ref()).and_then(|(img, size)| Look::measure(img, *size));
                 let _ = std::fs::create_dir_all(dir);
                 let saved = match (&rendered, look) {
-                    (Some((img, _)), Some(look)) => img
-                        .save(&file)
-                        .and_then(|()| Ok(std::fs::write(&look_file, look.to_bytes())?))
-                        .map_err(anyhow::Error::from),
+                    (Some((img, _)), Some(look)) => save_png(img, &file)
+                        .and_then(|()| Ok(write_atomic(&look_file, &look.to_bytes())?)),
                     _ if modded => Ok(()),
-                    _ => std::fs::write(&file, []).map_err(anyhow::Error::from),
+                    _ => write_atomic(&file, &[]).map_err(anyhow::Error::from),
                 };
                 if let Err(e) = saved {
                     eprintln!("thumbnail cache {}: {e:#}", file.display());
@@ -678,18 +803,24 @@ fn thumbnail_worker(
                 (rendered.map(|r| r.0), look)
             }
         };
-        if finished.send((cfg, image, look)).is_err() {
+        if finished.send((cfg, Finished::new(image, look))).is_err() {
             break;
         }
+    }
+    // Freeing the target and renderer is GPU work too: while exit waits,
+    // or not at all once it has begun.
+    match gpui_editor_kit::gpu::busy() {
+        Some(_busy) => drop(gpu),
+        None => std::mem::forget(gpu),
     }
 }
 
 /// Bump when island map thumbnails change; model thumbnails keep theirs.
-const MAP_VERSION: u32 = 4;
+const MAP_VERSION: u32 = 5;
 
-/// An island's map image (`_gamedata/<name>/mapimage_0.dds`) cut to the
-/// land with a small margin, square, at twice the list's 30 px icon. Sea is
-/// transparent so the row shows through; `None` without a map image.
+/// An island's minimap picture cut to the land with a small margin, square,
+/// at twice the list's 30 px icon. Sea is transparent so the row shows
+/// through; `None` without a picture or without land above the sea.
 fn map_thumbnail(install: &Install, path: &str) -> Option<image::RgbaImage> {
     map_image(install, path, 60)
 }
@@ -711,140 +842,122 @@ pub fn map_preview(
 }
 
 fn map_image(install: &Install, path: &str, edge: u32) -> Option<image::RgbaImage> {
-    let bytes = install
-        .read(&format!(
-            "{}/mapimage_0.dds",
-            super::doc::island_data_dir(path).ok()?
-        ))
-        .ok()?;
-    let dds = gpui_editor_kit::texture::Dds::parse(&bytes).ok()?;
-    let image = dds.decode(&bytes, 0).ok()?;
-    let (w, h) = (image.width, image.height);
-    let mask = land_mask(&image.rgba, w, h);
+    cut(&land_image(install, path, edge)?, edge)
+}
+
+/// `full` cut to its opaque part, square, `edge` px a side.
+fn cut(full: &image::RgbaImage, edge: u32) -> Option<image::RgbaImage> {
+    let (w, h) = full.dimensions();
     let (mut x0, mut y0, mut x1, mut y1) = (w, h, 0, 0);
-    for y in 0..h {
-        for x in 0..w {
-            if mask.contains((y * w + x) as usize) {
-                (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
-            }
+    for (x, y, p) in full.enumerate_pixels() {
+        if p.0[3] >= 128 {
+            (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
         }
     }
     if x0 > x1 {
         return None;
     }
-    // Square around the land's centre, 6 % margin.
-    let side = ((x1 - x0).max(y1 - y0) as f32 * 1.12) as u32 + 1;
+    // Square around the land's centre, 6 % margin, clear past the
+    // picture's edge: minimap pictures are cut to the island, rarely
+    // square, and a crop clamped to one was stretched square. Magnified 2x
+    // at most, so a deco rock of a few texels stays a small rock instead
+    // of a blur filling the tile.
+    let side = (((x1 - x0).max(y1 - y0) as f32 * 1.12) as u32 + 1).max(edge / 2);
     let (cx, cy) = ((x0 + x1) / 2, (y0 + y1) / 2);
-    let mut rgba = image.rgba;
-    for (i, texel) in rgba.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-        texel[3] = if mask.contains(i) { 255 } else { 0 };
+    let mut crop = image::RgbaImage::new(side, side);
+    let at = |c: u32| i64::from(side / 2) - i64::from(c);
+    image::imageops::replace(&mut crop, full, at(cx), at(cy));
+    // The filter weighs colour as it is: premultiplied, so the transparent
+    // sea's black stays out of the coast instead of rimming it dark.
+    for p in crop.pixels_mut() {
+        let a = u32::from(p.0[3]);
+        for c in 0..3 {
+            p.0[c] = ((u32::from(p.0[c]) * a + 127) / 255) as u8;
+        }
     }
-    let full = image::RgbaImage::from_raw(w, h, rgba)?;
-    let left = cx
-        .saturating_sub(side / 2)
-        .min(w.saturating_sub(side.min(w)));
-    let top = cy
-        .saturating_sub(side / 2)
-        .min(h.saturating_sub(side.min(h)));
-    let crop = image::imageops::crop_imm(&full, left, top, side.min(w), side.min(h)).to_image();
-    Some(image::imageops::resize(
-        &crop,
-        edge,
-        edge,
-        image::imageops::FilterType::Triangle,
-    ))
-}
-
-/// Which texels of a map image are land. The image covers the sea floor
-/// too, opaque, and its colour varies by pack: dark blue-grey in the base
-/// game, teal in DLC 3, with baked noise and streaks in some DLC 1 maps.
-/// Land is lit, not blue, and unlike the sea at the image's border; of
-/// that, only sizeable connected pieces count, so speckle and stray strips
-/// in the sea drop out.
-fn land_mask(rgba: &[u8], w: u32, h: u32) -> Mask {
-    let n = (w * h) as usize;
-    let at = |i: usize| -> [i32; 4] { std::array::from_fn(|c| i32::from(rgba[i * 4 + c])) };
-    // The sea's colour: the per-channel median of the opaque border
-    // texels. A median, since some maps have a black corner.
-    let mut border: [Vec<i32>; 3] = Default::default();
-    for y in 0..h {
-        for x in 0..w {
-            if x > 1 && y > 1 && x + 2 < w && y + 2 < h {
-                continue;
-            }
-            let t = at((y * w + x) as usize);
-            if t[3] >= 128 {
-                (0..3).for_each(|c| border[c].push(t[c]));
+    let mut out = image::imageops::resize(&crop, edge, edge, image::imageops::FilterType::Triangle);
+    for p in out.pixels_mut() {
+        let a = u32::from(p.0[3]);
+        for c in 0..3 {
+            if let Some(v) = (u32::from(p.0[c]) * 255 + a / 2).checked_div(a) {
+                p.0[c] = v.min(255) as u8;
             }
         }
     }
-    let sea = (!border[0].is_empty()).then(|| {
-        border.map(|mut v| {
-            let mid = v.len() / 2;
-            *v.select_nth_unstable(mid).1
+    Some(out)
+}
+
+/// `path`'s minimap picture, `_gamedata/<name>/gamemapimage_0.dds`, sea
+/// transparent, at the first mip no more than twice `edge` (512 at
+/// least: a deco rock is a few texels of its picture). It is the
+/// game's own cut: inland lakes, rivers and dark forest stay, shallows
+/// go. Every shipped island has one and saves rewrite it with the others
+/// (new::map_images). `mapimage_0.dds` is no use here: its sea is opaque,
+/// and some shipped ones are stale, patched with blocks of an old render.
+pub(crate) fn land_image(install: &Install, path: &str, edge: u32) -> Option<image::RgbaImage> {
+    let bytes = install
+        .read(&format!(
+            "{}/gamemapimage_0.dds",
+            super::doc::island_data_dir(path).ok()?
+        ))
+        .ok()?;
+    let dds = gpui_editor_kit::texture::Dds::parse(&bytes).ok()?;
+    // Mip 0 of a continental island's 1792 px picture made the hovered
+    // preview decode and resize four times the texels; mip 1 is plenty.
+    let image = dds.decode(&bytes, dds.mip_for((edge * 2).max(512))).ok()?;
+    let mut img = image::RgbaImage::from_raw(image.width, image.height, image.rgba)?;
+    land_alpha(&mut img);
+    Some(img)
+}
+
+/// Clears what is not land from a minimap picture: Anno 1800's drop
+/// shadow, pure black with its alpha fading out from the coast and opaque
+/// right at it, and the near-black blocks some DLC 3 quadrant pictures
+/// have where they were never drawn. Both touch the clear sea; dark land
+/// does not, so the sea grows from the clear texels through dark ones
+/// only. Black inside the land stays, as the game draws it: a long strip
+/// across the Arctic's colony03_a03_01.
+fn land_alpha(img: &mut image::RgbaImage) {
+    // Below this in every channel a texel is shadow, if the sea reaches it.
+    const DARK: u8 = 8;
+    let (w, h) = (img.width() as usize, img.height() as usize);
+    let texels = img.as_chunks_mut::<4>().0;
+    let dark = |t: &[u8; 4]| t[0].max(t[1]).max(t[2]) < DARK;
+    let clear = |t: &[u8; 4]| t[3] < 128;
+    // The shadow's faint outer ring is sea outright.
+    for t in texels.iter_mut() {
+        if clear(t) && dark(t) {
+            t[3] = 0;
+        }
+    }
+    let around = |i: usize| {
+        let (x, y) = (i % w, i / w);
+        [
+            (x > 0).then(|| i - 1),
+            (x + 1 < w).then(|| i + 1),
+            (y > 0).then(|| i - w),
+            (y + 1 < h).then(|| i + w),
+        ]
+        .into_iter()
+        .flatten()
+    };
+    // Texel indices fit u32: the kit caps a DDS side at MAX_SIDE.
+    let mut stack: Vec<u32> = (0..texels.len())
+        .filter(|&i| {
+            let t = &texels[i];
+            !clear(t) && dark(t) && around(i).any(|j| clear(&texels[j]))
         })
-    });
-    // Per texel: NOT_LAND, or land not yet given a piece, or its piece.
-    const NOT_LAND: u32 = u32::MAX;
-    const UNSEEN: u32 = u32::MAX - 1;
-    let mut piece: Vec<u32> = (0..n)
-        .map(|i| {
-            let [r, g, b, a] = at(i);
-            // With a transparent sea (the editor's own map images) alpha
-            // marks the land; the brightness test, made for the game's
-            // sandy maps, kept a dark green island's lit rim only.
-            let lit = a >= 128 && (sea.is_none() || (r + g + b) > 190 && b <= r.max(g) + 12);
-            let unlike_sea =
-                sea.is_none_or(|s| (r - s[0]).abs() + (g - s[1]).abs() + (b - s[2]).abs() > 60);
-            if lit && unlike_sea { UNSEEN } else { NOT_LAND }
-        })
+        .map(|i| i as u32)
         .collect();
-    // Connected pieces (4-neighbour), kept when at least a tenth of the
-    // largest: an island's islets stay, the sea's specks go.
-    let mut sizes: Vec<usize> = Vec::new();
-    let mut stack = Vec::new();
-    for seed in 0..n {
-        if piece[seed] != UNSEEN {
-            continue;
-        }
-        let id = sizes.len() as u32;
-        let mut size = 0;
-        piece[seed] = id;
-        stack.push(seed);
-        while let Some(i) = stack.pop() {
-            size += 1;
-            let (x, y) = (i as u32 % w, i as u32 / w);
-            let around = [
-                (x > 0).then(|| i - 1),
-                (x + 1 < w).then(|| i + 1),
-                (y > 0).then(|| i - w as usize),
-                (y + 1 < h).then(|| i + w as usize),
-            ];
-            for j in around.into_iter().flatten() {
-                if piece[j] == UNSEEN {
-                    piece[j] = id;
-                    stack.push(j);
-                }
+    // Cleared when pushed, so each texel goes on the stack once.
+    stack.iter().for_each(|&i| texels[i as usize][3] = 0);
+    while let Some(i) = stack.pop() {
+        for j in around(i as usize) {
+            if !clear(&texels[j]) && dark(&texels[j]) {
+                texels[j][3] = 0;
+                stack.push(j as u32);
             }
         }
-        sizes.push(size);
-    }
-    let keep = sizes.iter().max().map_or(0, |m| m / 10).max(1);
-    let mut out = Mask(vec![0; n.div_ceil(64)]);
-    for (i, &p) in piece.iter().enumerate() {
-        if p != NOT_LAND && sizes[p as usize] >= keep {
-            out.0[i / 64] |= 1 << (i % 64);
-        }
-    }
-    out
-}
-
-/// One bit per texel.
-struct Mask(Vec<u64>);
-
-impl Mask {
-    fn contains(&self, i: usize) -> bool {
-        self.0[i / 64] >> (i % 64) & 1 == 1
     }
 }
 
@@ -859,17 +972,18 @@ fn thumb_key(cfg: &str) -> u64 {
         })
 }
 
-/// `cfg` from a three-quarter view, fitted to its bounds; `None` when it
-/// has no drawable piece.
-fn render_thumbnail(
+/// `cfg` from a three-quarter view, fitted to its bounds, dyed and glowing
+/// as `look` says; `None` when it has no drawable piece.
+pub(crate) fn render_thumbnail(
     install: &Install,
     target: &mut Offscreen,
     renderer: &Renderer,
     cfg: &str,
+    look: &ModelLook,
 ) -> Result<Option<(image::RgbaImage, [f32; 3])>> {
     // A fresh texture cache per model keeps the worker's memory flat over
     // thousands of models; repeats within one model still share.
-    let pieces = models::load(install, &Cache::default(), cfg, 1.)?;
+    let pieces = models::load(install, &Cache::new(look), cfg, 1.)?;
     if pieces.is_empty() {
         return Ok(None);
     }
@@ -902,6 +1016,7 @@ fn render_thumbnail(
             ground: [0.85; 3],
             ..Default::default()
         },
+        glow: look.glow(&look.scene_glow()),
         ..Default::default()
     });
     let camera = Camera {
@@ -1074,21 +1189,41 @@ fn downsample(pixels: &[u8], side: u32) -> image::RgbaImage {
     })
 }
 
+/// Writes `bytes` beside `path` and renames them over it. Exit may end the
+/// process while a thumbnail worker writes (the kit's exit hook), and a torn
+/// file would stay in the cache: an empty one means "no thumbnail", a cut-off
+/// PNG fails to load on every later open.
+fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = path.with_extension("writing");
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)
+}
+
+/// `img` as a PNG at `path`, written as `write_atomic` does.
+fn save_png(img: &image::RgbaImage, path: &std::path::Path) -> anyhow::Result<()> {
+    let mut png = std::io::Cursor::new(Vec::new());
+    img.write_to(&mut png, image::ImageFormat::Png)?;
+    Ok(write_atomic(path, png.get_ref())?)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Catalog, THUMB, Thumbs, land_mask, thumb_key};
+    use super::{Catalog, THUMB, Thumbs, cut, land_alpha, thumb_key};
+    use anno_core::files::ModelLook;
     use anno_formats::vfs::Install;
-    use std::sync::Arc;
+    use std::sync::{Arc, mpsc};
+    use std::time::Duration;
 
     #[test]
     fn catalog_has_shipped_props_and_waterfalls() {
-        let Some(dir) = std::env::var_os("ANNO117_DIR") else {
+        let Some(dir) = anno_formats::vfs::install_dir("ANNO117_DIR") else {
             eprintln!("skip: ANNO117_DIR unset");
             return;
         };
-        let install = Install::open(dir).unwrap();
+        let families = crate::games::profile(anno_core::game::Game::Anno117).archive_families;
+        let install = Install::open(dir, families).unwrap();
         let t = std::time::Instant::now();
-        let c = Catalog::build(&install).unwrap();
+        let c = Catalog::build(crate::games::rules(crate::games::of(&install)), &install).unwrap();
         eprintln!(
             "catalog: {} props, {} objects, {} decorations in {:?}",
             c.props.len(),
@@ -1113,21 +1248,17 @@ mod tests {
                 .expect("waterfall");
             assert!(o.island.ends_with(".a7m"));
         }
-        // The cache round-trips.
-        let dir = tempfile::tempdir().unwrap();
-        let cache = dir.path().join("catalog.json");
-        std::fs::write(&cache, serde_json::to_vec(&c).unwrap()).unwrap();
-        assert_eq!(Catalog::load_or_build(&install, &cache).unwrap(), c);
     }
 
     // Needs the game and a Vulkan device.
     #[test]
     fn thumbnails_render_once_then_come_from_the_cache() {
-        let Some(dir) = std::env::var_os("ANNO117_DIR") else {
+        let Some(dir) = anno_formats::vfs::install_dir("ANNO117_DIR") else {
             eprintln!("skip: ANNO117_DIR unset");
             return;
         };
-        let install = Arc::new(Install::open(dir).unwrap());
+        let families = crate::games::profile(anno_core::game::Game::Anno117).archive_families;
+        let install = Arc::new(Install::open(dir, families).unwrap());
         let cache = tempfile::tempdir().unwrap();
         let tree = "data/base/graphics/roman/environment/props/vegetation/trees/olive_trees/olive_tree_07.cfg";
         let missing = "data/base/graphics/does/not/exist.cfg";
@@ -1139,7 +1270,7 @@ mod tests {
                 thumbs.receive();
             }
         };
-        let mut thumbs = Thumbs::start(install.clone(), cache.path().to_owned());
+        let mut thumbs = Thumbs::new(install.clone(), cache.path().to_owned(), ModelLook::PLAIN);
         thumbs.request([tree, missing]);
         wait(&mut thumbs);
         assert!(thumbs.get(tree).is_some());
@@ -1156,52 +1287,264 @@ mod tests {
 
         // A second session reads the PNG instead of rendering.
         let stamp = std::fs::metadata(&file).unwrap().modified().unwrap();
-        let mut again = Thumbs::start(install, cache.path().to_owned());
+        let mut again = Thumbs::new(install, cache.path().to_owned(), ModelLook::PLAIN);
         again.request([tree]);
         wait(&mut again);
         assert!(again.get(tree).is_some());
         assert_eq!(std::fs::metadata(&file).unwrap().modified().unwrap(), stamp);
     }
 
+    // Needs the game and a Vulkan device: dropping the thumbnails while
+    // the worker renders hands back without waiting for the render. The
+    // render is held on a gate, so the drop lands mid-render for certain,
+    // and a drop that joined the worker could not return before it opens.
+    // A wall-clock bound on the drop failed in loaded suite runs.
     #[test]
-    fn land_mask_takes_every_opaque_texel_on_a_transparent_sea() {
-        // The editor's own map image: dark green land, sea fully clear.
-        let (w, h) = (20u32, 20u32);
-        let mut rgba = [58u8, 66, 34, 0].repeat((w * h) as usize);
-        for y in 5..15 {
-            for x in 5..15 {
-                let i = ((y * w + x) * 4) as usize;
-                rgba[i..i + 4].copy_from_slice(&[50, 60, 30, 255]);
+    fn dropping_thumbnails_mid_render_does_not_wait_for_it() {
+        let Some(dir) = anno_formats::vfs::install_dir("ANNO117_DIR") else {
+            eprintln!("skip: ANNO117_DIR unset");
+            return;
+        };
+        let families = crate::games::profile(anno_core::game::Game::Anno117).archive_families;
+        let install = Arc::new(Install::open(dir, families).unwrap());
+        let cache = tempfile::tempdir().unwrap();
+        let tree = "data/base/graphics/roman/environment/props/vegetation/trees/olive_trees/olive_tree_07.cfg";
+        let (reached, rendering) = mpsc::channel();
+        let (go, held) = mpsc::channel();
+        let mut thumbs = Thumbs::spawn(
+            install,
+            cache.path().to_owned(),
+            ModelLook::PLAIN,
+            Some((reached, held)),
+        );
+        thumbs.request([tree]);
+        rendering
+            .recv_timeout(Duration::from_secs(120))
+            .expect("the worker never started the render");
+        let (dropped, returned) = mpsc::channel();
+        std::thread::spawn(move || {
+            drop(thumbs);
+            let _ = dropped.send(());
+        });
+        let returned = returned.recv_timeout(Duration::from_secs(30));
+        let _ = go.send(());
+        assert!(returned.is_ok(), "drop waited for the render");
+    }
+
+    // Every shipped island's map thumbnail on contact sheets, to eyeball
+    // the sea cut: per island its minimap picture made opaque, the same
+    // with what the cut clears tinted magenta, and the thumbnail over a
+    // list row's grey. `ANNO117_DIR=… ANNO1800_DIR=… ISLAND_THUMBS=<dir>
+    // cargo test island_thumbnail_sheets -- --ignored --nocapture`; each
+    // sheet-NN.png has a sheet-NN.txt naming its tiles in reading order.
+    #[test]
+    #[ignore]
+    fn island_thumbnail_sheets() {
+        const S: u32 = 128;
+        const COLS: u32 = 4;
+        const ROWS: u32 = 8;
+        let Some(out) = std::env::var_os("ISLAND_THUMBS").map(std::path::PathBuf::from) else {
+            eprintln!("skip: ISLAND_THUMBS unset");
+            return;
+        };
+        std::fs::create_dir_all(&out).unwrap();
+        let mut islands = Vec::new();
+        for game in [
+            anno_core::game::Game::Anno117,
+            anno_core::game::Game::Anno1800,
+        ] {
+            let profile = crate::games::profile(game);
+            let Some(dir) = anno_formats::vfs::install_dir(profile.env_var) else {
+                continue;
+            };
+            let install = Arc::new(Install::open(dir, profile.archive_families).unwrap());
+            let mut paths: Vec<String> = install
+                .search(".a7m", 100_000)
+                .into_iter()
+                .map(|id| install.file_path(id).to_owned())
+                .filter(|p| p.ends_with(".a7m") && p.contains("/islands/"))
+                .collect();
+            paths.sort();
+            islands.extend(paths.into_iter().map(|p| (install.clone(), p)));
+        }
+        let (tile_w, tile_h) = (3 * S + 12, S + 6);
+        let mut spent = std::time::Duration::ZERO;
+        for (page, chunk) in islands.chunks((COLS * ROWS) as usize).enumerate() {
+            let mut sheet = image::RgbaImage::from_pixel(
+                COLS * tile_w,
+                ROWS * tile_h,
+                [16, 16, 20, 255].into(),
+            );
+            let mut names = String::new();
+            for (k, (install, path)) in chunk.iter().enumerate() {
+                names.push_str(&format!("{k:2} {path}\n"));
+                let (tx, ty) = (
+                    (k as u32 % COLS) * tile_w + 3,
+                    (k as u32 / COLS) * tile_h + 3,
+                );
+                let started = std::time::Instant::now();
+                let land = super::land_image(install, path, S);
+                let thumb = super::map_image(install, path, S);
+                spent += started.elapsed();
+                let Some(land) = land else {
+                    continue;
+                };
+                let mut orig = land.clone();
+                orig.pixels_mut().for_each(|p| p.0[3] = 255);
+                let mut cut = orig.clone();
+                for (p, l) in cut.pixels_mut().zip(land.pixels()) {
+                    // Magenta over what the cut makes transparent.
+                    let t = 255 - u32::from(l.0[3]);
+                    let m = [255, 0, 255];
+                    (0..3).for_each(|c| {
+                        p.0[c] = ((u32::from(p.0[c]) * (510 - t) + m[c] * t) / 510) as u8
+                    });
+                }
+                let fit = |i: &image::RgbaImage| {
+                    image::imageops::resize(i, S, S, image::imageops::FilterType::Triangle)
+                };
+                image::imageops::overlay(&mut sheet, &fit(&orig), i64::from(tx), i64::from(ty));
+                image::imageops::overlay(
+                    &mut sheet,
+                    &fit(&cut),
+                    i64::from(tx + S + 3),
+                    i64::from(ty),
+                );
+                let mut row = image::RgbaImage::from_pixel(S, S, [44, 46, 52, 255].into());
+                if let Some(t) = thumb {
+                    image::imageops::overlay(&mut row, &t, 0, 0);
+                }
+                image::imageops::overlay(
+                    &mut sheet,
+                    &row,
+                    i64::from(tx + 2 * (S + 3)),
+                    i64::from(ty),
+                );
+                stamp(&mut sheet, tx + 2, ty + 2, k as u32);
+            }
+            sheet
+                .save(out.join(format!("sheet-{page:02}.png")))
+                .unwrap();
+            std::fs::write(out.join(format!("sheet-{page:02}.txt")), names).unwrap();
+        }
+        eprintln!("{} islands, cut + thumbnail {spent:?}", islands.len());
+    }
+
+    /// Writes `n` in a 3x5 pixel font, doubled, white on black.
+    fn stamp(img: &mut image::RgbaImage, x: u32, y: u32, n: u32) {
+        const DIGITS: [u16; 10] = [
+            0o75557, 0o22222, 0o71747, 0o71717, 0o55711, 0o74717, 0o74757, 0o71111, 0o75757,
+            0o75717,
+        ];
+        let text = n.to_string();
+        let w = text.len() as u32 * 8 + 2;
+        for dy in 0..12 {
+            for dx in 0..w {
+                img.put_pixel(x + dx, y + dy, [0, 0, 0, 255].into());
             }
         }
-        let mask = land_mask(&rgba, w, h);
-        let at = |x: u32, y: u32| mask.contains((y * w + x) as usize);
-        assert!(at(5, 5) && at(10, 10) && at(14, 14), "dark land");
-        assert!(!at(0, 0), "sea");
+        for (d, ch) in text.bytes().enumerate() {
+            let bits = DIGITS[usize::from(ch - b'0')];
+            for row in 0..5 {
+                for col in 0..3 {
+                    if bits >> ((4 - row) * 3 + (2 - col)) & 1 == 1 {
+                        for (sx, sy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                            let px = x + 2 + d as u32 * 8 + col * 2 + sx;
+                            img.put_pixel(px, y + 1 + row * 2 + sy, [255, 255, 255, 255].into());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A `w` x `h` minimap picture of clear sea, `paint` filling texels.
+    fn picture(w: u32, h: u32, paint: impl Fn(u32, u32) -> Option<[u8; 4]>) -> image::RgbaImage {
+        image::RgbaImage::from_fn(w, h, |x, y| paint(x, y).unwrap_or([0, 0, 0, 0]).into())
     }
 
     #[test]
-    fn land_mask_drops_the_sea_and_its_specks() {
-        // 40x40 of opaque teal sea (DLC 3's), a 20x20 sand island, and a
-        // 2x2 sand speck in a corner.
-        let (w, h) = (40u32, 40u32);
-        let mut rgba = [20u8, 90, 80, 255].repeat((w * h) as usize);
-        let sand = |rgba: &mut Vec<u8>, x: u32, y: u32| {
-            let i = ((y * w + x) * 4) as usize;
-            rgba[i..i + 4].copy_from_slice(&[200, 170, 110, 255]);
-        };
-        for y in 10..30 {
-            for x in 10..30 {
-                sand(&mut rgba, x, y);
+    fn minimap_cut_keeps_every_opaque_texel_on_a_clear_sea() {
+        // The editor's own picture (new::map_images): dark green land, the
+        // sea fully clear but still coloured.
+        let mut img = picture(20, 20, |x, y| {
+            let land = (5..15).contains(&x) && (5..15).contains(&y);
+            Some(if land {
+                [50, 60, 30, 255]
+            } else {
+                [58, 66, 34, 0]
+            })
+        });
+        land_alpha(&mut img);
+        assert!(
+            [(5, 5), (10, 10), (14, 14)]
+                .iter()
+                .all(|&(x, y)| img.get_pixel(x, y).0[3] == 255)
+        );
+        assert_eq!(img.get_pixel(0, 0).0[3], 0, "sea");
+        // Cut to the land: the 10 texel square fills all but the margin.
+        let thumb = cut(&img, 12).unwrap();
+        assert_eq!(thumb.get_pixel(6, 6).0, [50, 60, 30, 255]);
+    }
+
+    #[test]
+    fn minimap_cut_keeps_lakes_and_dark_forest_and_drops_the_shadow() {
+        // Anno 1800's picture: a 20x20 sand island holding a lake and a
+        // near-black forest, ringed by its drop shadow, pure black with
+        // alpha fading over 8 texels from opaque at the coast.
+        let lake = [30, 60, 80, 255];
+        let forest = [2, 5, 1, 255];
+        let mut img = picture(40, 40, |x, y| {
+            let off = |v: u32| 10u32.saturating_sub(v).max(v.saturating_sub(29));
+            let out = off(x).max(off(y));
+            match out {
+                0 if (14..20).contains(&x) && (14..20).contains(&y) => Some(lake),
+                0 if (22..26).contains(&x) && (22..26).contains(&y) => Some(forest),
+                0 => Some([200, 170, 110, 255]),
+                1..=8 => Some([0, 0, 0, (255 - (out - 1) * 30) as u8]),
+                _ => None,
             }
+        });
+        land_alpha(&mut img);
+        let alpha = |x: u32, y: u32| img.get_pixel(x, y).0[3];
+        assert_eq!(alpha(16, 16), 255, "lake");
+        assert_eq!(alpha(23, 23), 255, "dark forest");
+        assert_eq!(alpha(10, 20), 255, "coast");
+        assert_eq!(alpha(9, 20), 0, "shadow at the coast");
+        assert_eq!(alpha(5, 20), 0, "shadow further out");
+        assert_eq!(alpha(2, 20), 0, "shadow's faint rim");
+        let thumb = cut(&img, 40).unwrap();
+        let (w, _) = thumb.dimensions();
+        // The cut follows the land, not the shadow: the island spans the
+        // middle 1/1.12 of the picture.
+        assert_eq!(thumb.get_pixel(0, w / 2).0[3], 0);
+        assert_eq!(thumb.get_pixel(w / 2, w / 2).0[3], 255);
+        // Coast texels keep the sand's colour: the clear black sea is not
+        // mixed into them.
+        for p in thumb.pixels().filter(|p| (1..255).contains(&p.0[3])) {
+            let rgb = p.0;
+            assert!(rgb[0] > 150 && rgb[1] > 120, "darkened coast {rgb:?}");
         }
-        for (x, y) in [(3, 3), (4, 3), (3, 4), (4, 4)] {
-            sand(&mut rgba, x, y);
-        }
-        let mask = land_mask(&rgba, w, h);
-        let at = |x: u32, y: u32| mask.contains((y * w + x) as usize);
-        assert!(at(15, 15) && at(29, 29));
-        assert!(!at(0, 0), "sea");
-        assert!(!at(3, 3), "speck");
+    }
+
+    #[test]
+    fn minimap_cut_keeps_the_shape_of_wide_and_tiny_land() {
+        // A 90x30 picture, all land: the game cuts its pictures to the
+        // island, so they are rarely square.
+        let wide = picture(90, 30, |_, _| Some([200, 170, 110, 255]));
+        let thumb = cut(&wide, 60).unwrap();
+        let rows = (0..60)
+            .filter(|&y| thumb.get_pixel(30, y).0[3] >= 128)
+            .count();
+        // 30 of 90 texels tall, less the margin: a third, not stretched.
+        assert!((16..22).contains(&rows), "{rows} opaque rows");
+        // A 4x4 rock in a 200 px picture is magnified 2x at most: 8x8 of
+        // the 60 px tile, not all of it.
+        let rock = picture(200, 200, |x, y| {
+            ((98..102).contains(&x) && (98..102).contains(&y)).then_some([120, 110, 90, 255])
+        });
+        let thumb = cut(&rock, 60).unwrap();
+        let covered = thumb.pixels().filter(|p| p.0[3] >= 128).count();
+        assert!((16..=100).contains(&covered), "{covered} texels");
     }
 }

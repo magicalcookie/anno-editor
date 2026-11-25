@@ -2,18 +2,23 @@
 name = "anno-editor"
 version = "0.1.0"
 edition = "2024"
-description = "Anno 117 and 1800 asset browser, island editor and UI editor"
+description = "Anno 117, 1800 and 2070 asset browser and island editor, and 117 and 1800 UI editor"
 
 [workspace]
-members = ["formats"]
+members = ["formats", "core", "render", "games/anno117", "games/anno1800", "games/anno2070"]
 
 [dependencies]
+anno-core = { path = "core" }
 anno-formats = { path = "formats" }
+anno-render = { path = "render" }
+anno117 = { path = "games/anno117" }
+anno1800 = { path = "games/anno1800" }
+anno2070 = { path = "games/anno2070" }
 anyhow = "1"
 # Hash maps keyed by our own small values (layout and image caches).
 foldhash = "0.2"
-# Tint maps and thumbnails as PNG.
-image = { version = "0.25", default-features = false, features = ["png"] }
+# Tint maps and thumbnails as PNG; 2070's cursors (ICO).
+image = { version = "0.25", default-features = false, features = ["png", "ico"] }
 # A pool that stays up: per-template loads and bakes are short jobs, and
 # fresh threads per batch cost more than the jobs.
 rayon = "1.12"
@@ -27,9 +32,21 @@ ttf-parser = "0.25"
 # revision, so the device types are GPUI's own.
 wgpu = { git = "https://github.com/gfx-rs/wgpu", rev = "cddb2f5d80dc0009b2ef6767635140cacf90a007", default-features = false, features = ["vulkan", "wgsl", "std"] }
 bytemuck = { version = "1", features = ["derive"] }
+# Plays the sounds a model's sequences trigger (src/model/sound.rs).
+cpal = "0.16"
+# The sampling heap profiler's stacks (src/heap.rs).
+backtrace = { version = "0.3", optional = true }
+
+[features]
+# The sampling heap profiler as the global allocator (src/heap.rs);
+# ANNO_EDITOR_HEAP=seconds prints the live heap's owners after that long.
+heap-profile = ["dep:backtrace"]
 
 [target.'cfg(target_os = "windows")'.dependencies]
 wgpu = { git = "https://github.com/gfx-rs/wgpu", rev = "cddb2f5d80dc0009b2ef6767635140cacf90a007", default-features = false, features = ["dx12"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+wgpu = { git = "https://github.com/gfx-rs/wgpu", rev = "cddb2f5d80dc0009b2ef6767635140cacf90a007", default-features = false, features = ["metal"] }
 
 [profile.dev]
 debug = 1
@@ -44,6 +61,21 @@ opt-level = 2
 opt-level = 2
 
 [profile.dev.package.anno-formats]
+opt-level = 2
+
+[profile.dev.package.anno-core]
+opt-level = 2
+
+[profile.dev.package.anno-render]
+opt-level = 2
+
+[profile.dev.package.anno117]
+opt-level = 2
+
+[profile.dev.package.anno1800]
+opt-level = 2
+
+[profile.dev.package.anno2070]
 opt-level = 2
 
 [profile.dev.package.gpui-editor-kit]
@@ -65,6 +97,7 @@ opt-level = 3
 gpui = { path = "vendor/gpui-editor-kit/vendor/zed/gpui" }
 gpui_wgpu = { path = "vendor/gpui-editor-kit/vendor/zed/gpui_wgpu" }
 gpui_windows = { path = "vendor/gpui-editor-kit/vendor/zed/gpui_windows" }
+gpui_macos = { path = "vendor/gpui-editor-kit/vendor/zed/gpui_macos" }
 
 [patch.crates-io]
 async-task = { git = "https://github.com/zed-industries/async-task.git", rev = "015845a19fc31752c02367567d3b8900a406f9da" }
@@ -72,6 +105,10 @@ calloop = { git = "https://github.com/zed-industries/calloop", rev = "3759371fee
 
 [dev-dependencies]
 tempfile = "3"
+# posix_fadvise: the load bench drops the game's files from the OS cache.
+libc = "0.2"
+# Tests run the heap profiler as their allocator (src/heap.rs, ram_bench).
+backtrace = "0.3"
 # Validates the UI canvas shader in tests (ui/gpu.rs), as wgpu would.
 naga = { git = "https://github.com/gfx-rs/wgpu", rev = "cddb2f5d80dc0009b2ef6767635140cacf90a007", features = ["wgsl-in"] }
 # Window tests (editor/tests.rs): GPUI's TestApp drives the real editor,

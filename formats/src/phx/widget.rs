@@ -15,13 +15,9 @@ use std::ops::Range;
 
 use anyhow::{Context, Result, bail, ensure};
 
-use super::{Asset, Field, Guid, ObjectId, Record, Reference, Splice, Value, is_a, name_crc};
-
-const CLASS_GROUP_TEMPLATE: u32 = name_crc(b"GroupTemplate");
-const CLASS_GROUP_INSTANCE: u32 = name_crc(b"GroupInstance");
-const CLASS_WIDGET_INSTANCE: u32 = name_crc(b"WidgetInstance");
-const CLASS_IMAGE_ASSET: u32 = name_crc(b"ImageAsset");
-const CLASS_ATLAS_DESCRIPTION: u32 = name_crc(b"AtlasDescription");
+use super::{
+    Asset, Class, DefaultValue, Field, Guid, ObjectId, Prop, Record, Reference, Splice, Value, is_a,
+};
 
 /// One property of an object as the editor shows it.
 #[derive(Debug, Clone, PartialEq)]
@@ -30,7 +26,7 @@ pub struct PropValue {
     /// crc32 of the property name.
     pub crc: u32,
     /// Wire property index (presence-mask bit).
-    pub prop: u16,
+    prop: u16,
     /// First span of the value; for [`Value`] scalars the span to edit.
     pub span: usize,
     pub value: Value,
@@ -177,89 +173,141 @@ pub struct ImageInfo {
     /// `(1 - BottomRight) * size`.
     pub slice: [[f32; 2]; 2],
     /// `TextureFiltering` enum value.
-    pub filtering: u32,
+    filtering: u32,
     /// The ImageAtlasAsset this image is a region of, if any.
-    pub atlas: Option<Guid>,
+    pub(crate) atlas: Option<Guid>,
 }
 
-// Property name crcs.
-const PROP_POSITION: u32 = name_crc(b"Position");
-const PROP_PIVOT: u32 = name_crc(b"PivotPoint");
-const PROP_ROTATION: u32 = name_crc(b"RotationAngle");
-const PROP_SCALE: u32 = name_crc(b"Scale");
-const PROP_ALPHA_TINT: u32 = name_crc(b"AlphaTint");
-const PROP_COLOR_TINT: u32 = name_crc(b"ColorTint");
-const PROP_VISIBLE: u32 = name_crc(b"Visible");
-const PROP_IS_HIDDEN: u32 = name_crc(b"IsHidden");
-const PROP_ANCHOR: u32 = name_crc(b"AnchorPoint");
-// Anchor metrics x/y (unnamed; registered as legacy aliases),
-// then WidthResizing/HeightResizing.
-const PROP_ANCHOR_METRICS: [u32; 2] = [0x5c63_f4bb, 0xc16c_15cd];
-const PROP_RESIZE_METRICS: [u32; 2] = [name_crc(b"WidthResizing"), name_crc(b"HeightResizing")];
-const PROP_ASPECT_RATIO: u32 = name_crc(b"AspectRatio");
-const PROP_Z_INDEX: u32 = name_crc(b"ZIndex");
-pub(super) const PROP_ENUM_ENTRY: u32 = name_crc(b"EnumEntry");
-const PROP_WIDGET_TYPE: u32 = name_crc(b"WidgetType");
-const PROP_PARENT_WIDGET_TYPE: u32 = name_crc(b"ParentWidgetType");
-const PROP_CURRENT_ENUM_VALUE: u32 = name_crc(b"CurrentEnumValue");
-const PROP_CONSIDER_SIZE: u32 = name_crc(b"ConsiderSize");
-const PROP_WIDGET_INSTANCES: u32 = name_crc(b"WidgetInstances");
-const PROP_GROUP_TEMPLATE: u32 = name_crc(b"GroupTemplate");
-const PROP_NAME: u32 = super::PROP_NAME;
-const PROP_IMAGE_ID: u32 = name_crc(b"ImageId");
-const PROP_SIZE: u32 = name_crc(b"Size");
-// Unnamed ImageAsset field holding the UV rectangle object.
-const PROP_UV_RECT: u32 = 0x65fc_c08e;
-const PROP_TEXTURE_FILTERING: u32 = name_crc(b"TextureFiltering");
-const PROP_IMAGE_ATLAS: u32 = name_crc(b"ImageAtlas");
-const PROP_TOP_LEFT: u32 = name_crc(b"TopLeft");
-const PROP_BOTTOM_RIGHT: u32 = name_crc(b"BottomRight");
-const PROP_RESOLUTION: u32 = name_crc(b"Resolution");
-const PROP_IMAGE: u32 = name_crc(b"Image");
-const PROP_UV_OFFSET: u32 = name_crc(b"UVOffset");
-const PROP_UV_SCALE: u32 = name_crc(b"UVScale");
-const PROP_UV_ROTATION: u32 = name_crc(b"UVRotation");
-const PROP_FILL_MODE: u32 = name_crc(b"FillMode");
-/// See [`WidgetImage::path`]; its name is unknown.
-const PROP_IMAGE_PATH: u32 = name_crc(b"DynamicImageId");
-const PROP_TEXT: u32 = name_crc(b"Text");
-const PROP_DISPLAYED_TEXT: u32 = name_crc(b"DisplayedText");
-const PROP_LOCALIZATION_ID: u32 = name_crc(b"LocalizationId");
-// Unnamed; self-typed with the PHXLG kind root class.
-const PROP_FONT: u32 = 0xe152_3167;
-const PROP_TEXT_STYLE: u32 = name_crc(b"TextStyle");
-const PROP_ALIGNMENT: [u32; 2] = [name_crc(b"AlignmentX"), name_crc(b"AlignmentY")];
-const PROP_TEXT_PLANE: u32 = name_crc(b"TextPlane");
-const PROP_OVERFLOW: [u32; 2] = [
-    name_crc(b"HorizontalOverflow"),
-    name_crc(b"VerticalOverflow"),
-];
-const PROP_SIZING: [u32; 2] = [name_crc(b"HorizontalSizing"), name_crc(b"VerticalSizing")];
-const PROP_MAX_LINES: u32 = name_crc(b"MaxLineCount");
-const PROP_LINE_SPACING: u32 = name_crc(b"LineSpacing");
-const CLASS_IMAGE_DESCRIPTION: u32 = name_crc(b"ImageDescription");
-// TextStyle root; the PHXTS kind root 0xc697c96c is its abstract base.
-const CLASS_TEXT_STYLE: u32 = name_crc(b"SlugTextStyleAsset");
-const PROP_TRANSLATION: u32 = name_crc(b"Translation");
-const PROP_ATLAS_ROTATION: u32 = name_crc(b"Rotation");
-const PROP_LOCALIZED_FONT: u32 = name_crc(b"LocalizedFont");
-const PROP_BASE_COLOR: u32 = name_crc(b"BaseColor");
-const PROP_OUTLINE_ENABLED: u32 = name_crc(b"OutlineEnabled");
-// Unnamed ColorType right after OutlineEnabled.
-const PROP_OUTLINE_COLOR: u32 = name_crc(b"OutlineColor");
-const PROP_OUTLINE_ALPHA: u32 = name_crc(b"OutlineAlpha");
-const PROP_SHADOW_ENABLED: u32 = name_crc(b"ShadowEnabled");
-const PROP_SHADOW_COLOR: u32 = name_crc(b"ShadowColor");
-const PROP_SHADOW_ALPHA: u32 = name_crc(b"ShadowAlpha");
-const PROP_SHADOW_DISTANCE: u32 = name_crc(b"ShadowDistance");
-const PROP_SHADOW_ANGLE: u32 = name_crc(b"ShadowAngle");
-const PROP_LETTER_SPACING: u32 = name_crc(b"LetterSpacing");
-const CLASS_CONTAINER_TEMPLATE: u32 = name_crc(b"ContainerWidgetTemplate");
-const CLASS_CONTAINER_INSTANCE: u32 = name_crc(b"ContainerWidgetInstance");
-const PROP_REFERENCE_SIZE: u32 = name_crc(b"ReferenceSize");
-const PROP_TEMPLATE: u32 = name_crc(b"Template");
-const CLASS_IMAGE_WIDGET: u32 = name_crc(b"ImageWidgetInstance");
-const CLASS_LABEL_WIDGET: u32 = name_crc(b"LabelWidgetInstance");
+/// What a widget's own fields say. What it owns (components, effects,
+/// property overrides) is read through its [`Asset`].
+impl Widget {
+    /// Layout fields of a WidgetInstance; None for the root and non-widgets.
+    pub fn geometry(&self) -> Option<Geometry> {
+        if !is_a(self.class, Class::WIDGET_INSTANCE) {
+            return None;
+        }
+        let mut g = Geometry::default();
+        for p in &self.props {
+            match (p.crc, &p.value) {
+                (Prop::POSITION, Value::Vec3(v)) => g.position = *v,
+                (Prop::PIVOT, Value::Vec3(v)) => g.pivot = *v,
+                (Prop::ROTATION, Value::F32(v)) => g.rotation = *v,
+                (Prop::SCALE, Value::Vec3(v)) => g.scale = *v,
+                (Prop::ALPHA_TINT, Value::F32(v)) => g.alpha = *v,
+                (Prop::COLOR_TINT, Value::Color(c)) => g.tint = Some(*c),
+                (Prop::VISIBLE, Value::Bool(v)) => g.visible = *v,
+                (Prop::IS_HIDDEN, Value::Bool(v)) => g.hidden = *v,
+                (Prop::ANCHOR, Value::Enum { value, .. }) => g.anchor = *value,
+                (Prop::Z_INDEX, Value::U32(v)) => g.z_index = *v,
+                (Prop::ENUM_ENTRY, Value::U32(v)) => g.enum_entry = *v,
+                (Prop::CONSIDER_SIZE, Value::Bool(v)) => g.consider_size = *v,
+                (Prop::ASPECT_RATIO, Value::Enum { value, .. }) => g.aspect_ratio = *value,
+                (c, Value::Enum { value, .. }) if Prop::ANCHOR_METRICS.contains(&c) => {
+                    g.anchor_metrics[usize::from(c == Prop::ANCHOR_METRICS[1])] = *value;
+                }
+                (c, Value::Enum { value, .. }) if Prop::RESIZE_METRICS.contains(&c) => {
+                    g.resize_metrics[usize::from(c == Prop::RESIZE_METRICS[1])] = *value;
+                }
+                _ => {}
+            }
+        }
+        Some(g)
+    }
+
+    /// A container instance's stored `CurrentEnumValue`: the style of its
+    /// template it starts in (0 when absent).
+    pub fn enum_value(&self) -> u32 {
+        self.props
+            .iter()
+            .find_map(|p| match (p.crc, &p.value) {
+                (Prop::CURRENT_ENUM_VALUE, Value::U32(v)) => Some(*v),
+                _ => None,
+            })
+            .unwrap_or(0)
+    }
+
+    /// The ContainerWidgetTemplate asset a ContainerWidgetInstance expands
+    /// to (`data/ui/studio/generated/<guid>`); its widgets are this widget's
+    /// children.
+    pub fn container_template(&self) -> Option<Reference> {
+        if !is_a(self.class, Class::CONTAINER_INSTANCE) {
+            return None;
+        }
+        self.props.iter().find_map(|p| match p {
+            PropValue {
+                crc: Prop::TEMPLATE,
+                value: Value::Ref(r),
+                ..
+            } => Some(*r),
+            _ => None,
+        })
+    }
+
+    /// The image of an ImageWidgetInstance.
+    pub fn image(&self) -> Option<WidgetImage> {
+        if !is_a(self.class, Class::IMAGE_WIDGET) {
+            return None;
+        }
+        let mut img = WidgetImage {
+            asset: None,
+            uv_offset: [0.0; 2],
+            uv_scale: [1.0; 2],
+            uv_rotation: 0.0,
+            fill: 0,
+            path: None,
+        };
+        for p in &self.props {
+            match (p.crc, &p.value) {
+                (Prop::IMAGE, Value::Ref(r)) => img.asset = Some(*r),
+                (Prop::FILL_MODE, Value::Enum { value, .. }) => img.fill = *value,
+                (Prop::UV_OFFSET, Value::Vec2(v)) => img.uv_offset = *v,
+                (Prop::UV_SCALE, Value::Vec2(v)) => img.uv_scale = *v,
+                (Prop::UV_ROTATION, Value::F32(v)) => img.uv_rotation = *v,
+                (Prop::IMAGE_PATH, Value::Str(s)) if !s.is_empty() => img.path = Some(s.clone()),
+                _ => {}
+            }
+        }
+        Some(img)
+    }
+
+    /// The text of a LabelWidgetInstance.
+    pub fn label(&self) -> Option<LabelText> {
+        if !is_a(self.class, Class::LABEL_WIDGET) {
+            return None;
+        }
+        let mut l = LabelText {
+            line_spacing: 1.,
+            // Overflow "Visible" and sizing by the displayed text: a label
+            // shows its text, one line, as wide as it is.
+            overflow: [5, 4],
+            sizing: [1, 1],
+            ..LabelText::default()
+        };
+        for p in &self.props {
+            match (p.crc, &p.value) {
+                (Prop::TEXT, Value::Str(s)) => l.text = s.clone(),
+                (Prop::DISPLAYED_TEXT, Value::Str(s)) => l.displayed_text = s.clone(),
+                (Prop::LOCALIZATION_ID, Value::Str(s)) => l.localization_id = s.clone(),
+                (Prop::FONT, Value::Ref(r)) => l.font = Some(*r),
+                (Prop::TEXT_STYLE, Value::Ref(r)) => l.style = Some(*r),
+                (c, Value::U32(v)) if Prop::ALIGNMENT.contains(&c) => {
+                    l.alignment[usize::from(c == Prop::ALIGNMENT[1])] = *v;
+                }
+                (c, Value::U32(v)) if Prop::OVERFLOW.contains(&c) => {
+                    l.overflow[usize::from(c == Prop::OVERFLOW[1])] = *v;
+                }
+                (c, Value::U32(v)) if Prop::SIZING.contains(&c) => {
+                    l.sizing[usize::from(c == Prop::SIZING[1])] = *v;
+                }
+                (Prop::TEXT_PLANE, Value::Vec2(v)) => l.text_plane = *v,
+                (Prop::MAX_LINES, Value::F32(v)) => l.max_lines = *v,
+                (Prop::LINE_SPACING, Value::F32(v)) => l.line_spacing = *v,
+                _ => {}
+            }
+        }
+        Some(l)
+    }
+}
 
 impl Asset {
     /// Every object span grouped by its owning field, first span per field.
@@ -303,7 +351,7 @@ impl Asset {
             Record::Ref(r) => Value::Ref(*r),
             Record::Null => Value::Null,
             Record::Color(rgb) => Value::Color(*rgb),
-            Record::Object(o) if o.class == super::CLASS_COLOR => fields
+            Record::Object(o) if o.class == Class::COLOR => fields
                 .get(&Field {
                     object: span,
                     prop: 1,
@@ -311,7 +359,7 @@ impl Asset {
                 .map_or(Value::Other, |c| self.span_value(c, fields)),
             // A ColorType: its palette entry when that palette is known,
             // else the RGB of its embedded Color.
-            Record::Object(o) if o.class == super::CLASS_COLOR_TYPE => {
+            Record::Object(o) if o.class == Class::COLOR_TYPE => {
                 let props = self.props_with(span, fields);
                 let palette = props.iter().find_map(|p| match p.value {
                     Value::Ref(r) => Some(r.id),
@@ -322,7 +370,7 @@ impl Asset {
                     _ => None,
                 });
                 if let (Some(g), Some(e)) = (palette, entry)
-                    && let Some(rgb) = palette_color(g, e)
+                    && let Some(rgb) = self.palette_color(g, e)
                 {
                     return Value::Color(rgb);
                 }
@@ -339,19 +387,20 @@ impl Asset {
     }
 
     /// The widget tree; index 0 is the root template. Empty for assets that
-    /// are not widget templates or were not fully typed. Read once per
-    /// palette registered (ColorType values resolve through the palettes):
-    /// layout asks for it per template and per container instance.
+    /// are not widget templates or were not fully typed. Read again when
+    /// the asset's palettes change ([`Asset::use_palettes`], or one more
+    /// registered: ColorType values resolve through them); layout asks for
+    /// it per template and per container instance.
     pub fn widgets(&self) -> std::sync::Arc<[Widget]> {
-        let generation = palette_generation();
-        let mut cached = self.widgets.0.lock().expect("widget cache");
-        if let Some((g, w)) = &*cached
-            && *g == generation
+        let key = self.palette_key();
+        let mut cached = self.widgets.read.lock().expect("widget cache");
+        if let Some((k, w)) = &*cached
+            && *k == key
         {
             return w.clone();
         }
         let w: std::sync::Arc<[Widget]> = self.read_widgets().into();
-        *cached = Some((generation, w.clone()));
+        *cached = Some((key, w.clone()));
         w
     }
 
@@ -359,14 +408,14 @@ impl Asset {
         let Some((root, root_header)) = self.objects().next() else {
             return Vec::new();
         };
-        if !self.typed || !is_a(root_header.class, CLASS_GROUP_TEMPLATE) {
+        if !self.typed || !is_a(root_header.class, Class::GROUP_TEMPLATE) {
             return Vec::new();
         }
         let fields = self.fields();
         let name_of = |o: usize| {
             self.props_with(o, &fields)
                 .into_iter()
-                .find(|p| p.crc == PROP_NAME)
+                .find(|p| p.crc == Prop::NAME)
                 .and_then(|p| match p.value {
                     Value::Str(s) => Some(s),
                     _ => None,
@@ -378,15 +427,15 @@ impl Asset {
         let mut group_by_id: HashMap<Guid, usize> = HashMap::new();
         for (i, o) in self.objects() {
             if let ObjectId::Id(id) = o.id
-                && is_a(o.class, CLASS_GROUP_TEMPLATE)
+                && is_a(o.class, Class::GROUP_TEMPLATE)
             {
                 group_by_id.insert(id, i);
             }
-            if !is_a(o.class, CLASS_WIDGET_INSTANCE) {
+            if !is_a(o.class, Class::WIDGET_INSTANCE) {
                 continue;
             }
             if let Some(f) = self.spans[i].field
-                && self.prop_crc(f) == Some(PROP_WIDGET_INSTANCES)
+                && self.prop_crc(f) == Some(Prop::WIDGET_INSTANCES)
             {
                 by_group.entry(f.object).or_default().push(i);
             }
@@ -410,10 +459,10 @@ impl Asset {
                 };
                 let props = self.props_with(o, &fields);
                 let idx = out.len();
-                if h.class == CLASS_GROUP_INSTANCE
+                if h.class == Class::GROUP_INSTANCE
                     && let Some(Value::Ref(r)) = props
                         .iter()
-                        .find(|p| p.crc == PROP_GROUP_TEMPLATE)
+                        .find(|p| p.crc == Prop::GROUP_TEMPLATE)
                         .map(|p| &p.value)
                     && let Some(&g) = group_by_id.get(&r.id)
                 {
@@ -444,62 +493,16 @@ impl Asset {
         )
     }
 
-    /// Layout fields of a WidgetInstance; None for the root and non-widgets.
-    /// A container instance's stored `CurrentEnumValue`: the style of its
-    /// template it starts in (0 when absent).
-    pub fn current_enum_value(&self, widget: &Widget) -> u32 {
-        widget
-            .props
-            .iter()
-            .find_map(|p| match (p.crc, &p.value) {
-                (PROP_CURRENT_ENUM_VALUE, Value::U32(v)) => Some(*v),
-                _ => None,
-            })
-            .unwrap_or(0)
-    }
-
-    pub fn geometry(&self, widget: &Widget) -> Option<Geometry> {
-        if !is_a(widget.class, CLASS_WIDGET_INSTANCE) {
-            return None;
-        }
-        let mut g = Geometry::default();
-        for p in &widget.props {
-            match (p.crc, &p.value) {
-                (PROP_POSITION, Value::Vec3(v)) => g.position = *v,
-                (PROP_PIVOT, Value::Vec3(v)) => g.pivot = *v,
-                (PROP_ROTATION, Value::F32(v)) => g.rotation = *v,
-                (PROP_SCALE, Value::Vec3(v)) => g.scale = *v,
-                (PROP_ALPHA_TINT, Value::F32(v)) => g.alpha = *v,
-                (PROP_COLOR_TINT, Value::Color(c)) => g.tint = Some(*c),
-                (PROP_VISIBLE, Value::Bool(v)) => g.visible = *v,
-                (PROP_IS_HIDDEN, Value::Bool(v)) => g.hidden = *v,
-                (PROP_ANCHOR, Value::Enum { value, .. }) => g.anchor = *value,
-                (PROP_Z_INDEX, Value::U32(v)) => g.z_index = *v,
-                (PROP_ENUM_ENTRY, Value::U32(v)) => g.enum_entry = *v,
-                (PROP_CONSIDER_SIZE, Value::Bool(v)) => g.consider_size = *v,
-                (PROP_ASPECT_RATIO, Value::Enum { value, .. }) => g.aspect_ratio = *value,
-                (c, Value::Enum { value, .. }) if PROP_ANCHOR_METRICS.contains(&c) => {
-                    g.anchor_metrics[usize::from(c == PROP_ANCHOR_METRICS[1])] = *value;
-                }
-                (c, Value::Enum { value, .. }) if PROP_RESIZE_METRICS.contains(&c) => {
-                    g.resize_metrics[usize::from(c == PROP_RESIZE_METRICS[1])] = *value;
-                }
-                _ => {}
-            }
-        }
-        Some(g)
-    }
-
     /// The root template's `ReferenceSize`: the pixel size its widgets are
     /// laid out in (1920 × 1080 for screens and most templates).
     pub fn reference_size(&self) -> Option<[f32; 2]> {
         let (root, h) = self.objects().next()?;
-        if !is_a(h.class, CLASS_CONTAINER_TEMPLATE) {
+        if !is_a(h.class, Class::CONTAINER_TEMPLATE) {
             return None;
         }
         self.object_props(root).into_iter().find_map(|p| match p {
             PropValue {
-                crc: PROP_REFERENCE_SIZE,
+                crc: Prop::REFERENCE_SIZE,
                 value: Value::Vec2(v),
                 ..
             } => Some(v),
@@ -514,7 +517,7 @@ impl Asset {
         let (root, _) = self.objects().next()?;
         self.object_props(root).into_iter().find_map(|p| match p {
             PropValue {
-                crc: PROP_WIDGET_TYPE | PROP_PARENT_WIDGET_TYPE,
+                crc: Prop::WIDGET_TYPE | Prop::PARENT_WIDGET_TYPE,
                 value: Value::Ref(r),
                 ..
             } => Some(r),
@@ -522,86 +525,29 @@ impl Asset {
         })
     }
 
-    /// The ContainerWidgetTemplate asset a ContainerWidgetInstance expands
-    /// to (`data/ui/studio/generated/<guid>`); its widgets are this widget's
-    /// children.
-    pub fn container_template(&self, widget: &Widget) -> Option<Reference> {
-        if !is_a(widget.class, CLASS_CONTAINER_INSTANCE) {
-            return None;
-        }
-        widget.props.iter().find_map(|p| match p {
-            PropValue {
-                crc: PROP_TEMPLATE,
-                value: Value::Ref(r),
-                ..
-            } => Some(*r),
-            _ => None,
+    /// The template's WidgetType chain, its own first (a Button's, then
+    /// InteractiveWidget's…), each type loaded through `load`; it ends where
+    /// `load` finds nothing. Layout asks per instance, and the chain never
+    /// changes, so the first answer is kept on the asset. It stays an
+    /// asset's because the chain is its install's: 117 and 1800 share
+    /// guids, their palette's among them.
+    pub fn widget_types(
+        &self,
+        load: &mut dyn FnMut(Guid) -> Option<std::sync::Arc<Asset>>,
+    ) -> &[Guid] {
+        self.widget_types.get_or_init(|| {
+            let mut out = Vec::new();
+            let mut ty = self.widget_type().map(|r| r.id);
+            // Chains are a handful deep; the bound guards a cycle.
+            while let Some(t) = ty {
+                out.push(t);
+                if out.len() == 8 {
+                    break;
+                }
+                ty = load(t).and_then(|a| a.widget_type()).map(|r| r.id);
+            }
+            out.into_boxed_slice()
         })
-    }
-
-    /// The image of an ImageWidgetInstance.
-    pub fn widget_image(&self, widget: &Widget) -> Option<WidgetImage> {
-        if !is_a(widget.class, CLASS_IMAGE_WIDGET) {
-            return None;
-        }
-        let mut img = WidgetImage {
-            asset: None,
-            uv_offset: [0.0; 2],
-            uv_scale: [1.0; 2],
-            uv_rotation: 0.0,
-            fill: 0,
-            path: None,
-        };
-        for p in &widget.props {
-            match (p.crc, &p.value) {
-                (PROP_IMAGE, Value::Ref(r)) => img.asset = Some(*r),
-                (PROP_FILL_MODE, Value::Enum { value, .. }) => img.fill = *value,
-                (PROP_UV_OFFSET, Value::Vec2(v)) => img.uv_offset = *v,
-                (PROP_UV_SCALE, Value::Vec2(v)) => img.uv_scale = *v,
-                (PROP_UV_ROTATION, Value::F32(v)) => img.uv_rotation = *v,
-                (PROP_IMAGE_PATH, Value::Str(s)) if !s.is_empty() => img.path = Some(s.clone()),
-                _ => {}
-            }
-        }
-        Some(img)
-    }
-
-    /// The text of a LabelWidgetInstance.
-    pub fn label(&self, widget: &Widget) -> Option<LabelText> {
-        if !is_a(widget.class, CLASS_LABEL_WIDGET) {
-            return None;
-        }
-        let mut l = LabelText {
-            line_spacing: 1.,
-            // Overflow "Visible" and sizing by the displayed text: a label
-            // shows its text, one line, as wide as it is.
-            overflow: [5, 4],
-            sizing: [1, 1],
-            ..LabelText::default()
-        };
-        for p in &widget.props {
-            match (p.crc, &p.value) {
-                (PROP_TEXT, Value::Str(s)) => l.text = s.clone(),
-                (PROP_DISPLAYED_TEXT, Value::Str(s)) => l.displayed_text = s.clone(),
-                (PROP_LOCALIZATION_ID, Value::Str(s)) => l.localization_id = s.clone(),
-                (PROP_FONT, Value::Ref(r)) => l.font = Some(*r),
-                (PROP_TEXT_STYLE, Value::Ref(r)) => l.style = Some(*r),
-                (c, Value::U32(v)) if PROP_ALIGNMENT.contains(&c) => {
-                    l.alignment[usize::from(c == PROP_ALIGNMENT[1])] = *v;
-                }
-                (c, Value::U32(v)) if PROP_OVERFLOW.contains(&c) => {
-                    l.overflow[usize::from(c == PROP_OVERFLOW[1])] = *v;
-                }
-                (c, Value::U32(v)) if PROP_SIZING.contains(&c) => {
-                    l.sizing[usize::from(c == PROP_SIZING[1])] = *v;
-                }
-                (PROP_TEXT_PLANE, Value::Vec2(v)) => l.text_plane = *v,
-                (PROP_MAX_LINES, Value::F32(v)) => l.max_lines = *v,
-                (PROP_LINE_SPACING, Value::F32(v)) => l.line_spacing = *v,
-                _ => {}
-            }
-        }
-        Some(l)
     }
 }
 
@@ -613,9 +559,7 @@ impl Asset {
 // the `Groups` array of the group holding the instance (root or nested
 // GroupTemplate; 2,082/2,082 installed) and holds the children and their
 // own groups. Edits splice those byte ranges and fix the array counts;
-// `Asset::rebuild` re-derives the class table and layout section.
-
-const PROP_GROUPS: u32 = name_crc(b"Groups");
+// `Asset::rebuild` re-derives the class table and heap section.
 
 /// A widget cut out of a file: its object bytes, and for a GroupInstance
 /// the GroupTemplate subtree with all its descendants.
@@ -709,11 +653,11 @@ impl Asset {
         if w == 0 {
             return Some(widget.object);
         }
-        if widget.class != CLASS_GROUP_INSTANCE {
+        if widget.class != Class::GROUP_INSTANCE {
             return None;
         }
         widget.props.iter().find_map(|p| match (p.crc, &p.value) {
-            (PROP_GROUP_TEMPLATE, Value::Ref(r)) => self.object_by_id(r.id),
+            (Prop::GROUP_TEMPLATE, Value::Ref(r)) => self.object_by_id(r.id),
             _ => None,
         })
     }
@@ -722,7 +666,7 @@ impl Asset {
     pub fn widget_copy(&self, widgets: &[Widget], w: usize) -> Result<WidgetCopy> {
         ensure!(w > 0 && w < widgets.len(), "the root cannot be copied");
         let object = widgets[w].object;
-        let group = if widgets[w].class == CLASS_GROUP_INSTANCE {
+        let group = if widgets[w].class == Class::GROUP_INSTANCE {
             Some(
                 self.child_group(widgets, w)
                     .context("the group's template is missing")?,
@@ -793,73 +737,6 @@ impl Asset {
         self.finish(splices, counts, &copy.classes)
     }
 
-    /// Inserts several copies as the last children of widget `parent`, in
-    /// order, with one rebuild: the whole tree is emitted in a single encode
-    /// instead of one full decode-encode round per widget. With `fresh`,
-    /// every object id inside each copy gets a new random id (and references
-    /// inside the copy follow), so the same copy can be inserted next to its
-    /// original and copies sharing ids do not collide with each other.
-    pub fn insert_widgets_batch(
-        &self,
-        widgets: &[Widget],
-        parent: usize,
-        copies: &[WidgetCopy],
-        fresh: bool,
-    ) -> Result<Asset> {
-        if copies.is_empty() {
-            bail!("no widgets to insert");
-        }
-        let group = self
-            .child_group(widgets, parent)
-            .context("only the root and groups can hold widgets")?;
-        let mut splices = Vec::new();
-        let mut counts = HashMap::new();
-        let mut classes = Vec::new();
-        for copy in copies {
-            for c in &copy.classes {
-                if !classes.contains(c) {
-                    classes.push(*c);
-                }
-            }
-        }
-        if !fresh {
-            let mut flat = Vec::new();
-            for copy in copies {
-                for id in &copy.ids {
-                    if self.object_by_id(*id).is_some() {
-                        bail!("an object with id {id} is already in this file");
-                    }
-                    if flat.contains(id) {
-                        bail!("copies share object id {id}");
-                    }
-                    flat.push(*id);
-                }
-            }
-        }
-        for copy in copies {
-            let (mut widget, mut group_bytes) = (copy.widget.clone(), copy.group.clone());
-            if fresh {
-                for id in &copy.ids {
-                    let new = Guid::random();
-                    replace_all(&mut widget, &id.0, &new.0);
-                    if let Some(g) = &mut group_bytes {
-                        replace_all(g, &id.0, &new.0);
-                    }
-                }
-            }
-            self.insert_into(
-                group,
-                usize::MAX,
-                widget,
-                group_bytes,
-                &[],
-                &mut splices,
-                &mut counts,
-            )?;
-        }
-        self.finish(splices, counts, &classes)
-    }
-
     // Splices for putting a widget (and its GroupTemplate) into `group`.
     // Slots are positions in the file before any removal; elements in `skip`
     // (a widget being moved) do not count, so `index` is relative to the
@@ -876,7 +753,7 @@ impl Asset {
         counts: &mut HashMap<usize, i64>,
     ) -> Result<()> {
         let (count, mut elements) = self
-            .array(group, PROP_WIDGET_INSTANCES)
+            .array(group, Prop::WIDGET_INSTANCES)
             .context("the group stores no WidgetInstances array")?;
         elements.retain(|e| !skip.contains(e));
         let at = self.array_slot(count, &elements, index);
@@ -887,7 +764,7 @@ impl Asset {
         *counts.entry(count).or_default() += 1;
         if let Some(bytes) = group_bytes {
             let (count, mut elements) = self
-                .array(group, PROP_GROUPS)
+                .array(group, Prop::GROUPS)
                 .context("the group stores no Groups array")?;
             elements.retain(|e| !skip.contains(e));
             let at = self.array_slot(count, &elements, usize::MAX);
@@ -911,7 +788,7 @@ impl Asset {
     ) -> Result<Vec<usize>> {
         ensure!(w > 0 && w < widgets.len(), "the root cannot be removed");
         let mut roots = vec![widgets[w].object];
-        if widgets[w].class == CLASS_GROUP_INSTANCE {
+        if widgets[w].class == Class::GROUP_INSTANCE {
             roots.extend(self.child_group(widgets, w));
         }
         for &o in &roots {
@@ -946,7 +823,7 @@ impl Asset {
             let n = i64::from(n) + delta;
             ensure!(n >= 0, "array count would drop below zero");
             let mut bytes = Vec::new();
-            super::write_varint(&mut bytes, n as u32);
+            crate::varint::write(&mut bytes, n as u32);
             splices.push(Splice {
                 range: self.spans[span].range.clone(),
                 bytes,
@@ -1036,45 +913,94 @@ fn replace_all(bytes: &mut [u8], from: &[u8; 16], to: &[u8; 16]) {
 // id) besides their embedded RGB; the palette's colour is what the game
 // shows. 9,696 of the install's 26,634 ColorTypes do, all into the one
 // shared palette `c63efd8b…` (124 named colours: Anno117_Base_Blue,
-// Anno117_TextIcon_Light…). Palettes are global game data, so a loaded
-// palette is registered once for every asset to resolve against.
-
-const CLASS_PALETTE_COLOR: u32 = name_crc(b"ColorPaletteEntry");
-const PROP_PALETTE_COLORS: u32 = name_crc(b"Colors");
-const PROP_PALETTE_ENTRY: u32 = 0x46a1_7a33;
+// Anno117_TextIcon_Light…). 1800 ships a palette under the same guid with
+// colours of its own, so palettes belong to an install: an asset resolves
+// against the set its loader gave it, and without one shows the embedded
+// RGB.
 
 type Palette = HashMap<u32, [u8; 3]>;
 
-fn palettes() -> &'static std::sync::RwLock<HashMap<Guid, std::sync::Arc<Palette>>> {
-    static PALETTES: std::sync::OnceLock<
-        std::sync::RwLock<HashMap<Guid, std::sync::Arc<Palette>>>,
-    > = std::sync::OnceLock::new();
-    PALETTES.get_or_init(Default::default)
+/// One install's colour palettes (`ColorPaletteAsset`), which ColorTypes
+/// naming an entry resolve through once an asset uses them
+/// ([`Asset::use_palettes`]).
+#[derive(Default)]
+pub struct Palettes {
+    by_guid: std::sync::RwLock<HashMap<Guid, std::sync::Arc<Palette>>>,
+    /// Bumped by every palette registered: widgets read before resolved
+    /// against fewer.
+    generation: std::sync::atomic::AtomicU64,
 }
 
-/// Bumped by every palette registered: what was resolved against the
-/// palettes before is stale.
-static PALETTE_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+impl Palettes {
+    /// Registers `asset` if it is a ColorPaletteAsset (`PHXPA`), so
+    /// ColorTypes naming its entries resolve to its colours; returns how
+    /// many colours it has. Other assets are ignored (0).
+    pub fn register(&self, asset: &Asset) -> usize {
+        let Some(guid) = asset.guid() else { return 0 };
+        let colors = palette_colors(asset);
+        let n = colors.len();
+        if n > 0
+            && let Ok(mut p) = self.by_guid.write()
+        {
+            p.insert(guid, std::sync::Arc::new(colors));
+            self.generation
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
+        n
+    }
 
-fn palette_generation() -> u64 {
-    PALETTE_GENERATION.load(std::sync::atomic::Ordering::Acquire)
+    pub(super) fn color(&self, palette: Guid, entry: u32) -> Option<[u8; 3]> {
+        self.by_guid
+            .read()
+            .ok()?
+            .get(&palette)?
+            .get(&entry)
+            .copied()
+    }
 }
 
-pub(super) fn palette_color(palette: Guid, entry: u32) -> Option<[u8; 3]> {
-    palettes().read().ok()?.get(&palette)?.get(&entry).copied()
+impl Asset {
+    /// Resolves this asset's ColorTypes through `palettes`, its install's,
+    /// from now on.
+    pub fn use_palettes(&self, palettes: &std::sync::Arc<Palettes>) {
+        let mut slot = self.widgets.palettes.write().expect("palettes lock");
+        if !slot
+            .as_ref()
+            .is_some_and(|p| std::sync::Arc::ptr_eq(p, palettes))
+        {
+            *slot = Some(palettes.clone());
+        }
+    }
+
+    pub(super) fn palette_color(&self, palette: Guid, entry: u32) -> Option<[u8; 3]> {
+        self.widgets
+            .palettes
+            .read()
+            .ok()?
+            .as_ref()?
+            .color(palette, entry)
+    }
+
+    /// Which palettes, at which generation, the widgets would be read with.
+    fn palette_key(&self) -> super::PaletteKey {
+        match &*self.widgets.palettes.read().expect("palettes lock") {
+            Some(p) => (
+                std::sync::Arc::as_ptr(p) as usize,
+                p.generation.load(std::sync::atomic::Ordering::Acquire),
+            ),
+            None => (0, 0),
+        }
+    }
 }
 
-/// Registers a ColorPaletteAsset (`PHXPA`) so ColorTypes naming its
-/// entries resolve to its colours; returns how many colours it has.
-/// Other assets are ignored (0).
-pub fn register_palette(asset: &Asset) -> usize {
-    let Some(guid) = asset.guid() else { return 0 };
+/// A ColorPaletteAsset's colours by entry id; empty for other assets.
+fn palette_colors(asset: &Asset) -> Palette {
     let Some((root, _)) = asset.objects().next() else {
-        return 0;
+        return Palette::new();
     };
     let mut colors = Palette::new();
-    for c in asset.values_of(root, PROP_PALETTE_COLORS) {
-        if !matches!(&asset.spans[c].record, Record::Object(h) if h.class == CLASS_PALETTE_COLOR) {
+    for c in asset.values_of(root, Prop::PALETTE_COLORS) {
+        if !matches!(&asset.spans[c].record, Record::Object(h) if h.class == Class::PALETTE_COLOR) {
             continue;
         }
         let mut rgb = None;
@@ -1084,7 +1010,7 @@ pub fn register_palette(asset: &Asset) -> usize {
                 (_, Some(f)) if f.object < c => break,
                 (Record::Color(v), _) => rgb = Some(*v),
                 (Record::Value(Value::U32(v)), Some(f))
-                    if f.object == c && asset.prop_crc(f) == Some(PROP_PALETTE_ENTRY) =>
+                    if f.object == c && asset.prop_crc(f) == Some(Prop::PALETTE_ENTRY) =>
                 {
                     entry = Some(*v)
                 }
@@ -1095,20 +1021,13 @@ pub fn register_palette(asset: &Asset) -> usize {
             colors.insert(e, rgb);
         }
     }
-    let n = colors.len();
-    if n > 0
-        && let Ok(mut p) = palettes().write()
-    {
-        p.insert(guid, std::sync::Arc::new(colors));
-        PALETTE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
-    }
-    n
+    colors
 }
 
 /// Decodes an ImageAsset (`PHXIM`): texture path, size, 9-slice rect, atlas.
 pub fn image_info(asset: &Asset) -> Option<ImageInfo> {
     let (root, header) = asset.objects().next()?;
-    if header.class != CLASS_IMAGE_ASSET || !asset.typed {
+    if header.class != Class::IMAGE_ASSET || !asset.typed {
         return None;
     }
     let fields = asset.fields();
@@ -1121,15 +1040,15 @@ pub fn image_info(asset: &Asset) -> Option<ImageInfo> {
     };
     for p in asset.props_with(root, &fields) {
         match (p.crc, p.value) {
-            (PROP_IMAGE_ID, Value::Str(s)) => info.path = s,
-            (PROP_SIZE, Value::Vec2(v)) => info.size = v,
-            (PROP_TEXTURE_FILTERING, Value::Enum { value, .. }) => info.filtering = value,
-            (PROP_IMAGE_ATLAS, Value::Ref(r)) => info.atlas = Some(r.id),
-            (PROP_UV_RECT, _) => {
+            (Prop::IMAGE_ID, Value::Str(s)) => info.path = s,
+            (Prop::SIZE, Value::Vec2(v)) => info.size = v,
+            (Prop::TEXTURE_FILTERING, Value::Enum { value, .. }) => info.filtering = value,
+            (Prop::IMAGE_ATLAS, Value::Ref(r)) => info.atlas = Some(r.id),
+            (Prop::UV_RECT, _) => {
                 for q in asset.props_with(p.span, &fields) {
                     match (q.crc, q.value) {
-                        (PROP_TOP_LEFT, Value::Vec2(v)) => info.slice[0] = v,
-                        (PROP_BOTTOM_RIGHT, Value::Vec2(v)) => info.slice[1] = v,
+                        (Prop::TOP_LEFT, Value::Vec2(v)) => info.slice[0] = v,
+                        (Prop::BOTTOM_RIGHT, Value::Vec2(v)) => info.slice[1] = v,
                         _ => {}
                     }
                 }
@@ -1138,69 +1057,6 @@ pub fn image_info(asset: &Asset) -> Option<ImageInfo> {
         }
     }
     Some(info)
-}
-
-/// One image packed into an atlas texture.
-#[derive(Debug, Clone, PartialEq)]
-pub struct AtlasRegion {
-    /// The packed image's own path (`ImageId`), as ImageAssets name it.
-    pub image: String,
-    /// Pixel size of the region.
-    pub size: [f32; 2],
-    /// Pixel offset of the region in the atlas texture (`Translation`).
-    pub offset: [f32; 2],
-    /// `size / atlas size` (`Scale`), so the atlas size is `size / uv_scale`.
-    pub uv_scale: [f32; 2],
-    /// `Rotation` (0 in shipped atlases).
-    pub rotation: f32,
-}
-
-/// An ImageAtlasAsset (`PHXTA`): per resolution (`Default`, …) the regions
-/// it packs. An ImageAsset with an `ImageAtlas` reference finds its region
-/// by matching its `ImageId` against [`AtlasRegion::image`].
-pub fn atlas_regions(asset: &Asset) -> Vec<(String, Vec<AtlasRegion>)> {
-    let fields = asset.fields();
-    let mut out = Vec::new();
-    for (i, o) in asset.objects() {
-        if o.class != CLASS_ATLAS_DESCRIPTION {
-            continue;
-        }
-        let resolution = asset
-            .props_with(i, &fields)
-            .into_iter()
-            .find_map(|p| match (p.crc, p.value) {
-                (PROP_RESOLUTION, Value::Str(s)) => Some(s),
-                _ => None,
-            })
-            .unwrap_or_default();
-        let mut regions = Vec::new();
-        for (j, r) in asset.objects() {
-            let owned = asset.spans[j].field.is_some_and(|f| f.object == i);
-            if r.class != CLASS_IMAGE_DESCRIPTION || !owned {
-                continue;
-            }
-            let mut region = AtlasRegion {
-                image: String::new(),
-                size: [0.0; 2],
-                offset: [0.0; 2],
-                uv_scale: [1.0; 2],
-                rotation: 0.0,
-            };
-            for q in asset.props_with(j, &fields) {
-                match (q.crc, q.value) {
-                    (PROP_IMAGE_ID, Value::Str(s)) => region.image = s,
-                    (PROP_SIZE, Value::Vec2(v)) => region.size = v,
-                    (PROP_TRANSLATION, Value::Vec2(v)) => region.offset = v,
-                    (PROP_SCALE, Value::Vec2(v)) => region.uv_scale = v,
-                    (PROP_ATLAS_ROTATION, Value::F32(v)) => region.rotation = v,
-                    _ => {}
-                }
-            }
-            regions.push(region);
-        }
-        out.push((resolution, regions));
-    }
-    out
 }
 
 /// A TextStyle asset (`PHXTS`, root class `0x9f98c15a`): what labels that
@@ -1214,8 +1070,8 @@ pub struct TextStyle {
     /// `BaseColor` RGB.
     pub color: Option<[u8; 3]>,
     /// Outline colour, when `OutlineEnabled`.
-    pub outline: Option<[u8; 3]>,
-    pub outline_alpha: f32,
+    outline: Option<[u8; 3]>,
+    outline_alpha: f32,
     /// Drop shadow colour when `ShadowEnabled`; alpha, distance (px),
     /// angle (degrees).
     pub shadow: Option<[u8; 3]>,
@@ -1228,10 +1084,9 @@ pub struct TextStyle {
 /// The FontAsset (`PHXFT`) a LocalizedFontAsset (`PHXLF`) uses for the
 /// first language it lists (English in every shipped one).
 pub fn localized_font(asset: &Asset) -> Option<Guid> {
-    const CLASS_FONT_ASSET: u32 = name_crc(b"FontBaseAsset");
     asset
         .references()
-        .find(|(_, r)| r.class == CLASS_FONT_ASSET)
+        .find(|(_, r)| r.class == Class::FONT_ASSET)
         .map(|(_, r)| r.id)
 }
 
@@ -1247,7 +1102,7 @@ pub fn font_file(asset: &Asset) -> Option<String> {
 /// Decodes a TextStyle asset.
 pub fn text_style(asset: &Asset) -> Option<TextStyle> {
     let (root, header) = asset.objects().next()?;
-    if header.class != CLASS_TEXT_STYLE || !asset.typed {
+    if header.class != Class::TEXT_STYLE || !asset.typed {
         return None;
     }
     let mut t = TextStyle::default();
@@ -1255,18 +1110,18 @@ pub fn text_style(asset: &Asset) -> Option<TextStyle> {
     let (mut outline_rgb, mut shadow_rgb) = (None, None);
     for p in asset.object_props(root) {
         match (p.crc, p.value) {
-            (PROP_LOCALIZED_FONT, Value::Ref(r)) => t.font = Some(r),
-            (PROP_SIZE, Value::F32(v)) => t.size = v,
-            (PROP_BASE_COLOR, Value::Color(c)) => t.color = Some(c),
-            (PROP_OUTLINE_ENABLED, Value::Bool(b)) => outline = b,
-            (PROP_OUTLINE_COLOR, Value::Color(c)) => outline_rgb = Some(c),
-            (PROP_OUTLINE_ALPHA, Value::F32(v)) => t.outline_alpha = v,
-            (PROP_SHADOW_ENABLED, Value::Bool(b)) => shadow = b,
-            (PROP_SHADOW_COLOR, Value::Color(c)) => shadow_rgb = Some(c),
-            (PROP_SHADOW_ALPHA, Value::F32(v)) => t.shadow_alpha = v,
-            (PROP_SHADOW_DISTANCE, Value::F32(v)) => t.shadow_distance = v,
-            (PROP_SHADOW_ANGLE, Value::F32(v)) => t.shadow_angle = v,
-            (PROP_LETTER_SPACING, Value::F32(v)) => t.letter_spacing = v,
+            (Prop::LOCALIZED_FONT, Value::Ref(r)) => t.font = Some(r),
+            (Prop::SIZE, Value::F32(v)) => t.size = v,
+            (Prop::BASE_COLOR, Value::Color(c)) => t.color = Some(c),
+            (Prop::OUTLINE_ENABLED, Value::Bool(b)) => outline = b,
+            (Prop::OUTLINE_COLOR, Value::Color(c)) => outline_rgb = Some(c),
+            (Prop::OUTLINE_ALPHA, Value::F32(v)) => t.outline_alpha = v,
+            (Prop::SHADOW_ENABLED, Value::Bool(b)) => shadow = b,
+            (Prop::SHADOW_COLOR, Value::Color(c)) => shadow_rgb = Some(c),
+            (Prop::SHADOW_ALPHA, Value::F32(v)) => t.shadow_alpha = v,
+            (Prop::SHADOW_DISTANCE, Value::F32(v)) => t.shadow_distance = v,
+            (Prop::SHADOW_ANGLE, Value::F32(v)) => t.shadow_angle = v,
+            (Prop::LETTER_SPACING, Value::F32(v)) => t.letter_spacing = v,
             _ => {}
         }
     }
@@ -1305,10 +1160,12 @@ pub fn parse_texts(xml: &str) -> HashMap<i64, String> {
         rest = &rest[j..];
         // The line's text is the next <Text> element before the next line.
         let line = &rest[..rest.find(start).unwrap_or(rest.len())];
-        if let (Ok(id), Some(a)) = (id, line.find("<Text>"))
-            && let Some(b) = line[a + 6..].find("</Text>")
+        const OPEN: &str = "<Text>";
+        if let (Ok(id), Some(a)) = (id, line.find(OPEN))
+            && let Some(b) = line[a + OPEN.len()..].find("</Text>")
         {
-            out.insert(id, unescape_xml(&line[a + 6..a + 6 + b]));
+            let text = a + OPEN.len();
+            out.insert(id, unescape_xml(&line[text..text + b]));
         }
     }
     out
@@ -1323,4 +1180,149 @@ fn unescape_xml(s: &str) -> String {
         .replace("&quot;", "\"")
         .replace("&apos;", "'")
         .replace("&amp;", "&")
+}
+
+// ---------------------------------------------------------------------------
+// Components
+
+/// One ComponentInstance (or EffectInstance) on a widget.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Component {
+    /// Object header span of the ComponentInstance.
+    object: usize,
+    /// Instance UniqueId; override paths start with it.
+    pub uid: u32,
+    /// The ComponentTemplate asset (`PHXCP`), e.g. StackLayout `d5481210…`.
+    pub template: Option<Guid>,
+    /// Instance name as authored ("Layout Component", "AlignmentUtility").
+    pub name: String,
+    /// The widget's overrides of this component's custom properties:
+    /// (CustomPropertyInstance UniqueId, value). Properties not listed keep
+    /// the template default.
+    pub overrides: Vec<(u32, DefaultValue)>,
+}
+
+impl Component {
+    /// The override for custom property `uid`, if the widget sets one.
+    pub fn get(&self, uid: u32) -> Option<&DefaultValue> {
+        self.overrides.iter().find(|o| o.0 == uid).map(|o| &o.1)
+    }
+}
+
+impl Asset {
+    /// The widget's PropertyValues: (path of UniqueIds, value). A two-id path
+    /// `[component uid, custom property uid]` overrides a component on this
+    /// widget; on a ContainerWidgetInstance, paths starting with one of the
+    /// template's own custom properties (object-typed data slots, listed in
+    /// its `0xc3fa0951` array) feed data into the template instead.
+    pub fn property_values(&self, widget: &Widget) -> Vec<(Vec<u32>, DefaultValue)> {
+        let mut out = Vec::new();
+        for (i, s) in self.spans.iter().enumerate() {
+            let Record::Object(o) = &s.record else {
+                continue;
+            };
+            if o.class != Class::PROPERTY_VALUE
+                || !self.owned_by(i, widget.object, Prop::PROPERTY_VALUES)
+            {
+                continue;
+            }
+            let mut path = Vec::new();
+            let mut value = None;
+            for (k, t) in self.spans.iter().enumerate().skip(i + 1) {
+                let Some(f) = t.field else { continue };
+                if f.object != i {
+                    if f.object < i {
+                        break;
+                    }
+                    continue;
+                }
+                match (self.prop_name_crc(f), &t.record) {
+                    (Some(Prop::PROPERTY_ID_PATH), Record::Value(Value::U32(v))) => path.push(*v),
+                    (Some(Prop::VALUE), Record::Default(_)) if value.is_none() => {
+                        value = Some(self.default_at(k))
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(v) = value {
+                out.push((path, v));
+            }
+        }
+        out
+    }
+
+    /// The ComponentInstances on a widget, with this widget's overrides.
+    pub fn components(&self, widget: &Widget) -> Vec<Component> {
+        self.instances(
+            widget,
+            Class::COMPONENT_INSTANCE,
+            Prop::COMPONENTS,
+            Prop::COMPONENT_TEMPLATE,
+        )
+    }
+
+    /// The EffectInstances on a widget (`Effects`), shaped like components:
+    /// `template` is the EffectTemplate (`PHXEF`), overrides address its
+    /// custom properties the same way (`[effect uid, property uid]`).
+    pub fn effects(&self, widget: &Widget) -> Vec<Component> {
+        self.instances(
+            widget,
+            Class::EFFECT_INSTANCE,
+            Prop::EFFECTS,
+            Prop::EFFECT_TEMPLATE,
+        )
+    }
+
+    fn instances(&self, widget: &Widget, class: u32, field: u32, template: u32) -> Vec<Component> {
+        let values = self.property_values(widget);
+        let mut out = Vec::new();
+        for (i, s) in self.spans.iter().enumerate() {
+            let Record::Object(o) = &s.record else {
+                continue;
+            };
+            if o.class != class || !self.owned_by(i, widget.object, field) {
+                continue;
+            }
+            let mut c = Component {
+                object: i,
+                uid: 0,
+                template: None,
+                name: String::new(),
+                overrides: Vec::new(),
+            };
+            for p in self.object_props(i) {
+                match (p.crc, p.value) {
+                    (Prop::UNIQUE_ID, Value::U32(v)) => c.uid = v,
+                    (t, Value::Ref(r)) if t == template => c.template = Some(r.id),
+                    (_, Value::Str(s)) => c.name = s,
+                    _ => {}
+                }
+            }
+            c.overrides = values
+                .iter()
+                .filter(|(path, _)| path.len() == 2 && path[0] == c.uid)
+                .map(|(path, v)| (path[1], v.clone()))
+                .collect();
+            out.push(c);
+        }
+        out
+    }
+
+    // Whether object span `i` is (an element of) property `prop` of `owner`.
+    fn owned_by(&self, i: usize, owner: usize, prop: u32) -> bool {
+        self.spans[i]
+            .field
+            .is_some_and(|f| f.object == owner && self.prop_name_crc(f) == Some(prop))
+    }
+
+    fn prop_name_crc(&self, f: Field) -> Option<u32> {
+        let Record::Object(h) = &self.spans[f.object].record else {
+            return None;
+        };
+        Some(
+            self.class_props(h.class)?
+                .get(f.prop as usize - 1)?
+                .name_crc,
+        )
+    }
 }

@@ -2,7 +2,7 @@
 name = "anno-formats"
 version = "0.1.0"
 edition = "2024"
-description = "Anno 117 and 1800 file formats: RDA archives, the layered install VFS, ADF record trees, islands and compiled Phoenix UI assets"
+description = "Anno file formats: RDA archives, the layered archive VFS, ADF record trees, islands and compiled Phoenix UI assets"
 
 [dependencies]
 anyhow = "1"
@@ -11,13 +11,18 @@ flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 # Hash maps keyed by our own small values (layout caches).
 foldhash = "0.2"
 quick-xml = "0.39"
+# Finding where each top-level asset starts in assets.xml.
+memchr = "2"
 # The worker pool layout warms a screen's templates on.
 rayon = "1.12"
+memmap2 = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Vorbis packet decode for Wwise `.wem`s; `audio` rebuilds the headers and
+# hands it packets, so its Ogg reader stays off.
+lewton = { version = "0.10", default-features = false }
 
 [dev-dependencies]
+# CPU time and page faults in `index_build_phases`.
+libc = "0.2"
 tempfile = "3"
-
-[target.'cfg(windows)'.dependencies]
-winreg = "0.56"

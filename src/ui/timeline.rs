@@ -6,12 +6,13 @@
 // A playing clip writes its tracks through the binding slots of its file
 // (`phx::animation`), and the canvas lays out again each frame.
 use super::UiEditor;
+use super::evaluate::Builtin;
+use super::layout::{self, Play};
 use crate::editor::{Editor, Pane, empty_pane};
 use anno_formats::phx::{
     Asset, DefaultValue, Edit, Guid, Value,
     animation::{Key, NewKey, TrackKind},
-    binding::{NewSlot, Slot, builtin},
-    layout::{self, Play},
+    binding::{NewSlot, Slot},
 };
 use anyhow::{Context as _, Result, bail};
 use gpui_editor_kit::{
@@ -104,17 +105,17 @@ pub struct Player {
     pub clips_of: Option<Guid>,
 }
 
-/// What "+ Track" animates on a widget: built-in property id (named as
-/// the lane it makes names it, `builtin::name`) and the track type shipped
+/// What "+ Track" animates on a widget: a built-in property (named as the
+/// lane it makes names it, `Builtin::name`) and the track type shipped
 /// clips use for it.
-pub const ANIMATABLE: [(u32, TrackKind); 7] = [
-    (builtin::ALPHA, TrackKind::Float),
-    (builtin::VISIBLE, TrackKind::Bool),
-    (builtin::POSITION, TrackKind::Vec3),
-    (builtin::SCALE, TrackKind::Vec3),
-    (builtin::ROTATION, TrackKind::Float),
-    (builtin::SIZE, TrackKind::Vec2),
-    (builtin::PIVOT, TrackKind::Vec3),
+pub const ANIMATABLE: [(Builtin, TrackKind); 7] = [
+    (Builtin::AlphaTint, TrackKind::Float),
+    (Builtin::Visible, TrackKind::Bool),
+    (Builtin::Position, TrackKind::Vec3),
+    (Builtin::Scale, TrackKind::Vec3),
+    (Builtin::RotationAngle, TrackKind::Float),
+    (Builtin::Size, TrackKind::Vec2),
+    (Builtin::PivotPoint, TrackKind::Vec3),
 ];
 
 impl Player {
@@ -132,6 +133,8 @@ impl Player {
 /// template input is named by that template (`templates`), as Data rows
 /// and graph pins are (round 6 showed a track as `131547d4`).
 fn clip_refs(
+    sources: &anno_formats::phx::Sources,
+    fields: &anno_formats::phx::DataFields,
     asset: &Asset,
     file: Option<Guid>,
     owner: &str,
@@ -139,7 +142,7 @@ fn clip_refs(
 ) -> Vec<ClipRef> {
     let widgets = asset.widgets();
     let slots = asset.bindings(&widgets).slots;
-    let template = |w: usize| templates.get(&asset.container_template(widgets.get(w)?)?.id);
+    let template = |w: usize| templates.get(&widgets.get(w)?.container_template()?.id);
     let input = |w: usize, path: &[(u32, u32)]| {
         let [(_, uid)] = path else { return None };
         let t = template(w)?;
@@ -180,7 +183,7 @@ fn clip_refs(
                         _ => Vec::new(),
                     };
                     let label = super::bindings::slot_label(
-                        asset, &widgets, &slots, t.target, &input, &steps,
+                        sources, asset, fields, &widgets, &slots, t.target, &input, &steps,
                     );
                     let widget = super::bindings::slot_widget(&slots, t.target);
                     let (group, prop) = match label.split_once(" · ") {
@@ -212,7 +215,9 @@ impl UiEditor {
             .iter()
             .filter_map(|t| Some((t.guid()?, t.clone())))
             .collect();
-        let mut clips = clip_refs(&self.asset, None, "this file", &templates);
+        let sources = self.images.shared.sources(&install).clone();
+        let fields = self.screens().data_fields;
+        let mut clips = clip_refs(&sources, fields, &self.asset, None, "this file", &templates);
         let mut files: Vec<super::preview::File> = super::preview::file(&self.asset, "this file")
             .into_iter()
             .collect();
@@ -226,7 +231,7 @@ impl UiEditor {
             };
             let widgets = asset.widgets();
             let Some(w) = widgets.get(k) else { continue };
-            if let Some(r) = asset.container_template(w)
+            if let Some(r) = w.container_template()
                 && !owners.iter().any(|(g, _)| *g == r.id)
             {
                 owners.push((r.id, w.name.clone().unwrap_or_default()));
@@ -244,7 +249,7 @@ impl UiEditor {
                 .find(|(o, n)| *o == g && !n.is_empty())
                 .map(|(_, n)| n.clone())
                 .unwrap_or_else(|| g.to_string()[..8].to_owned());
-            clips.extend(clip_refs(t, Some(g), &owner, &templates));
+            clips.extend(clip_refs(&sources, fields, t, Some(g), &owner, &templates));
             files.extend(super::preview::file(t, &owner));
         }
         self.preview.files = files;
@@ -528,19 +533,19 @@ impl UiEditor {
 
     /// The current value of built-in property `id` on this file's widget
     /// `node`, as a key of `kind` holds it.
-    fn current_value(&self, node: usize, id: u32, kind: TrackKind) -> DefaultValue {
+    fn current_value(&self, node: usize, id: Builtin, kind: TrackKind) -> DefaultValue {
         let f = &self.frames[node];
         let v3 = |v: [f32; 3]| DefaultValue::Vec(v.map(f32::to_bits).to_vec());
         match (id, kind) {
-            (builtin::POSITION, _) => v3(f.position),
-            (builtin::PIVOT, _) => v3(f.pivot),
-            (builtin::SCALE, _) => v3(f.scale),
-            (builtin::ROTATION, _) => DefaultValue::F32(f.rotation.to_bits()),
-            (builtin::SIZE, _) => {
+            (Builtin::Position, _) => v3(f.position),
+            (Builtin::PivotPoint, _) => v3(f.pivot),
+            (Builtin::Scale, _) => v3(f.scale),
+            (Builtin::RotationAngle, _) => DefaultValue::F32(f.rotation.to_bits()),
+            (Builtin::Size, _) => {
                 let s = f.bound.size.unwrap_or([f.local[2], f.local[3]]);
                 DefaultValue::Vec(s.map(f32::to_bits).to_vec())
             }
-            (builtin::VISIBLE, _) => DefaultValue::Bool(u8::from(self.nodes[node].visible)),
+            (Builtin::Visible, _) => DefaultValue::Bool(u8::from(self.nodes[node].visible)),
             _ => DefaultValue::F32(f.bound.alpha.unwrap_or(1.).to_bits()),
         }
     }
@@ -551,7 +556,7 @@ impl UiEditor {
     fn key_property(
         &mut self,
         node: usize,
-        id: u32,
+        id: Builtin,
         kind: TrackKind,
         value: DefaultValue,
     ) -> Result<String> {
@@ -567,7 +572,7 @@ impl UiEditor {
             "Only this file's widgets can be animated here"
         );
         let (index, w) = (clip.index, self.nodes[node].widget);
-        let path = vec![(1, 0x8000_0000 | id)];
+        let path = vec![(1, id.uid())];
         let time = self.snap(self.player.time).max(0.);
         let key = NewKey {
             time,
@@ -618,7 +623,7 @@ impl UiEditor {
         self.replace_asset(next);
         self.player.key = written;
         self.player.also.clear();
-        let name = builtin::name(id).unwrap_or("value");
+        let name = id.name().unwrap_or("value");
         Ok(format!("Keyed {name} at {time:.2} s"))
     }
 
@@ -652,9 +657,9 @@ impl UiEditor {
                 continue;
             };
             let id = if Some(*span) == f.position_span {
-                builtin::POSITION
+                Builtin::Position
             } else if Some(*span) == f.scale_span {
-                builtin::SCALE
+                Builtin::Scale
             } else {
                 continue;
             };
@@ -1816,12 +1821,12 @@ impl Editor {
         if can_track {
             let options: Vec<(Option<usize>, SharedString)> =
                 std::iter::once((None, "+ Track".into()))
-                    .chain(ANIMATABLE.iter().enumerate().map(|(i, a)| {
-                        (
-                            Some(i),
-                            SharedString::from(builtin::name(a.0).unwrap_or("?")),
-                        )
-                    }))
+                    .chain(
+                        ANIMATABLE
+                            .iter()
+                            .enumerate()
+                            .map(|(i, a)| (Some(i), SharedString::from(a.0.name().unwrap_or("?")))),
+                    )
                     .collect();
             out.push(
                 gpui_editor_kit::widgets::dropdown(
@@ -2260,9 +2265,10 @@ impl Editor {
             .child(field(
                 "Value",
                 key.value_span,
-                key.value
-                    .as_ref()
-                    .map_or_else(|| "—".to_owned(), super::bindings::short),
+                key.value.as_ref().map_or_else(
+                    || "—".to_owned(),
+                    |v| super::bindings::short(ui.sources(), v),
+                ),
                 130.,
                 cx,
             ));
@@ -2406,7 +2412,7 @@ mod tests {
         ui.select_widget(node);
         let position = ANIMATABLE
             .iter()
-            .position(|a| a.0 == anno_formats::phx::binding::builtin::POSITION)
+            .position(|a| a.0 == super::Builtin::Position)
             .unwrap();
         ui.add_track_for(position).unwrap();
         assert_eq!(ui.clip().unwrap().lanes.len(), 1);
@@ -2783,7 +2789,7 @@ mod tests {
                             return None;
                         };
                         let &[(1, p)] = &path[..] else { return None };
-                        let which = ANIMATABLE.iter().position(|a| 0x8000_0000 | a.0 == p)?;
+                        let which = ANIMATABLE.iter().position(|a| a.0.uid() == p)?;
                         let keys = &c.lanes[t].keys;
                         (keys.len() >= 2 && keys[1].time - keys[0].time > 2.5 * frame)
                             .then_some((i, t, *w, which))

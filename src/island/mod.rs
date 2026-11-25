@@ -5,20 +5,44 @@
 // Terrain draws as one mesh per heightfield tile; a dab rebuilds only the
 // tiles it touched and every other tile keeps its GPU buffers. Props draw as
 // markers until model (.rdm) decoding exists.
+
+/// Problems as a status line names them: "Start island without a harbour
+/// coast; 3 × Props whose model the install lacks".
+pub(crate) fn said(problems: &[Problem]) -> String {
+    problems
+        .iter()
+        .map(Problem::said)
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+#[cfg(test)]
+mod baselines;
 mod blockers;
 pub mod catalog;
 mod cliffs;
 pub mod convert;
 mod doc;
-pub mod fertility;
+pub use anno_core::fertility;
+#[cfg(test)]
+mod gpu_bench;
 mod grids;
 mod harbour;
 mod import;
+#[cfg(test)]
+mod island_shots;
+#[cfg(test)]
+mod load_bench;
+pub(crate) mod materials;
 pub(crate) mod models;
+mod motion;
+#[cfg(test)]
+mod motion_tests;
 mod new;
 mod panels;
 mod placements;
 pub mod port;
+mod rail;
 mod river;
 mod scatter;
 mod sound;
@@ -26,13 +50,22 @@ mod sound;
 mod test_support;
 mod tint;
 mod vegetation;
+// The Model workspace's island skies light as islands do.
+pub(crate) use vegetation::NO_RT_AMBIENT;
+#[cfg(test)]
+mod water_shots;
 mod wizard;
-pub(crate) use panels::{IslandKind, island_title, pretty, selection_status};
-pub(crate) use wizard::{province, province_short};
+pub(crate) use anno_core::game::IslandKind;
+pub(crate) use panels::{fold_summary, island_title, preset_name, pretty, selection_status};
 mod worldmachine;
 
+use anno_core::ambient::{self, Ambient, Baked, SunMoon};
+use anno_core::game::{IslandRules, Module, Refs, Use};
+use anno_core::harbour::Piece;
+use anno_core::island::Problem;
+pub use anno_core::island::{Item, Native, changed_samples};
 pub use doc::island_data_dir;
-use doc::{Doc, Materials, Prop};
+use doc::{Doc, MaterialChange, Materials, Paint, Prop};
 pub use import::Import;
 pub use new::{Skeleton, Spec, Start, file_name, island_path, islands, skeletons};
 pub use wizard::Wizard;
@@ -42,14 +75,18 @@ use crate::{
     project::{Listing, Project},
     terrain,
 };
+use anno_core::island::landscape::{self, Landscape};
+use anno_core::island::objects;
 use anno_formats::{
-    grids::{Grids, Kind},
-    island::Island,
-    landscape::{self, Landscape},
-    objects, rda,
-    tint::TintMap,
+    a7m::{
+        grids::{Grids, Kind},
+        island::Island,
+        tint::TintMap,
+    },
+    rda,
     vfs::Install,
 };
+use anno_render::a7m::Splat;
 use anyhow::{Context as _, Result};
 use gpui_editor_kit::{
     camera::{Camera, Extent},
@@ -57,10 +94,10 @@ use gpui_editor_kit::{
     gizmo::{self, Gesture, Marquee},
     gpu::{
         self, Batch, Fog, Instances, Light, Marker, Mesh, MeshData, Occlusion, Renderer, Scene,
-        Sea, Shadows, Shape, Sky, Splat, Tone, Viewport,
+        Sea, Shape, Sky, Tone, Viewport,
     },
     gpui::{prelude::*, *},
-    heightfield::{Brush, Falloff, Grid, Heightfield, Mode, Rect, Sculpt, Stroke, files},
+    heightfield::{Brush, Falloff, Heightfield, Mode, Rect, Sculpt, Stroke, files},
     history::History,
     icon::Icon,
     math::{self, Mat4, Vec3},
@@ -98,7 +135,7 @@ pub enum Tool {
 /// How the buildable overlay draws a ground point: unbuildable land hatched
 /// red, the edge of buildable land bright, harbour pads teal, buildable land
 /// left as it is so the ground still reads.
-fn buildable_overlay(layer: &anno_formats::grids::Layer, p: Vec3) -> Option<([f32; 3], f32)> {
+fn buildable_overlay(layer: &anno_formats::a7m::grids::Layer, p: Vec3) -> Option<([f32; 3], f32)> {
     let rgb = |c: u32| [(c >> 16) & 255, (c >> 8) & 255, c & 255].map(|v| v as f32 / 255.);
     let at = |x: f32, z: f32| grids::value_at(layer, x, z);
     let land = p[1] > 0.;
@@ -127,7 +164,7 @@ fn buildable_overlay(layer: &anno_formats::grids::Layer, p: Vec3) -> Option<([f3
 }
 
 /// Ground length of a harbour curve in metres.
-fn curve_length(path: &[anno_formats::objects::PathPoint]) -> f32 {
+fn curve_length(path: &[anno_core::island::objects::PathPoint]) -> f32 {
     path.windows(2)
         .map(|w| (w[1].p[0] - w[0].p[0]).hypot(w[1].p[2] - w[0].p[2]))
         .sum()
@@ -352,14 +389,6 @@ pub enum Shading {
 /// items take about 0.5 ms a frame on the CPU; 20k took 5 ms.
 const GPU_DRAG: usize = 2048;
 
-/// A selectable thing on the island: an rd3d prop or a gamedata object, by
-/// their stable ids.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Item {
-    Prop(u64),
-    Object(u64),
-}
-
 /// High word of the IDs the editor gives objects it generates (sound spots,
 /// build blockers), so a rerun replaces its own and leaves hand-placed ones.
 /// It is a normal game object ID: bits 50..61 are a per-session editor tag
@@ -377,11 +406,25 @@ pub enum Group {
     Prop(u32),
 }
 
+/// A ground bake (`IslandEditor::bake_job`): the texture for cliff tops and
+/// non-splat shading, the GPU splat when it was stale, and how far sinking
+/// ground lies below the heights.
+pub struct Ground {
+    /// `None` when nothing draws it (`IslandEditor::bake_wanted`).
+    pub texture: Option<Texture>,
+    pub splat: Option<(Splat, Arc<terrain::SplatPlanes<doc::Layer>>)>,
+    pub sink: Option<Arc<Vec<f32>>>,
+}
+
 /// What the viewports draw, toggled from the hierarchy pane.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Layers {
     pub props: bool,
     pub objects: bool,
+    /// Models the game draws only in its own editor (`Mesh/
+    /// OnlyVisibleInEditor`): build blockers, herds, flocks, sound spots
+    /// and markers. Off they show as markers, as in game.
+    pub editor_only: bool,
     pub shipped: bool,
     /// The sea plane, and rivers and lakes as translucent surfaces.
     pub water: bool,
@@ -399,9 +442,28 @@ pub struct Layers {
     pub vegetation: bool,
     /// Sun shadows. Every caster draws a second time into the shadow map.
     pub shadows: bool,
+    /// The ground raised and lit by its materials' heights, as the game
+    /// displaces it (anno_render::a7m::Relief): rock ledges stand out. One more texture
+    /// read per layer.
+    pub relief: bool,
     /// Harbour coasts as cyan lines on the waterline; the Harbour tool
     /// shows them regardless.
     pub harbours: bool,
+    /// The sea's waves move; off they hold still. Moving waves redraw
+    /// every frame.
+    pub waves: bool,
+    /// Rain on the water, as in a shower in game (117 rivers and lakes).
+    pub rain: bool,
+    /// The flood season rather than the dry one, on islands whose region
+    /// has seasons (117's Egypt rivers).
+    pub flood: bool,
+    /// The island seen as the game shows it when that isn't from the air
+    /// (`IslandEditor::view`: 2070's Deep Ocean islands under water); off,
+    /// from the air like any other.
+    pub under_water: bool,
+    /// The player colour dyed flags and trim show, an index into the
+    /// game's `Profile::player_colors`: islands have no owner.
+    pub player: usize,
 }
 
 impl Default for Layers {
@@ -409,6 +471,7 @@ impl Default for Layers {
         Self {
             props: true,
             objects: true,
+            editor_only: false,
             // The heightfield is the terrain; shipped meshes are a reference.
             shipped: false,
             water: true,
@@ -420,9 +483,15 @@ impl Default for Layers {
             // Tens of thousands of instances; opt in.
             vegetation: false,
             shadows: true,
+            relief: true,
             // The heaviest line on the island otherwise; the Harbour tool
             // draws them regardless.
             harbours: false,
+            waves: true,
+            rain: false,
+            flood: false,
+            under_water: true,
+            player: 0,
         }
     }
 }
@@ -444,6 +513,43 @@ enum Field {
     Jitter,
     /// Value the Grid tool paints.
     GridValue,
+    /// The view's time of day, hours.
+    TimeOfDay,
+    /// River tool: the picked knot's flow speed at the left bank (0),
+    /// centre (1) or right bank (2), looking downstream.
+    Flow(usize),
+    /// River tool: a setting of the bed carving makes.
+    Bed(BedField),
+    /// River tool: how far along the curve a moved point's neighbours
+    /// follow it, metres.
+    Falloff,
+}
+
+/// The River tool's bed settings ([`river::Bed`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BedField {
+    Depth,
+    Bank,
+    Reach,
+    Bends,
+    Pools,
+}
+
+/// Shipped Albion marsh ground lies flat at this height, metres.
+const MARSH_LEVEL: f32 = 0.5;
+
+/// A resource slot as the slot tool marks it.
+pub(super) struct SlotMark {
+    pub at: [f32; 3],
+    /// Kind, and the test-map deposit when one is assigned.
+    pub label: String,
+    pub resource: harbour::Resource,
+    /// Always active: drawn square, random slots round.
+    pub fixed: bool,
+    /// Which way it faces, radians in the ground plane.
+    pub yaw: f32,
+    /// The kind the tool places now: drawn bright, the others faint.
+    pub current: bool,
 }
 
 enum Drag {
@@ -452,6 +558,9 @@ enum Drag {
         before: Box<Doc>,
         level: f32,
         changed: bool,
+        /// Shadows wait for the release (`continue_brush`); dropping the
+        /// drag on any path lets them draw.
+        hold: Option<gpu::ShadowHold>,
     },
     Gizmo {
         gesture: Gesture,
@@ -465,6 +574,10 @@ enum Drag {
         /// targets' start transforms take now. The document keeps their
         /// starts until the release.
         gpu: Option<Mat4>,
+        /// The turn the targets stand on (`Islands::turn_step`), which a
+        /// turn about the vertical snaps to; 0 for free. `None` while the
+        /// game still reads it: the drag turns freely and asks again.
+        turn: Option<f32>,
     },
     Marquee(Marquee),
     /// Harbour tool: drawing a harbour along the shore; the preview follows
@@ -472,22 +585,51 @@ enum Drag {
     Shore {
         from: Vec3,
         to: Vec3,
-        preview: Option<Vec<anno_formats::objects::PathPoint>>,
+        preview: Option<Vec<anno_core::island::objects::PathPoint>>,
     },
-    /// Harbour and slot tools: a ground rectangle to auto-place in.
+    /// Harbour and slot tools: a ground rectangle to auto-place in, or with
+    /// the lasso the ground points the cursor traced.
     Region {
         from: Vec3,
         to: Vec3,
+        lasso: Option<Vec<[f32; 2]>>,
     },
-    /// River tool: dragging a draft point or its width handle.
+    /// River tool: dragging a draft point or its width handle, from
+    /// where every knot stood at the press (neighbours follow a moved
+    /// point within the falloff).
     RiverKnot {
         index: usize,
         handle: river::Handle,
+        start: Vec<[f32; 2]>,
+    },
+    /// River tool: the gizmo moving the picked point, its up arrow the
+    /// water's height there (`surfaces`: every point's at the press).
+    RiverGizmo {
+        gesture: Gesture,
+        index: usize,
+        start: Vec<[f32; 2]>,
+        surfaces: Vec<f32>,
+    },
+    /// Grid tool on a 2070 island: dragging one build-blocker polygon's
+    /// point.
+    ShapePoint {
+        shape: usize,
+        point: usize,
+        before: Box<Doc>,
+        changed: bool,
     },
     /// Dragging one harbour curve point along the shore.
     CoastPoint {
         id: u64,
         index: usize,
+        before: Box<Doc>,
+        changed: bool,
+    },
+    /// The path edit mode's gizmo moving the picked points, from where
+    /// they were at the press.
+    PathGizmo {
+        gesture: Gesture,
+        start: Vec<(usize, Vec3)>,
         before: Box<Doc>,
         changed: bool,
     },
@@ -497,6 +639,24 @@ enum Drag {
     Pan(Point<Pixels>, Option<Vec3>),
 }
 
+/// What the Inspector's path preview offers for a slot.
+pub struct PathPreview {
+    pub slot: u64,
+    /// Buildings that lay a model on one of the slot's paths: GUID, name.
+    pub buildings: Vec<(u32, String)>,
+    /// The choice: a building, 0 for none; None is Auto.
+    pub current: Option<u32>,
+}
+
+/// The Slot tool's path edit mode: one work area's path, and the points
+/// picked for the gizmo. Placing slots is off while it is on, and clicks
+/// pick points only. The last point sits on the slot and is never picked.
+#[derive(Clone, Debug)]
+pub struct RoadEdit {
+    pub work: u64,
+    pub picked: BTreeSet<usize>,
+}
+
 struct View {
     camera: Camera,
     bounds: Bounds<Pixels>,
@@ -504,21 +664,45 @@ struct View {
     drag: Option<Drag>,
 }
 
+/// A sky bake from `IslandEditor::sky_job`: the sky for `ambient` at
+/// `time`, started at `clock` on the renderer's clock.
+pub(crate) struct SkyBaked {
+    ambient: Ambient,
+    time: f32,
+    clock: f32,
+    baked: Baked,
+}
+
+/// How often a sky with drifting clouds is baked again: a bake is ~9 ms of
+/// one core, and 117's clouds drift about 2 units a second, so the
+/// reflected clouds lag the marched ones by under that.
+const SKY_DRIFT_STEP: f32 = 1.;
+
 pub struct IslandEditor {
-    game: anno_formats::game::Game,
+    module: &'static dyn anno_core::game::Module,
     pub path: String,
-    source: Island,
-    // Inputs matching `source`. The install mounts saved mods, so reading it
+    // Inputs matching `island.native`. The install mounts saved mods, so reading it
     // again after Save would apply edits to already edited terrain files.
     terrain_original: std::collections::BTreeMap<String, Option<Vec<u8>>>,
-    pub doc: Doc,
+    /// The document and what tools and conversion change beside it (object
+    /// store, harbour records, slot tool choices, prop ids, material set).
+    pub island: anno_core::island::Island,
     map: Option<Arc<Texture>>,
     ground: Option<Arc<Texture>>,
     /// Native splat of the material maps; terrain draws with it in Ground.
     splat: Option<Arc<Splat>>,
+    /// The ground drawing `splat`, made with it so the view keeps one
+    /// mounted ground, and its pages, across scenes.
+    splat_ground: gpu::GroundDraw,
+    /// What the splat's control maps draw from: handed the material maps
+    /// again after each edit (`Palette::update_splat`).
+    splat_planes: Option<Arc<terrain::SplatPlanes<doc::Layer>>>,
     palette: Option<Arc<terrain::Palette>>,
     /// Material id and thumbnail, palette order.
     thumbs: Vec<(u8, Arc<RenderImage>)>,
+    /// The colour ids of a game's own ground with their names and looks,
+    /// by id: what conversion maps ground by in place of a palette's.
+    own_materials: Vec<convert::GroundMaterial>,
     /// Material edits since the ground texture was baked; the editor re-bakes
     /// off the UI thread after a paint stroke.
     pub ground_stale: bool,
@@ -534,13 +718,18 @@ pub struct IslandEditor {
     land_job: Option<(u64, Arc<Heightfield>)>,
     land_jobs: u64,
     layers: Layers,
+    /// The Graphics pane's settings, shared by every island
+    /// (`crate::graphics::current`); the pane sets the open island's too.
+    graphics: crate::graphics::Graphics,
+    /// ANNO_EDITOR_RENDER_SCALE, which wins over `graphics.render_scale`.
+    render_scale_env: Option<f32>,
     /// Flatten target; `None` uses the height where each stroke starts.
     level: Option<f32>,
     /// Prop file index the Place tool adds.
     place: Option<u32>,
     /// What the Place tool puts down instead of a prop: an object record
     /// from a shipped island, and the model a decoration carries.
-    pub place_object: Option<(anno_formats::objects::Template, Option<String>)>,
+    pub place_object: Option<(anno_core::island::objects::Template, Option<String>)>,
     /// Library pane: which list, and its search.
     pub library_tab: catalog::Kind,
     pub library_filter: String,
@@ -556,9 +745,15 @@ pub struct IslandEditor {
     /// Grid layer and value the Grid tool paints.
     grid: Kind,
     grid_value: u32,
-    /// Overlay and tint switch the terrain tiles were last built with, so a
-    /// layer toggle rebuilds them.
-    drawn_look: Option<(Option<Kind>, bool)>,
+    /// What the Grid tool edits on a 2070 island, whose grids are its
+    /// blockers instead.
+    pub blocker: grids::BlockerEdit,
+    /// The build-blocker polygon being drawn: its points so far, island
+    /// metres. Not in the document until it closes.
+    outline: Vec<[f32; 2]>,
+    /// Overlay, tint switch and path-blocker layer the terrain tiles were
+    /// last built with, so a layer toggle rebuilds them.
+    drawn_look: Option<(Option<Kind>, bool, Option<anno_core::island::PathLayer>)>,
     /// What the scene's water lines were built for: River tool, hovered
     /// water, the river being edited.
     drawn_lines: Option<(bool, Option<u64>, Option<u64>)>,
@@ -571,26 +766,28 @@ pub struct IslandEditor {
     is_new: bool,
     /// How the game is offered a new island; unused for shipped ones.
     pub listing: Listing,
-    /// Shipped records the harbour and slot tools copy; loaded on first use.
-    pub harbour: Option<Arc<harbour::Library>>,
-    /// The records are being read off the UI thread (`start_harbour_library`).
+    /// The harbour records (`island.harbour`) are being read off the UI
+    /// thread (`start_harbour_library`).
     harbour_loading: bool,
     /// Reading them failed for this island; not retried on every click.
     harbour_failed: bool,
-    /// The harbour tool places the island's start coast instead.
-    pub start_coast: bool,
-    pub resource: harbour::Resource,
-    /// The slot tool places always-active (fixed) slots, not random ones.
-    pub fixed_slots: bool,
     /// Harbour and slot tools: dragging marks a region to auto-place in.
     pub auto_region: bool,
+    /// The region is traced freehand instead of dragged as a rectangle.
+    pub auto_lasso: bool,
+    /// Painting the Marsh grid also shapes the marsh: flat ground, Marsh
+    /// environment, marsh textures (`shape_marsh`).
+    pub marsh_shape: bool,
     /// How many auto placement adds per region.
     pub auto_count: u32,
     /// Shipped sound spot and build blocker records by GUID, loaded on the
     /// first auto placement.
-    pub spot_records: Option<Arc<HashMap<u32, anno_formats::objects::Template>>>,
-    /// The harbour curve point picked with the Harbour tool: object, index.
-    pub coast_point: Option<(u64, usize)>,
+    pub spot_records: Option<Arc<HashMap<u32, anno_core::island::objects::Template>>>,
+    /// The curve point picked with the Harbour tool (a harbour) or the Slot
+    /// tool (a work area's road): object, index.
+    pub curve_point: Option<(u64, usize)>,
+    /// The Slot tool's path edit mode, when on (`road_editing`).
+    pub road_edit: Option<RoadEdit>,
     /// The river or lake the River tool is drawing or re-editing.
     pub river: Option<river::Draft>,
     /// Undo within the draft, and drafts written, which undoing reopens.
@@ -607,17 +804,67 @@ pub struct IslandEditor {
     pub selected_only: bool,
     /// New River tool drafts are lakes.
     pub lake_mode: bool,
+    /// How carving shapes and paints river beds.
+    river_bed: river::Bed,
+    /// [`Field::Falloff`].
+    river_falloff: f32,
+    /// Writing a river reshapes and repaints the ground under it.
+    pub carve_ground: bool,
+    /// The draft knot whose flow speed the last slider drag set, so one
+    /// drag is one undo step.
+    flow_step: Option<usize>,
     /// Flow brush: the last dab, whose direction to the next one sets the
     /// current.
     flow_from: Option<[f32; 2]>,
     /// `listing` changed since the last save.
     listing_dirty: bool,
+    /// The Ground material pane's browser of the game's sets, when open.
+    pub(crate) set_browser: Option<materials::SetBrowser>,
+    /// The material the Ground material pane is removing, while it waits for
+    /// the user to pick what its ground becomes.
+    pub(crate) removing: Option<u8>,
     /// The install's prop sets; `None` when `prop_sets.xml` did not load.
     pub prop_sets: Option<Arc<vegetation::PropSets>>,
+    /// How far foliage draws at each of the game's View Distance levels.
+    pub view_distances: crate::graphics::ViewDistances,
     /// Ambient presets the inspector offers for this island's region.
     pub ambients: Vec<String>,
     /// How each of those presets, and the island's own, lights the scene.
-    ambient_lights: Vec<(String, vegetation::Ambient)>,
+    ambient_lights: Vec<(String, Ambient)>,
+    /// The sky last baked, for the preset and time it was baked for: a bake
+    /// takes tens of milliseconds, and scenes rebuild on every edit.
+    sky: Option<(Ambient, f32, Baked)>,
+    /// The preset and time a sky bake is running for (`sky_job`); one at a
+    /// time, so bakes land in the order they were asked for.
+    sky_baking: Option<(Ambient, f32)>,
+    /// When the last bake started on the renderer's clock (`gpu::clock`),
+    /// for skies whose clouds drift across them (`Sky::drifts`).
+    sky_clock: f32,
+    /// A wake-up for the next drifting bake is pending (`sky_due_in`).
+    pub(crate) sky_ticking: bool,
+    /// The preset's ground light at noon, which eye adaptation opens the
+    /// view's exposure against at other times.
+    /// The working tint as the GPU decodes it per pixel (`GroundTint`),
+    /// drawn from the map itself (`TintSource`), and that map by pointer,
+    /// when the splat draws the ground. A dab touches what it painted; a
+    /// different map (undo, or the first dab after a checkpoint) makes it
+    /// again.
+    tint_gpu: Option<(usize, Arc<gpu::ControlMap>, Arc<TintSource>)>,
+    /// The game's own water pass (117's ocean, rivers and lakes), made with
+    /// the island and kept: its wave simulation and maps last across
+    /// scenes. Listed in the scene's passes while a preset has a sea.
+    water_pass: Option<Arc<dyn anno_core::water::Water>>,
+    /// The game's own sky passes (the backdrop from the camera and the
+    /// haze over the island), made with the island and kept like the water.
+    sky_pass: Option<Arc<dyn anno_core::ambient::SkyPass>>,
+    /// The way the game sees this island when not from the air (2070's
+    /// Deep Ocean islands from under the water), shown while
+    /// `Layers::under_water` is on; its passes stand in for the sky's and
+    /// the water's.
+    view: Option<anno_core::ambient::View>,
+    /// Hours, 0-24: where the view's sun and moon stand. View-only, like
+    /// Layers; the game runs its own day.
+    pub time_of_day: f32,
     /// The ground vegetation preview last placed, for the scene panel.
     vegetation: Option<Arc<vegetation::Preview>>,
     /// A World Machine import is running.
@@ -652,8 +899,12 @@ pub struct IslandEditor {
     /// `shipped` with the current shading's texture.
     shipped_meshes: Vec<Vec<Arc<Mesh>>>,
     water: Arc<Mesh>,
-    /// Rivers and lakes as one surface.
-    inland_water: Option<Arc<Mesh>>,
+    /// Rivers and lakes as one surface: shaded as 117 does beside its
+    /// ocean, else a translucent stand-in.
+    inland_water: Option<Inland>,
+    /// The rivers' and lakes' courses their outlines draw, from the same
+    /// `inland_job` as their surface.
+    water_courses: Vec<river::Course>,
     history: History<Doc>,
     pub tool: Tool,
     brush: Brush,
@@ -674,8 +925,39 @@ pub struct IslandEditor {
     pieces_stale: bool,
     /// Only markers changed (a drag moved items in place).
     markers_stale: bool,
+    /// A work area's path changed: its rail preview rows are redone with
+    /// the vegetation's (`set_grown`), not every row.
+    rails_stale: bool,
+    /// Bent path models by work area, and each model to bend, by cfg, once
+    /// its pieces have loaded.
+    rails: rail::Rails,
+    rail_templates: HashMap<String, Arc<rail::Template>>,
+    /// The rails are due a bend (`rails_job`), and whether one is running.
+    /// The rails bent last stay drawn meanwhile.
+    rails_wanted: bool,
+    rails_building: bool,
+    /// The Inspector's path preview per slot: the building whose path
+    /// model its work areas show, 0 for none; absent is Auto
+    /// (`Assets::work_area_path`). A view setting: not saved, not undone.
+    pub path_previews: HashMap<u64, u32>,
     /// A drag moved a river or lake curve: its water mesh follows.
     inland_stale: bool,
+    /// The rivers and lakes' surface is due a rebuild (`inland_job`), and
+    /// whether one is running. The surface built last stays drawn meanwhile.
+    inland_wanted: bool,
+    inland_building: bool,
+    /// The ground the last `inland_job` measured the flow map over: edits
+    /// replace the field's `Arc`. Weak, so its address is never reused.
+    inland_ground: std::sync::Weak<gpui_editor_kit::heightfield::Heightfield>,
+    /// Placement rows planned by the last full refresh, waiting for
+    /// `placement_job` to build them, and whether a build is running.
+    /// Only while `background_scene`: else `refresh_scene` builds them.
+    placement_plan: Option<placements::Plan>,
+    placement_building: bool,
+    /// A runner takes the scene's jobs (`inland_job`, `placement_job`) off
+    /// the UI thread. Off for tests and harnesses, whose refresh builds
+    /// everything itself.
+    pub(crate) background_scene: bool,
     /// The selection the renderer outlines and marks, with the placement
     /// rows' generation it was resolved against.
     selection_sent: Option<(BTreeSet<Item>, u64)>,
@@ -695,8 +977,9 @@ pub struct IslandEditor {
     models_settled: Option<(u64, bool, bool, usize, usize)>,
     /// assets.xml, for object GUID → model cfg; set by the editor once loaded.
     pub assets: Option<Arc<anno_formats::assets::Assets>>,
-    /// Decoded object areas, kept for writing `doc.objects` back on save.
-    object_store: Option<objects::Objects>,
+    /// The app's install, where a game places models by copying a shipped
+    /// record of their asset (2070, `IslandCodec::object_for`).
+    pub install: Option<Arc<Install>>,
     views: [View; 2],
     /// Draws both views; each has a viewport on it.
     renderer: Arc<Renderer>,
@@ -704,6 +987,9 @@ pub struct IslandEditor {
     /// Heights on the GPU; every tile mesh displaces by it, so a sculpt dab
     /// uploads only its rectangle and rebuilds no mesh.
     gpu_heights: Option<Arc<gpu::HeightMap>>,
+    /// How far sinking ground (marsh) lies below the heights where the
+    /// terrain is drawn, per height sample (`Palette::sinking`).
+    sink: Option<Arc<Vec<f32>>>,
     /// With GPU heights: the ground's color per height sample, and the
     /// terrain the renderer displaces from both. `tiles` stays empty then;
     /// it holds CPU meshes only when the GPU copy is unavailable.
@@ -722,8 +1008,86 @@ pub struct IslandEditor {
     identity: Arc<Instances>,
     cursor: Option<Vec3>,
     editing: Option<TextEdit<Field>>,
-    next_id: u64,
     pub message: Option<(String, bool)>,
+    /// The game's ground for its own paint form (`SceneParts::ground`);
+    /// `None` where the a7m splat or the kit's material draws the paint.
+    own_ground: Option<Box<dyn anno_core::game::IslandGround>>,
+}
+
+/// What loading finds beside the document, for `IslandEditor::assemble`.
+struct Parts {
+    palette: Option<Arc<terrain::Palette>>,
+    splat: Option<Arc<Splat>>,
+    splat_planes: Option<Arc<terrain::SplatPlanes<doc::Layer>>>,
+    ground: Option<Arc<Texture>>,
+    shipped: terrain::ShippedMeshes,
+    thumbs: Vec<(u8, Arc<RenderImage>)>,
+    map: Option<Arc<Texture>>,
+    tint_gpu: Option<(usize, Arc<gpu::ControlMap>, Arc<TintSource>)>,
+    ambients: Vec<String>,
+    ambient_lights: Vec<(String, Ambient)>,
+    water_pass: Option<Arc<dyn anno_core::water::Water>>,
+    sky_pass: Option<Arc<dyn anno_core::ambient::SkyPass>>,
+    prop_sets: Option<Arc<vegetation::PropSets>>,
+    library: models::Library,
+    shipped_source: Option<(Arc<Install>, String)>,
+    own_ground: Option<Box<dyn anno_core::game::IslandGround>>,
+}
+
+/// Rivers and lakes as the scene draws them.
+/// The GPU's view of `map` for the ground's tint (`GroundTint`), keyed by
+/// the map's pointer: a control map drawn from the tint map as the GPU
+/// fills and refreshes it, where an RGBA copy was 36 MB on the continental
+/// island. `None` past the 4096² a control map takes.
+fn tint_control(map: &Arc<TintMap>) -> Option<(usize, Arc<gpu::ControlMap>, Arc<TintSource>)> {
+    if map.width > 4096 || map.height > 4096 {
+        return None;
+    }
+    let source = Arc::new(TintSource(std::sync::Mutex::new(Some(map.clone()))));
+    let draw = source.clone();
+    let control = gpu::ControlMap::drawn(map.width, map.height, move |rect| {
+        let mut out = vec![255u8; (rect.x1 - rect.x0) * (rect.z1 - rect.z0) * 4];
+        // Read under the lock: a dab waits rather than the map being
+        // copied on write under a reader.
+        if let Some(map) = draw.0.lock().unwrap().as_ref() {
+            let mut texels = out.as_chunks_mut::<4>().0.iter_mut();
+            for z in rect.z0..rect.z1 {
+                for t in &map.texels[z * map.width + rect.x0..z * map.width + rect.x1] {
+                    let o = texels.next().expect("sized for the rect");
+                    o[..3].copy_from_slice(t);
+                }
+            }
+        }
+        out
+    })
+    .ok()?;
+    Some((Arc::as_ptr(map) as usize, Arc::new(control), source))
+}
+
+/// The tint map a tint control map draws from. A dab takes it out while
+/// it paints (the Tint tool's dab), so painting does not copy the
+/// whole map for this second reference, and hands it back.
+pub(crate) struct TintSource(std::sync::Mutex<Option<Arc<TintMap>>>);
+
+/// What `rails_job` bends: the rails, and the templates it made for
+/// models bent the first time.
+pub(crate) struct RailsBuilt {
+    rails: rail::Rails,
+    templates: HashMap<String, Arc<rail::Template>>,
+}
+
+/// What `inland_job` builds: the rivers' and lakes' surface and the
+/// courses their outlines draw.
+pub(crate) struct InlandBuilt {
+    surface: Option<Inland>,
+    courses: Vec<river::Course>,
+}
+
+pub(crate) enum Inland {
+    /// 117's own shading, beside its ocean.
+    Shaded(Arc<anno_core::water::Inland>),
+    /// A translucent surface where there is no ocean to shade them with.
+    Mesh(Arc<Mesh>),
 }
 
 impl IslandEditor {
@@ -746,9 +1110,10 @@ impl IslandEditor {
             .map(|e| e as &mut dyn gpui_editor_kit::field::InputBuffer)
     }
 
-    /// Reads an island archive through the install and builds the document.
-    pub fn load(install: &Install, path: &str) -> Result<Self> {
-        Self::load_with(install, path, None)
+    /// Reads an island archive of `game` through the install and builds the
+    /// document.
+    pub fn load(module: &'static dyn Module, install: &Install, path: &str) -> Result<Self> {
+        Self::load_with(module, install, path, None)
     }
 
     /// `load`, given the app's install and asset registry: the island's
@@ -756,6 +1121,7 @@ impl IslandEditor {
     /// does. Waiting for the document first put 0.8 s before them on the
     /// continental island.
     pub fn load_with(
+        module: &'static dyn Module,
         install: &Install,
         path: &str,
         shared: Option<(Arc<Install>, Arc<anno_formats::assets::Assets>)>,
@@ -766,8 +1132,24 @@ impl IslandEditor {
             log.push(format!("{what}: {} ms", step.elapsed().as_millis()));
             step = std::time::Instant::now();
         };
+        let islands = module.islands().context("this game has no islands")?;
+        let rules = islands.rules();
+        // A game with its own codec builds the document there; the a7m
+        // pipeline below reads, bakes and derives the rest.
+        let assets = shared.as_ref().map(|s| &*s.1);
+        let a7m = match islands.codec() {
+            anno_core::game::Codec::Own(codec) => {
+                let island = codec.read(install, path, assets)?;
+                let mut editor = Self::load_native(module, install, path, island)?;
+                // The database names the models its objects draw, and with
+                // the install, the records new ones copy.
+                (editor.install, editor.assets) = shared.unzip();
+                return Ok(editor);
+            }
+            anno_core::game::Codec::A7m(a7m) => a7m,
+        };
         let bytes = install.read(path)?;
-        let archive = rda::Archive::from_bytes(bytes, path).context("island archive")?;
+        let archive = rda::Archive::parse(bytes, path).context("island archive")?;
         let member = |name: &str| {
             archive
                 .read_path(name)
@@ -775,27 +1157,21 @@ impl IslandEditor {
         };
         let gamedata = member("gamedata.data")?;
         let rd3d = member("rd3d.data")?;
-        let source = match install.read(&format!("{path}info")) {
-            Ok(info) => Island::parse_with_info(&gamedata, &rd3d, &info)?,
-            Err(_) => Island::parse(&gamedata, &rd3d)?,
+        let info_path = format!("{path}info");
+        let info = install.read(&info_path).ok();
+        let source = match &info {
+            Some(info) => Island::parse_with_info(&gamedata, &rd3d, info)?,
+            None => Island::parse(&gamedata, &rd3d)?,
         };
-        // The terrain's material set and the shipped terrain meshes need
-        // only the island's header: with the app's install they load on
-        // their own threads, beside the material maps and the models.
+        let material_set = a7m.material_set(source.material_set_file_name()).to_owned();
+        // The archive stays for `Island::park` below, its members go.
+        drop((gamedata, rd3d));
         let metres = source.world_size()[0] as f32;
-        let early = shared.as_ref().map(|(install, _)| {
-            let (install, set, path) = (
-                install.clone(),
-                source.material_set_file_name().to_owned(),
-                path.to_owned(),
-            );
-            let palette = std::thread::spawn({
-                let install = install.clone();
-                move || terrain::Palette::load(&install, Some(&install), &set)
-            });
-            (palette, (install, path))
-        });
-        let (early_palette, shipped_source) = early.unzip();
+        // With the app's install the shipped terrain meshes wait for their
+        // layer (64 MB on the continental island, off by default).
+        let shipped_source = shared
+            .as_ref()
+            .map(|(install, _)| (install.clone(), path.to_owned()));
         let (object_store, objects) = match objects::Objects::read(source.gamedata()) {
             Ok(store) => {
                 let list = store.objects.clone();
@@ -806,99 +1182,306 @@ impl IslandEditor {
                 (None, Vec::new())
             }
         };
-        let mut library = models::Library::default();
-        let models = shared.as_ref().map(|(install, assets)| {
-            let files = source.prop_files();
-            let props = (source.props().iter()).map(|p| {
-                let cfg = files.get(p.file as usize).map(|f| f.replace('\\', "/"));
-                (cfg, doc::trs(p.position, p.rotation, p.scale))
+        let objects = Arc::new(objects);
+        lap("Island file", &mut log);
+        let mut library = models::Library {
+            models: Default::default(),
+            cache: Arc::new(models::Cache::new(&module.model_look())),
+        };
+        // Everything after the island's file needs only the file and the
+        // install, and no part needs another: each on its own thread, the
+        // material maps and the document on this one. One after another
+        // they took 0.6 s of the pirate island's 0.7.
+        let loaded = std::thread::scope(|s| -> Result<_> {
+            let sky = s.spawn(|| module.scene().and_then(|scene| scene.sky(install)));
+            // Kept only when a preset has a sea of its own, which is known
+            // once they are read: read alongside them rather than after.
+            let water = s.spawn(|| module.scene().and_then(|scene| scene.water(install)));
+            let prop_sets = s.spawn(|| vegetation::PropSets::load(rules, install));
+            let ambients = s.spawn(|| {
+                let region = rules.island_region(path);
+                let list = (module.scene())
+                    .map_or_else(Vec::new, |scene| scene.ambient_names(install, region));
+                let own = anno_formats::a7m::session::SessionSettings::read(source.gamedata())
+                    .map(|s| s.global_ambient)
+                    .unwrap_or_default();
+                let names: Vec<&str> = (list.iter().chain([&own])).map(String::as_str).collect();
+                let lights = module
+                    .scene()
+                    .map_or_else(Vec::new, |scene| scene.ambients(install, &names));
+                (list, lights)
             });
-            let placed: Vec<(Option<String>, Mat4)> = props
-                .chain(objects.iter().map(|o| {
-                    let cfgs = assets.get(o.guid).map_or(&[][..], |a| a.cfgs.as_slice());
-                    let cfg = o.model(cfgs).map(|m| m.replace('\\', "/"));
-                    (cfg, doc::trs(o.position, o.rotation, o.scale))
-                }))
-                .collect();
-            let batch = library.batch(
-                placed
-                    .iter()
-                    .filter_map(|(c, m)| Some((c.as_deref()?, Some(m)))),
-            );
-            std::thread::spawn(library.job(install.clone(), batch))
-        });
-        let (materials, level0) = match Materials::load_level0(install, path, &source) {
-            Ok((m, level0)) => (Some(m), level0),
-            Err(e) => {
-                eprintln!("{path}: material maps unavailable, painting disabled: {e:#}");
-                (None, None)
-            }
-        };
-        let mut doc = Doc::from_island(&source, materials)?;
-        doc.objects = Arc::new(objects);
-        doc.grids = Grids::read(&source)
-            .map_err(|e| eprintln!("{path}: grids unavailable: {e:#}"))
-            .ok()
-            .map(Arc::new);
-        doc.tint = island_data_dir(path)
-            .ok()
-            .map(|dir| Arc::new(tint::load(install, &dir, source.world_size())));
-        lap("Terrain / heightmap", &mut log);
-        let map = load_map_image(install, path);
-        let palette = match early_palette {
-            Some(thread) => thread.join().expect("material set"),
-            None => terrain::Palette::load(install, None, source.material_set_file_name()),
-        };
-        let palette = palette
-            .map_err(|e| eprintln!("{path}: material set unavailable: {e:#}"))
-            .ok()
-            .map(Arc::new);
-        lap("Material textures", &mut log);
-        // Level 0 as decoded, else copied out of the paint chunks once.
-        let level0 = level0.or_else(|| {
-            doc.materials
-                .as_ref()
-                .map(|m| (m.ids.grid(), m.alphas.grid()))
-        });
-        // The GPU splat draws the ground; the baked texture only colours
-        // shipped cliff tops, map images and the other shadings, so with a
-        // splat it bakes off the UI thread after loading (`bake_job`), not
-        // here: 100-180 ms of the continental island's load.
-        let splat = palette
-            .as_ref()
-            .zip(level0.as_ref())
-            .and_then(|(p, (ids, alphas))| {
-                p.splat(ids, alphas)
-                    .map_err(|e| eprintln!("{path}: splat unavailable: {e:#}"))
+            let palette = s.spawn(|| {
+                let reload = shared.as_ref().map(|(install, _)| install);
+                terrain::Palette::load(install, reload, &material_set)
+            });
+            // The models' cfgs and placements, then the models themselves on
+            // every core (`Library::job`).
+            let models = shared.as_ref().map(|(shared, assets)| {
+                let (source, objects, library) = (&source, &objects, &mut library);
+                s.spawn(move || {
+                    let files = source.prop_files();
+                    let props = (source.props().iter()).map(|p| {
+                        let cfg = files.get(p.file as usize).map(|f| f.replace('\\', "/"));
+                        (cfg, doc::trs(p.position, p.rotation, p.scale))
+                    });
+                    let placed: Vec<(Option<String>, Mat4)> = props
+                        .chain(objects.iter().map(|o| {
+                            let cfgs = assets.get(o.guid).map_or(&[][..], |a| a.cfgs.as_slice());
+                            let cfg = o.model(cfgs).map(|m| m.replace('\\', "/"));
+                            (cfg, doc::trs(o.position, o.rotation, o.scale))
+                        }))
+                        .collect();
+                    let batch = library.batch(
+                        placed
+                            .iter()
+                            .filter_map(|(c, m)| Some((c.as_deref()?, Some(m)))),
+                    );
+                    let loaded = library.job(shared.clone(), batch)();
+                    library.models.finish(loaded);
+                })
+            });
+            let map = s.spawn(|| load_map_image(install, path));
+            let grids = s.spawn(|| {
+                Grids::read(&source)
+                    .map_err(|e| eprintln!("{path}: grids unavailable: {e:#}"))
                     .ok()
                     .map(Arc::new)
             });
-        let ground = match (&palette, &level0, &splat) {
-            (Some(p), Some((ids, alphas)), None) => p
-                .bake(ids, alphas, metres)
-                .map_err(|e| eprintln!("{path}: ground bake failed: {e:#}"))
+            let tint = s.spawn(|| {
+                let dir = island_data_dir(path).ok()?;
+                let map = Arc::new(tint::load(install, &dir, source.world_size()));
+                let gpu = tint_control(&map);
+                Some((map, gpu))
+            });
+            let materials = match Materials::load_level0(a7m.material_files, install, path, &source)
+            {
+                Ok(m) => Some(m),
+                Err(e) => {
+                    eprintln!("{path}: material maps unavailable, painting disabled: {e:#}");
+                    None
+                }
+            };
+            let mut doc = Doc::from_island(&source, materials)?;
+            doc.objects = objects.clone();
+            doc.grids = grids.join().expect("grids");
+            let (tint, tint_gpu) = tint.join().expect("tint").unzip();
+            doc.tint = tint;
+            let tint_gpu = tint_gpu.flatten();
+            lap("Terrain / heightmap", &mut log);
+            let palette = (palette.join().expect("material set"))
+                .map_err(|e| eprintln!("{path}: material set unavailable: {e:#}"))
                 .ok()
-                .map(Arc::new),
-            _ => None,
-        };
-        let bake_later = ground.is_none() && splat.is_some();
-        lap("Splat layers", &mut log);
-        drop(level0);
-        // With the app's install the shipped meshes wait for their layer
-        // (64 MB on the continental island, off by default).
-        let shipped = match &shipped_source {
-            Some(_) => terrain::ShippedMeshes::empty(metres),
-            None => terrain::ShippedMeshes::load(install, path, metres),
-        };
-        lap("Shipped meshes", &mut log);
-        let thumbs = palette.as_ref().map_or_else(Vec::new, |p| {
-            p.materials
+                .map(Arc::new);
+            lap("Material textures", &mut log);
+            // The GPU splat draws the ground; the baked texture only colours
+            // shipped cliff tops, map images and the other shadings, so with
+            // a splat it bakes off the UI thread after loading (`bake_job`),
+            // not here: 100-180 ms of the continental island's load. Both
+            // read the material maps' chunks in place.
+            let splat = palette
+                .as_ref()
+                .zip(doc.materials.as_ref())
+                .and_then(|(p, m)| {
+                    let grit = doc.grids.as_ref().and_then(|g| g.layer(Kind::Grit));
+                    let a = m.paint.a7m()?;
+                    p.splat(a7m.ground_bake, &a.ids, &a.alphas, grit)
+                        .map_err(|e| eprintln!("{path}: splat unavailable: {e:#}"))
+                        .ok()
+                });
+            let (splat, splat_planes) = splat.map(|(s, p)| (Arc::new(s), p)).unzip();
+            let ground = match (&palette, &doc.materials, &splat) {
+                (
+                    Some(p),
+                    Some(Materials {
+                        paint: Paint::A7m(a),
+                        ..
+                    }),
+                    None,
+                ) => p
+                    .bake(&a.ids, &a.alphas, metres)
+                    .map_err(|e| eprintln!("{path}: ground bake failed: {e:#}"))
+                    .ok()
+                    .map(Arc::new),
+                _ => None,
+            };
+            let shipped = match &shipped_source {
+                Some(_) => terrain::ShippedMeshes::empty(metres),
+                None => terrain::ShippedMeshes::load(install, path, metres),
+            };
+            let thumbs = palette.as_ref().map_or_else(Vec::new, |p| {
+                p.materials
+                    .iter()
+                    .map(|(&id, m)| (id, m.preview.render_image()))
+                    .collect()
+            });
+            lap("Splat layers", &mut log);
+            let (ambients, ambient_lights) = ambients.join().expect("ambient presets");
+            // 50 MB of ripples: only for presets with a sea of their own.
+            let water = water.join().expect("water");
+            let water = ambient_lights
                 .iter()
-                .map(|(&id, m)| (id, m.preview.render_image()))
-                .collect()
+                .any(|(_, a)| a.sea.is_some())
+                .then_some(water)
+                .flatten();
+            let sky = sky.join().expect("sky");
+            let prop_sets = (prop_sets.join().expect("prop sets"))
+                .map_err(|e| eprintln!("{}: {e:#}", rules.prop_sets_path))
+                .ok()
+                .map(Arc::new);
+            lap("Ambient presets", &mut log);
+            if let Some(models) = models {
+                models.join().expect("model loader");
+                lap("Models, alongside", &mut log);
+            }
+            let map = map.join().expect("map image");
+            Ok((
+                doc,
+                (
+                    palette,
+                    (splat, splat_planes),
+                    ground,
+                    shipped,
+                    thumbs,
+                    map,
+                    tint_gpu,
+                ),
+                (ambients, ambient_lights, water, sky, prop_sets),
+            ))
+        })?;
+        let (
+            doc,
+            (palette, (splat, splat_planes), ground, shipped, thumbs, map, tint_gpu),
+            (ambients, ambient_lights, water_pass, sky_pass, prop_sets),
+        ) = loaded;
+        let mut island = anno_core::island::Island::new(doc, object_store, material_set);
+        island.set_native(Native::A7m(source));
+        let mut editor = Self::assemble(
+            module,
+            install,
+            path,
+            island,
+            Parts {
+                palette,
+                splat,
+                splat_planes,
+                ground,
+                shipped,
+                thumbs,
+                map,
+                tint_gpu,
+                ambients,
+                ambient_lights,
+                water_pass,
+                sky_pass,
+                prop_sets,
+                library,
+                shipped_source,
+                own_ground: None,
+            },
+        );
+        lap("Terrain chunks", &mut log);
+        log.push(format!(
+            "{} objects · {} props · {} materials · {} triangles",
+            editor.island.doc.objects.len(),
+            editor.island.doc.props.len(),
+            editor.thumbs.len(),
+            editor.triangles()
+        ));
+        // The island's trees are read again only to save (`Island::park`):
+        // from the game's archives when they serve both files, which no save
+        // overwrites, else from the compressed archive read here.
+        let served = |p: &str| install.mod_layer(p).is_none() && install.file(p).is_some();
+        let archived = (shared.as_ref())
+            .filter(|_| served(path) && (info.is_none() || served(&info_path)))
+            .map(|(install, _)| install.clone());
+        let Some(source) = editor.island.a7m_mut() else {
+            return Ok(editor);
+        };
+        match archived {
+            Some(install) => {
+                let path = path.to_owned();
+                source.park(move || {
+                    let read =
+                        |p: &str| install.file(p).map(|id| install.read_file(id)).transpose();
+                    let bytes =
+                        read(&path)?.with_context(|| format!("{path}: gone from the archives"))?;
+                    let archive = rda::Archive::parse(bytes, &path)?;
+                    let info = read(&info_path)?;
+                    Ok((
+                        archive.read_path("gamedata.data")?,
+                        archive.read_path("rd3d.data")?,
+                        info,
+                    ))
+                });
+            }
+            None => {
+                let archive = Arc::new(archive);
+                source.park(move || {
+                    let (gamedata, rd3d) = (
+                        archive.read_path("gamedata.data")?,
+                        archive.read_path("rd3d.data")?,
+                    );
+                    Ok((gamedata, rd3d, info.clone()))
+                });
+            }
+        }
+        editor.assets = shared.map(|(_, assets)| assets);
+        editor.load_log = log;
+        // What the load let go goes back before the first frames pack the
+        // arena and grow textures, on a thread of its own (13-30 ms): kept
+        // in glibc's arenas it stood on top of what they allocate, 40-110
+        // MB of the resident set's high on the 117 islands.
+        gpui_editor_kit::gpu::trim_heap();
+        Ok(editor)
+    }
+
+    /// The editor around `island`, read from `source`, with what loading
+    /// found beside it.
+    fn assemble(
+        module: &'static dyn Module,
+        install: &Install,
+        path: &str,
+        island: anno_core::island::Island,
+        parts: Parts,
+    ) -> Self {
+        let Parts {
+            palette,
+            splat,
+            splat_planes,
+            ground,
+            shipped,
+            thumbs,
+            map,
+            tint_gpu,
+            ambients,
+            ambient_lights,
+            water_pass,
+            sky_pass,
+            prop_sets,
+            library,
+            shipped_source,
+            own_ground,
+        } = parts;
+        let metres = island.doc.field.grid.size()[0];
+        let bake_later = ground.is_none() && splat.is_some();
+        let size = island.doc.field.grid.size();
+        // The families the game's models draw in, under its own scene
+        // lighting where the island has a preset of its own to light by:
+        // the set is the renderer's for good. Else the kit's alone.
+        let preset = (ambient_lights.iter()).any(|(n, _)| *n == island.doc.session.global_ambient);
+        let lit = module.model_look().surfaces.map(|s| {
+            preset
+                .then(|| s.0.lit())
+                .flatten()
+                .unwrap_or_else(|| s.0.families())
         });
-        let size = doc.field.grid.size();
-        let renderer = Arc::new(Renderer::default());
+        let renderer = Arc::new(lit.map_or_else(Renderer::default, Renderer::with_families));
+        // Fewer pixels for slow GPUs and 5K panes; README, Graphics. Set
+        // with the scene (`refresh_scene`).
+        let render_scale_env = std::env::var("ANNO_EDITOR_RENDER_SCALE")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok());
         // The 3D view is a real perspective; the Top view stays orthographic.
         // Anno's world is left-handed (+z is north): mirrored, the views show
         // islands as the game does, north up.
@@ -909,10 +1492,9 @@ impl IslandEditor {
             ..Camera::perspective()
         };
         let mut editor = Self {
-            game: install.game(),
+            module,
             path: path.to_owned(),
-            next_id: doc.props.len() as u64 + 1,
-            source,
+            island,
             history: History::new(true),
             // Select: a first click on an unfamiliar island inspects it
             // rather than reshaping its terrain. A new island starts on
@@ -923,9 +1505,10 @@ impl IslandEditor {
                 strength: 0.5,
                 ..Brush::default()
             },
-            paint: 1,
+            // The first material shown, which a set's thumbnails start with.
+            paint: thumbs.first().map_or(1, |t| t.0),
             load_log: Vec::new(),
-            shading: if ground.is_some() || splat.is_some() {
+            shading: if ground.is_some() || splat.is_some() || own_ground.is_some() {
                 Shading::Ground
             } else if map.is_some() {
                 Shading::Map
@@ -935,11 +1518,17 @@ impl IslandEditor {
             shipped_meshes: Vec::new(),
             water: terrain::water(metres),
             inland_water: None,
+            water_courses: Vec::new(),
             map,
+            splat_ground: splat
+                .as_ref()
+                .map_or(gpu::GroundDraw::Kit, anno_render::a7m::ground),
             splat,
+            splat_planes,
             ground,
             palette,
             thumbs,
+            own_materials: Vec::new(),
             ground_stale: bake_later,
             splat_stale: false,
             baking: false,
@@ -947,42 +1536,59 @@ impl IslandEditor {
             land_job: None,
             land_jobs: 0,
             layers: Layers::default(),
+            graphics: crate::graphics::current(),
+            render_scale_env,
             level: None,
             place: None,
             scatter: scatter::Scatter::default(),
             cliffs: cliffs::Settings::default(),
             grid: Kind::Water,
             grid_value: 1,
+            blocker: grids::BlockerEdit::Paths(anno_core::island::PathLayer::Blocked),
+            outline: Vec::new(),
             drawn_look: None,
             drawn_lines: None,
             tint_color: tint::PRESETS[3].1,
             tint_loaded: None,
             terrain_original: std::collections::BTreeMap::new(),
             is_new: false,
-            listing: Listing::default(),
+            listing: Listing::new(module.islands().map_or(&IslandRules::BARE, |i| i.rules())),
             listing_dirty: false,
-            prop_sets: vegetation::PropSets::load(install)
-                .map_err(|e| eprintln!("{}: {e:#}", install.game().profile().prop_sets_path))
-                .ok()
-                .map(Arc::new),
-            ambients: Vec::new(),
-            ambient_lights: Vec::new(),
+            set_browser: None,
+            removing: None,
+            prop_sets,
+            view_distances: crate::graphics::ViewDistances::read(install, module),
+            ambients,
+            ambient_lights,
+            sky: None,
+            sky_baking: None,
+            sky_clock: 0.,
+            sky_ticking: false,
+            tint_gpu,
+            water_pass,
+            sky_pass,
+            view: None,
+            // Noon: the sun at the preset's highest, as the view always was.
+            time_of_day: 12.,
             vegetation: None,
             wm_busy: false,
             wm_stamp: None,
-            harbour: None,
             harbour_loading: false,
             harbour_failed: false,
-            start_coast: false,
-            resource: harbour::Resource::Mine,
-            fixed_slots: false,
             auto_region: false,
+            auto_lasso: false,
+            marsh_shape: true,
             auto_count: 2,
             spot_records: None,
-            coast_point: None,
+            curve_point: None,
+            road_edit: None,
             river: None,
             river_history: river::DraftHistory::default(),
             lake_mode: false,
+            river_bed: river::Bed::default(),
+            river_falloff: 10.,
+            carve_ground: true,
+            flow_step: None,
             hover_water: None,
             hover_item: None,
             selected_only: false,
@@ -1013,7 +1619,19 @@ impl IslandEditor {
             undrawn: Vec::new(),
             pieces_stale: true,
             markers_stale: false,
+            rails_stale: false,
+            rails: rail::Rails::default(),
+            rail_templates: HashMap::new(),
+            rails_wanted: false,
+            rails_building: false,
+            path_previews: HashMap::new(),
             inland_stale: false,
+            inland_wanted: false,
+            inland_building: false,
+            inland_ground: std::sync::Weak::new(),
+            placement_plan: None,
+            placement_building: false,
+            background_scene: false,
             selection_sent: None,
             selection_unplaced: Vec::new(),
             vegetation_window: Vec::new(),
@@ -1021,7 +1639,7 @@ impl IslandEditor {
             loading_models: false,
             models_settled: None,
             assets: None,
-            object_store,
+            install: None,
             views: [
                 View {
                     camera: perspective,
@@ -1042,45 +1660,100 @@ impl IslandEditor {
             renderer,
             tiles: Vec::new(),
             gpu_heights: None,
+            sink: None,
             terrain_colors: None,
             terrain: None,
             stale_colors: Rect::default(),
             dirty: Rect::default(),
             scene_stale: true,
+            own_ground,
             identity: Arc::new(Instances {
                 matrices: vec![math::IDENTITY],
                 ids: vec![],
             }),
             cursor: None,
             editing: None,
-            doc,
             message: None,
         };
-        editor.tint_loaded = editor.doc.tint.clone();
-        editor.ambients = vegetation::ambients(install, &editor.region());
-        let own = editor.doc.session.global_ambient.clone();
-        editor.ambient_lights =
-            vegetation::Ambient::read_all(install, editor.ambients.iter().chain([&own]));
-        lap("Ambient presets", &mut log);
+        editor.tint_loaded = editor.island.doc.tint.clone();
         editor.rebuild_tiles(None);
-        lap("Terrain chunks", &mut log);
-        log.push(format!(
-            "{} objects · {} props · {} materials · {} triangles",
-            editor.doc.objects.len(),
-            editor.doc.props.len(),
-            editor.thumbs.len(),
-            editor.triangles()
-        ));
-        if let Some(models) = models {
-            editor
-                .library
-                .models
-                .finish(models.join().expect("model loader"));
-            editor.pieces_stale = true;
-            lap("Models, alongside", &mut log);
+        editor
+    }
+
+    /// Loads an island a game's own codec reads (2070's `.isd`): the
+    /// document `island` holds, its layer textures and the ground that
+    /// draws its paint. Nothing of the a7m path's (material set, splat,
+    /// grids, tint, props) applies.
+    fn load_native(
+        module: &'static dyn Module,
+        install: &Install,
+        path: &str,
+        mut island: anno_core::island::Island,
+    ) -> Result<Self> {
+        // The island file names no light: the game's scene finds the
+        // profile its worlds light it by.
+        let scene = module.scene();
+        let ambient = scene.and_then(|s| s.island_ambient(install, path));
+        let (ambients, ambient_lights) = match (scene, ambient) {
+            (Some(scene), Some(name)) => {
+                let lights = scene.ambients(install, &[name.as_str()]);
+                island.doc.session.global_ambient = name.clone();
+                (vec![name], lights)
+            }
+            _ => (Vec::new(), Vec::new()),
+        };
+        // The game's ground for its own paint form, and the palette's
+        // thumbnails and conversion looks from it.
+        let own_ground = (scene.zip(island.doc.materials.as_ref()))
+            .and_then(|(scene, m)| scene.ground(install, &m.paint))
+            .and_then(|g| {
+                g.map_err(|e| eprintln!("{path}: ground unavailable: {e:#}"))
+                    .ok()
+            });
+        let (mut thumbs, mut looks) = (Vec::new(), Vec::new());
+        for t in own_ground.iter().flat_map(|g| g.thumbs(install)) {
+            // Conversion maps ground onto colour layers only.
+            if t.colour {
+                let look = convert::Swatch::of(&t.image.rgba);
+                looks.push((t.id, t.name, Some(look)));
+            }
+            thumbs.push((t.id, t.image.render_image()));
         }
-        editor.assets = shared.map(|(_, assets)| assets);
-        editor.load_log = log;
+        let metres = island.doc.field.grid.size()[0];
+        // The game's sea, kept only when the island's preset has one, as
+        // the a7m path keeps it.
+        let water_pass = (ambient_lights.iter().any(|(_, a)| a.sea.is_some()))
+            .then(|| scene.and_then(|s| s.water(install)))
+            .flatten();
+        let parts = Parts {
+            palette: None,
+            splat: None,
+            splat_planes: None,
+            ground: None,
+            shipped: terrain::ShippedMeshes::empty(metres),
+            thumbs,
+            map: None,
+            tint_gpu: None,
+            ambients,
+            ambient_lights,
+            water_pass,
+            sky_pass: scene.and_then(|s| s.sky(install)),
+            prop_sets: None,
+            library: models::Library {
+                models: Default::default(),
+                cache: Arc::new(models::Cache::new(&module.model_look())),
+            },
+            shipped_source: None,
+            own_ground,
+        };
+        let mut editor = Self::assemble(module, install, path, island, parts);
+        looks.sort_by_key(|m: &convert::GroundMaterial| m.0);
+        editor.own_materials = looks;
+        editor.view = scene.and_then(|s| s.island_view(install, path));
+        if let Some(note) = editor.placeholder_note() {
+            editor.say(note, true);
+        }
+        gpui_editor_kit::gpu::trim_heap();
         Ok(editor)
     }
 
@@ -1099,16 +1772,16 @@ impl IslandEditor {
     /// model of each object, normalized. For telling which mod provides
     /// them.
     pub fn model_paths(&self) -> Vec<String> {
-        let mut used = vec![false; self.doc.meshes.len()];
-        for p in self.doc.props.iter() {
+        let mut used = vec![false; self.island.doc.meshes.len()];
+        for p in self.island.doc.props.iter() {
             if let Some(u) = used.get_mut(p.source.file as usize) {
                 *u = true;
             }
         }
-        let props = (self.doc.meshes.iter().zip(used))
+        let props = (self.island.doc.meshes.iter().zip(used))
             .filter(|(_, u)| *u)
             .map(|(m, _)| m.clone());
-        let objects = self.doc.objects.iter().filter_map(|o| {
+        let objects = self.island.doc.objects.iter().filter_map(|o| {
             let cfgs = self
                 .assets
                 .as_ref()
@@ -1129,14 +1802,15 @@ impl IslandEditor {
     fn item_cfg(&self, item: Item) -> Option<String> {
         match item {
             Item::Prop(id) => {
-                let p = self.doc.prop(id)?;
-                self.doc
+                let p = self.island.doc.prop(id)?;
+                self.island
+                    .doc
                     .meshes
                     .get(p.source.file as usize)
                     .map(|m| m.replace('\\', "/"))
             }
             Item::Object(id) => {
-                let o = self.doc.objects.iter().find(|o| o.id == id)?;
+                let o = self.island.doc.objects.iter().find(|o| o.id == id)?;
                 let cfgs = self
                     .assets
                     .as_ref()
@@ -1170,7 +1844,7 @@ impl IslandEditor {
         if local[0][0] > local[1][0] {
             return None;
         }
-        let mut world = self.doc.matrix(item)?;
+        let mut world = self.island.doc.matrix(item)?;
         // Mid GPU drag the document holds the start.
         if let Some(m) = self.gpu_drag()
             && self.selection.contains(&item)
@@ -1202,29 +1876,30 @@ impl IslandEditor {
     /// the island's file list, object cfgs from assets.xml.
     fn item_cfgs(&self) -> Vec<(Item, Option<String>, Mat4)> {
         let files: Vec<String> = self
+            .island
             .doc
             .meshes
             .iter()
             .map(|m| m.replace('\\', "/"))
             .collect();
-        let mut out = Vec::with_capacity(self.doc.props.len() + self.doc.objects.len());
-        for p in self.doc.props.iter() {
+        let mut out =
+            Vec::with_capacity(self.island.doc.props.len() + self.island.doc.objects.len());
+        for p in self.island.doc.props.iter() {
             out.push((
                 Item::Prop(p.id),
                 files.get(p.source.file as usize).cloned(),
                 p.matrix,
             ));
         }
-        for o in self.doc.objects.iter() {
-            let cfgs = self
-                .assets
-                .as_ref()
-                .and_then(|a| a.get(o.guid))
-                .map(|a| a.cfgs.as_slice())
-                .unwrap_or(&[]);
+        for o in self.island.doc.objects.iter() {
+            let asset = self.assets.as_ref().and_then(|a| a.get(o.guid));
+            // The game draws these only in its own editor; blocker
+            // footprints come from what it shows.
+            let shown = !asset.is_some_and(|a| a.editor_only == Some(true));
+            let cfgs = asset.map(|a| a.cfgs.as_slice()).unwrap_or(&[]);
             out.push((
                 Item::Object(o.id),
-                o.model(cfgs).map(|m| m.replace('\\', "/")),
+                (o.model(cfgs).filter(|_| shown)).map(|m| m.replace('\\', "/")),
                 doc::trs(o.position, o.rotation, o.scale),
             ));
         }
@@ -1251,17 +1926,39 @@ impl IslandEditor {
         if self.models_settled == Some(key) {
             return None;
         }
-        let cfgs = self.item_cfgs();
-        let grown = self
-            .vegetation
-            .as_ref()
+        let mut rails: Vec<String> = self.rail_works().into_iter().map(|(_, c)| c).collect();
+        rails.sort();
+        rails.dedup();
+        // Props' cfgs by their mesh file, objects' borrowed from the asset
+        // registry: a String per item (68k on an 1800 island) held the UI
+        // thread 10-40 ms whenever models landed.
+        let files: Vec<String> = (self.island.doc.meshes.iter())
+            .map(|m| m.replace('\\', "/"))
+            .collect();
+        let props = (self.island.doc.props.iter())
+            .filter_map(|p| Some((files.get(p.source.file as usize)?.as_str(), Some(&p.matrix))));
+        let assets = self.assets.as_deref();
+        let objects: Vec<(std::borrow::Cow<str>, Mat4)> = (self.island.doc.objects.iter())
+            .filter_map(|o| {
+                let cfgs =
+                    (assets.and_then(|a| a.get(o.guid))).map_or(&[][..], |a| a.cfgs.as_slice());
+                let cfg = o.model(cfgs)?;
+                let cfg = match cfg.contains('\\') {
+                    true => std::borrow::Cow::Owned(cfg.replace('\\', "/")),
+                    false => std::borrow::Cow::Borrowed(cfg),
+                };
+                Some((cfg, doc::trs(o.position, o.rotation, o.scale)))
+            })
+            .collect();
+        let grown = (self.vegetation.as_ref())
             .filter(|_| self.layers.vegetation)
-            .map(|p| p.models.keys().map(String::as_str).collect::<Vec<_>>())
-            .unwrap_or_default();
+            .into_iter()
+            .flat_map(|p| p.models.keys().map(|c| (c.as_str(), None)));
         let batch = self.library.batch(
-            (cfgs.iter())
-                .filter_map(|(_, c, m)| Some((c.as_deref()?, Some(m))))
-                .chain(grown.into_iter().map(|c| (c, None))),
+            props
+                .chain(objects.iter().map(|(c, m)| (c.as_ref(), Some(m))))
+                .chain(grown)
+                .chain(rails.iter().map(|c| (c.as_str(), None))),
         );
         if batch.is_empty() {
             self.models_settled = Some(key);
@@ -1314,8 +2011,9 @@ impl IslandEditor {
         let set = self
             .prop_sets
             .as_ref()?
-            .get(&self.doc.session.vegetation_prop_set)?;
+            .get(&self.island.doc.session.vegetation_prop_set)?;
         let statics: Vec<([f32; 2], f32)> = self
+            .island
             .doc
             .props
             .iter()
@@ -1325,8 +2023,8 @@ impl IslandEditor {
             })
             .collect();
         let ground = vegetation::Ground {
-            field: &self.doc.field,
-            materials: self.doc.materials.as_ref()?,
+            field: &self.island.doc.field,
+            materials: self.island.doc.materials.as_ref()?,
             layers: &self.palette.as_ref()?.ground_layers,
             statics: &statics,
         };
@@ -1364,20 +2062,23 @@ impl IslandEditor {
     }
 
     /// Sets the island's vegetation prop set or ambient, as one undo step.
-    pub fn edit_session(&mut self, f: impl FnOnce(&mut anno_formats::session::SessionSettings)) {
-        let mut next = self.doc.session.clone();
+    pub fn edit_session(
+        &mut self,
+        f: impl FnOnce(&mut anno_formats::a7m::session::SessionSettings),
+    ) {
+        let mut next = self.island.doc.session.clone();
         f(&mut next);
-        if next == self.doc.session {
+        if next == self.island.doc.session {
             return;
         }
         self.checkpoint();
-        self.doc.session = next;
+        self.island.doc.session = next;
         self.scene_stale = true;
     }
 
     pub fn triangles(&self) -> usize {
         let tiles: usize = self.tiles.iter().map(|m| m.data().indices.len() / 3).sum();
-        let grid = self.doc.field.grid;
+        let grid = self.island.doc.field.grid;
         // GPU terrain: what full detail would draw.
         let terrain = if self.terrain.is_some() {
             (grid.width - 1) * (grid.depth - 1) * 2
@@ -1391,33 +2092,83 @@ impl IslandEditor {
     /// the texture for cliff tops, map images and non-splat shading, and the
     /// GPU splat when it is missing or stale. Paint strokes keep the splat
     /// current themselves, so after one only the texture is redone.
-    pub fn bake_job(
-        &mut self,
-    ) -> Option<impl FnOnce() -> Result<(Texture, Option<Splat>)> + Send + 'static> {
+    pub fn bake_job(&mut self) -> Option<impl FnOnce() -> Result<Ground> + Send + 'static> {
         self.ground_stale = false;
         let rebuild_splat = self.splat.is_none() || std::mem::take(&mut self.splat_stale);
+        let (wanted, had_splat) = (self.bake_wanted(), self.splat.is_some() && !rebuild_splat);
         let palette = self.palette.clone()?;
-        let m = self.doc.materials.as_ref()?;
-        let (ids, alphas) = (m.ids.grid(), m.alphas.grid());
-        let size = self.doc.field.grid.size()[0];
+        let m = self.island.doc.materials.as_ref()?;
+        // The chunks shared, not copied out: two flat copies of the
+        // continental island's maps held the UI thread 40-90 ms and 190 MB.
+        // Only a7m paint bakes: 2070's draws through its own ground.
+        let a = m.paint.a7m()?;
+        let (ids, alphas) = (a.ids.clone(), a.alphas.clone());
+        let grids = self.island.doc.grids.clone();
+        let field = self.island.doc.field.grid;
+        let size = field.size()[0];
+        let bake = self.a7m_rules()?.ground_bake;
         Some(move || {
             let splat = rebuild_splat
                 .then(|| {
+                    let grit = grids.as_ref().and_then(|g| g.layer(Kind::Grit));
                     palette
-                        .splat(&ids, &alphas)
+                        .splat(bake, &ids, &alphas, grit)
                         .map_err(|e| eprintln!("splat: {e:#}"))
                         .ok()
                 })
                 .flatten();
-            Ok((palette.bake(&ids, &alphas, size)?, splat))
+            // A splat that failed leaves the terrain to the texture.
+            let wanted = wanted || (splat.is_none() && !had_splat);
+            Ok(Ground {
+                texture: wanted
+                    .then(|| palette.bake(&ids, &alphas, size))
+                    .transpose()?,
+                splat,
+                sink: palette.sinking(&ids, &alphas, field).map(Arc::new),
+            })
         })
     }
 
-    pub fn set_ground(&mut self, (texture, splat): (Texture, Option<Splat>)) {
-        self.ground = Some(Arc::new(texture));
+    /// Whether anything draws the baked ground: the shipped cliff tops, or
+    /// the terrain when it has no splat. With the splat drawing and the
+    /// cliff tops hidden (the default) the bake is skipped, 36 MB on the
+    /// continental island and most of each stroke's bake job.
+    fn bake_wanted(&self) -> bool {
+        self.layers.shipped || self.splat.is_none()
+    }
+
+    pub fn set_ground(&mut self, ground: Ground) {
+        let Ground {
+            texture,
+            splat,
+            sink,
+        } = ground;
+        self.ground = texture.map(Arc::new);
+        // Sinking ground (marsh) moves the drawn terrain: its heights go to
+        // the GPU anew.
+        let sink = sink.filter(|s| s.len() == self.island.doc.field.heights.len());
+        if sink.is_some() || self.sink.is_some() {
+            self.sink = sink;
+            self.rebuild_tiles(None);
+        }
         match splat {
-            Some(splat) => {
-                self.splat = Some(Arc::new(splat));
+            Some((mut splat, planes)) => {
+                if let Some(r) = splat.relief.as_mut() {
+                    r.on = self.layers.relief;
+                }
+                // Painted meanwhile, the maps moved on from what it was
+                // built from.
+                if let Some(Materials {
+                    paint: Paint::A7m(a),
+                    ..
+                }) = &self.island.doc.materials
+                {
+                    planes.set(&a.ids, &a.alphas);
+                }
+                let splat = Arc::new(splat);
+                self.splat_ground = anno_render::a7m::ground(&splat);
+                self.splat = Some(splat);
+                self.splat_planes = Some(planes);
                 self.retexture_tiles();
             }
             // Terrain draws with the texture: every tile changes.
@@ -1434,12 +2185,49 @@ impl IslandEditor {
     }
 
     fn extent(&self) -> Extent {
-        let g = &self.doc.field.grid;
+        let g = &self.island.doc.field.grid;
         let [w, d] = g.size();
         Extent {
             center: [g.origin[0] + w / 2., 0., g.origin[1] + d / 2.],
             size: w.max(d),
         }
+    }
+
+    /// What the game's ground says of how this island's paint shows in
+    /// game (2070's magenta stand-ins).
+    fn placeholder_note(&self) -> Option<String> {
+        let paint = &self.island.doc.materials.as_ref()?.paint;
+        self.own_ground.as_ref()?.note(paint)
+    }
+
+    /// Whether paint id `id` draws the developers' stand-in in game.
+    pub(crate) fn placeholder_layer(&self, id: u8) -> bool {
+        (self.own_ground.as_ref()).is_some_and(|g| g.stand_in(id))
+    }
+
+    /// Hands the paint changed within world `area` to what draws it: the
+    /// a7m splat recomputes its control texels there in place, a game's
+    /// own ground uploads its coverage there. False where neither holds
+    /// it, so the splat rebuilds whole.
+    pub(crate) fn show_paint(&self, area: [f32; 4]) -> bool {
+        let Some(m) = &self.island.doc.materials else {
+            return false;
+        };
+        if let Some(g) = &self.own_ground {
+            g.update(&m.paint, area);
+            return true;
+        }
+        let (Some(palette), Some(splat), Some(planes), Some(a)) = (
+            &self.palette,
+            &self.splat,
+            &self.splat_planes,
+            m.paint.a7m(),
+        ) else {
+            return false;
+        };
+        let size = self.island.doc.field.grid.size()[0];
+        palette.update_splat(splat, planes, &a.ids, &a.alphas, size, area);
+        true
     }
 
     pub fn say(&mut self, text: impl Into<String>, error: bool) {
@@ -1455,7 +2243,7 @@ impl IslandEditor {
 
     /// Records the document as it is, before an edit.
     fn checkpoint(&mut self) {
-        self.history.checkpoint(&self.doc);
+        self.history.checkpoint(&self.island.doc);
         self.patch_history();
     }
 
@@ -1465,7 +2253,7 @@ impl IslandEditor {
     /// not yet made: it waits for the next checkpoint.
     fn patch_history(&mut self) {
         self.trim_heap();
-        let live = self.doc.field.clone();
+        let live = self.island.doc.field.clone();
         let mut next = live.clone();
         for (k, snapshot) in self.history.past_mut().enumerate() {
             if snapshot.heights_patch.is_some() {
@@ -1499,65 +2287,157 @@ impl IslandEditor {
         self.end_drags();
         // The step being left keeps land grids that match its heights.
         self.sync_land();
-        let live = self.doc.field.clone();
         let left = self.history.revision();
-        // What tiles are built from, to rebuild only what the step changes.
-        let before = (
-            self.doc.field.grid,
-            self.doc.field.clone(),
-            self.doc.grids.clone(),
-            self.doc.tint.clone(),
-        );
+        // The step left, to update only what the restored one changes. All
+        // copy-on-write: a few thousand reference counts.
+        let before = self.island.doc.clone();
         let done = if redo {
-            self.history.redo(&mut self.doc)
+            self.history.redo(&mut self.island.doc)
         } else {
-            self.history.undo(&mut self.doc)
+            self.history.undo(&mut self.island.doc)
         };
-        if done {
-            self.trim_heap();
-            // The step restored may hold its heights as a patch against the
-            // one left, which now waits on the other stack: store that one
-            // as a patch against the restored heights in turn.
-            self.doc.unpatch_heights(&live);
-            let restored = self.doc.field.clone();
-            let other = if redo {
-                self.history.past_mut().next()
-            } else {
-                self.history.future_mut().next()
-            };
-            if let Some(other) = other {
-                other.patch_heights(&restored);
-            }
-            let doc = &self.doc;
-            self.selection.retain(|&item| doc.matrix(item).is_some());
-            // Materials may have changed back; the ground follows.
-            if self.doc.materials.is_some() {
+        if !done {
+            return false;
+        }
+        self.trim_heap();
+        // The step restored may hold its heights as a patch against the
+        // one left, which now waits on the other stack: store that one as a
+        // patch against the restored heights in turn.
+        self.island.doc.unpatch_heights(&before.field);
+        let restored = self.island.doc.field.clone();
+        let other = if redo {
+            self.history.past_mut().next()
+        } else {
+            self.history.future_mut().next()
+        };
+        if let Some(other) = other {
+            other.patch_heights(&restored);
+        }
+        let doc = &self.island.doc;
+        self.selection.retain(|&item| doc.matrix(item).is_some());
+        // Materials may have changed back. Like a dab, the live splat takes
+        // the changed texels in place, so the GPU re-bakes only the ground
+        // pages over them; a new splat re-baked every page, and the undo
+        // showed only once a whole off-thread rebuild had landed. The
+        // texture bake (cliff tops, sinking) still follows, as after a
+        // stroke.
+        let painted = match (&before.materials, &self.island.doc.materials) {
+            (Some(a), Some(b)) => match a.changed(b) {
+                MaterialChange::Nothing => false,
+                MaterialChange::Area(area) => {
+                    if !self.show_paint(area) {
+                        self.splat_stale = true;
+                    }
+                    self.ground_stale = true;
+                    true
+                }
+                MaterialChange::Whole => {
+                    if let (Some(g), Some(m)) = (&self.own_ground, &self.island.doc.materials) {
+                        let [w, d] = self.island.doc.field.grid.size();
+                        g.update(&m.paint, [0., 0., w, d]);
+                    }
+                    self.ground_stale = true;
+                    self.splat_stale = true;
+                    true
+                }
+            },
+            (None, None) => false,
+            _ => {
                 self.ground_stale = true;
                 self.splat_stale = true;
+                true
             }
-            let (grid, heights, grids, tint) = before;
-            let same_colors = Option::zip(grids.as_ref(), self.doc.grids.as_ref())
-                .map_or(grids.is_none() && self.doc.grids.is_none(), |(a, b)| Arc::ptr_eq(a, b))
-                && Option::zip(tint.as_ref(), self.doc.tint.as_ref())
-                    .map_or(tint.is_none() && self.doc.tint.is_none(), |(a, b)| Arc::ptr_eq(a, b))
-                // Materials shading colors tiles from the material maps.
-                && self.shading != Shading::Materials;
-            if grid != self.doc.field.grid || !same_colors {
-                self.rebuild_tiles(None);
-            } else if let Some(rect) =
-                changed_samples(grid, &heights.heights, &self.doc.field.heights)
-            {
-                // A sculpt step: the tiles under it, as a stroke updates them.
-                if let Some(gpu) = &self.gpu_heights {
-                    gpu.update(rect, &self.doc.field.heights);
-                }
-                self.rebuild_tiles(Some(rect));
+        };
+        fn same<T>(a: &Option<Arc<T>>, b: &Option<Arc<T>>) -> bool {
+            match (a, b) {
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                (a, b) => a.is_none() && b.is_none(),
             }
-            // Props and objects may have moved back.
-            self.scene_stale = true;
-            self.river_written(left, redo);
         }
-        done
+        let same_grids = same(&before.grids, &self.island.doc.grids);
+        let same_tint = same(&before.tint, &self.island.doc.tint);
+        // 2070's path blockers, which the ground shows while they're painted.
+        let paths = match (before.blockers(), self.island.doc.blockers()) {
+            (Some(a), Some(b)) => a.changed(b).0,
+            _ => None,
+        };
+        let grid = before.field.grid;
+        let heights = (grid == self.island.doc.field.grid)
+            .then(|| changed_samples(grid, &before.field.heights, &self.island.doc.field.heights));
+        // Materials shading colors tiles from the material maps.
+        if heights.is_none() || !same_grids || !same_tint || self.shading == Shading::Materials {
+            self.rebuild_tiles(None);
+        } else if let Some(Some(rect)) = heights {
+            // A sculpt step: the tiles under it, as a stroke updates them.
+            if let Some(gpu) = &self.gpu_heights {
+                gpu.update(rect, &self.drawn_field().heights);
+            }
+            self.rebuild_tiles(Some(rect));
+        }
+        if let Some(cells) = paths.filter(|_| self.path_overlay().is_some()) {
+            // Two cells a metre; the samples on both sides of each.
+            let rect = Rect {
+                x0: cells.x0 / 2,
+                z0: cells.z0 / 2,
+                x1: (cells.x1.div_ceil(2) + 1).min(grid.width),
+                z1: (cells.z1.div_ceil(2) + 1).min(grid.depth),
+            };
+            self.rebuild_tiles(Some(rect));
+        }
+        let sculpted = heights != Some(None);
+        // Props and objects may have moved back, and the vegetation grows
+        // from the heights, grids and ground. A paint step changes only the
+        // ground: it rescatters as a stroke's release does when vegetation
+        // shows, and otherwise skips rebuilding every placement row (4-10
+        // ms of refresh_scene on the pirate island).
+        let placed_same = before.props.same(&self.island.doc.props)
+            && Arc::ptr_eq(&before.objects, &self.island.doc.objects)
+            && Arc::ptr_eq(&before.meshes, &self.island.doc.meshes)
+            && before.session == self.island.doc.session;
+        if !(placed_same && !sculpted && same_grids && same_tint)
+            || (painted && self.layers.vegetation)
+        {
+            self.scene_stale = true;
+        }
+        // The selection may have lost items, a river draft may reopen.
+        self.markers_stale = true;
+        // So may the grit map; its mask on the GPU follows now, not at the
+        // next splat rebuild. Only the cells that changed: a write re-bakes
+        // the ground pages under it.
+        if let Some(window) =
+            changed_grit(before.grids.as_deref(), self.island.doc.grids.as_deref())
+        {
+            self.sync_grit(window);
+        }
+        self.river_written(left, redo);
+        true
+    }
+
+    /// Writes the grit map's cells under `window` (island metres x0, z0,
+    /// x1, z1; everything without one) into the live splat's grit mask, so
+    /// a Grid stroke on the detail layer shows on the next frame.
+    fn sync_grit(&mut self, window: Option<[f32; 4]>) {
+        let Some(mask) = (self.splat.as_ref())
+            .and_then(|s| s.grit.as_ref())
+            .map(|g| g.mask.clone())
+        else {
+            return;
+        };
+        let Some(layer) = (self.island.doc.grids.as_ref()).and_then(|g| g.layer(Kind::Grit)) else {
+            return;
+        };
+        let (xs, ys) = layer.cells_within(window);
+        if xs.is_empty() || ys.is_empty() {
+            return;
+        }
+        let texels = terrain::grit_texels(layer, (xs.clone(), ys.clone()));
+        let rect = Rect {
+            x0: xs.start,
+            z0: ys.start,
+            x1: xs.end,
+            z1: ys.end,
+        };
+        mask.write(rect, &texels);
     }
 
     /// Points every tile, and the shipped meshes' tops, at the current
@@ -1575,7 +2455,7 @@ impl IslandEditor {
         } else {
             self.texture()
         };
-        let textured = texture.is_some() || splat.is_some();
+        let textured = texture.is_some();
         if self.terrain.is_some() {
             // GPU terrain takes the material whole (its UVs span the grid);
             // its tiles are empty, so only the shipped tops below remain.
@@ -1588,10 +2468,10 @@ impl IslandEditor {
         {
             return self.rebuild_tiles(None);
         }
-        let material = match &splat {
-            Some(splat) => gpu::Material::Splat(splat.clone()),
-            None => gpu::Material::Lit,
-        };
+        // The splat draws only as the GPU terrain's ground (render's a7m
+        // ground); CPU tiles, kept for heights the GPU can't hold, show
+        // the ground's colours as that terrain does while its ground loads.
+        let material = gpu::Material::Lit;
         let texture = texture.map(gpui_editor_kit::texture::Image::from);
         retexture(&mut self.tiles, |data| {
             Some(MeshData {
@@ -1634,22 +2514,49 @@ impl IslandEditor {
     /// meshes and normal pages, and re-baked tint tiles.
     pub fn stage(&mut self, install: &Install, project: &mut Project) -> Result<()> {
         self.sync_land();
+        let mut warnings = Vec::new();
         if self.is_new
             && let Some(warning) = self.prepare_new_island()
         {
-            self.say(warning, true);
+            warnings.push(warning);
         }
+        // Saving is the only way to keep work, so what would stop the island
+        // leaving the editor only warns here; the listing keeps it for
+        // export, test maps and Test in game, which it blocks.
+        self.listing.broken = self.validate(install, project);
+        if !self.listing.broken.is_empty() {
+            warnings.push(format!(
+                "It can't be installed or tested in game until fixed: {}",
+                said(&self.listing.broken)
+            ));
+        }
+        // Only a warning: the game loads the island and draws them.
+        warnings.extend(self.placeholder_note());
+        if !warnings.is_empty() {
+            self.say(warnings.join(". "), true);
+        }
+        let Some(Native::A7m(loaded)) = &self.island.native else {
+            return self.stage_native(project);
+        };
         // Every stage starts from the same tree. Differential grid/object
         // writers must also be able to restore values after undoing a save.
-        let mut source = self.source.clone();
-        if let Some(store) = &mut self.object_store {
-            store.objects.clone_from(&self.doc.objects);
-            store.write_into(source.gamedata_mut())?;
+        let mut source = loaded.clone();
+        source.unpark()?;
+        if let Some(store) = &mut self.island.object_store {
+            store.objects.clone_from(&self.island.doc.objects);
+            store.write(source.gamedata_mut())?;
         }
         self.derive_water();
-        let levels = self.doc.write_into(&mut source)?;
-        if let Some(grids) = &self.doc.grids {
-            grids.apply(&mut source)?;
+        let levels = self.island.doc.write_into(&mut source, Some(install))?;
+        if let Some(grids) = &self.island.doc.grids {
+            grids.write(&mut source)?;
+        }
+        // An island that names no set keeps naming none while it paints
+        // with the game's default.
+        let set = &self.island.material_set;
+        let a7m = self.a7m_rules().context("a7m material set")?;
+        if a7m.material_set(source.material_set_file_name()) != set {
+            source.set_material_set_file_name(set);
         }
         let base = island_data_dir(&self.path)?;
         let mut current = |rel: &str| {
@@ -1657,10 +2564,7 @@ impl IslandEditor {
             self.terrain_original
                 .entry(path.clone())
                 .or_insert_with(|| {
-                    project
-                        .files
-                        .get(&path)
-                        .cloned()
+                    (project.read_file(&path).map(std::borrow::Cow::into_owned))
                         .or_else(|| install.read(&path).ok())
                 })
                 .clone()
@@ -1671,11 +2575,12 @@ impl IslandEditor {
                 .rebuild_height_pages(&mut current)
                 .context("normal pages")?,
         );
-        let coverage_changed = source.active_map().data != self.source.active_map().data;
-        let tint = match (&self.doc.tint, &self.tint_loaded) {
+        let coverage_changed = (self.island.a7m())
+            .is_none_or(|loaded| source.active_map().data != loaded.active_map().data);
+        let tint = match (&self.island.doc.tint, &self.tint_loaded) {
             (Some(now), Some(loaded)) if Arc::ptr_eq(now, loaded) && !coverage_changed => None,
-            (Some(now), _) => Some(anno_formats::tint::bake(
-                self.game,
+            (Some(now), _) => Some(anno_formats::a7m::tint::bake(
+                self.a7m_rules().context("a7m tint")?.tint_base_level,
                 now,
                 source.active_map(),
                 source.world_size(),
@@ -1686,26 +2591,34 @@ impl IslandEditor {
             let ground = self
                 .palette
                 .as_ref()
-                .zip(self.doc.materials.as_ref())
-                .map(|(p, m)| p.bake(&m.ids.grid(), &m.alphas.grid(), self.world()[0] as f32))
+                .zip(self.island.doc.materials.as_ref())
+                // A 2070 island has no palette, and ships no map images.
+                .and_then(|(p, m)| Some((p, m.paint.a7m()?)))
+                .map(|(p, a)| p.bake(&a.ids, &a.alphas, self.world()[0] as f32))
                 .transpose()?;
-            new::map_images(ground.as_ref().or(self.ground.as_deref()), &self.doc.field)
+            new::map_images(
+                ground.as_ref().or(self.ground.as_deref()),
+                &self.island.doc.field,
+            )
         } else {
             Vec::new()
         };
-        let (gamedata, mut rd3d) = source.to_members()?;
+        let (gamedata, mut rd3d) = source.encode()?;
         let grids_in_rd3d = self
+            .island
             .doc
             .grids
             .as_ref()
             .is_some_and(|g| g.layers.iter().any(|l| l.is_edited() && l.in_rd3d()));
+        // TODO: the island already decoded rd3d when it loaded; this second
+        // decode and encode goes once `Island` hands out its rd3d tree to edit.
         if grids_in_rd3d || tint.is_some() {
-            let mut tree = anno_formats::adf::Adf::decode(&rd3d)?;
-            if let Some(grids) = &self.doc.grids {
+            let mut tree = anno_formats::adf::Adf::parse(&rd3d)?;
+            if let Some(grids) = &self.island.doc.grids {
                 grids.write_rd3d(&mut tree)?;
             }
             if let Some(tint) = &tint {
-                anno_formats::tint::write_rd3d(&mut tree, &tint.rd3d)?;
+                tint.rd3d.write(&mut tree)?;
             }
             rd3d = tree.encode();
         }
@@ -1714,10 +2627,7 @@ impl IslandEditor {
             self.terrain_original
                 .entry(path.clone())
                 .or_insert_with(|| {
-                    project
-                        .files
-                        .get(&path)
-                        .cloned()
+                    (project.read_file(&path).map(std::borrow::Cow::into_owned))
                         .or_else(|| install.read(&path).ok())
                 });
         }
@@ -1726,10 +2636,7 @@ impl IslandEditor {
             self.terrain_original
                 .entry(path.clone())
                 .or_insert_with(|| {
-                    project
-                        .files
-                        .get(&path)
-                        .cloned()
+                    (project.read_file(&path).map(std::borrow::Cow::into_owned))
                         .or_else(|| install.read(&path).ok())
                 });
         }
@@ -1739,7 +2646,7 @@ impl IslandEditor {
             match bytes {
                 Some(bytes) => project.stage(path, bytes.clone()),
                 None => {
-                    project.files.remove(path);
+                    project.remove_file(path);
                 }
             }
         }
@@ -1758,10 +2665,10 @@ impl IslandEditor {
         }
         // Presence flags suppress unused shipped tiles. Drop obsolete loose
         // copies too, so repeated expansion/shrinking does not grow the mod.
-        let tree = anno_formats::adf::Adf::decode(&rd3d)?;
-        let flags = anno_formats::tint::read_rd3d(&tree)?.flags;
+        let tree = anno_formats::adf::Adf::parse(&rd3d)?;
+        let flags = anno_formats::a7m::tint::Rd3dTint::read(&tree)?.flags;
         let prefix = format!("{base}/tintmaps/");
-        project.files.retain(|path, _| {
+        project.retain_files(|path| {
             let Some(tile) = path.strip_prefix(&prefix) else {
                 return true;
             };
@@ -1782,16 +2689,41 @@ impl IslandEditor {
                 .get(level)
                 .is_some_and(|f| x < f.width && y < f.height && f.get(x, y) != 0)
         });
-        if self.is_new || self.game.profile().info_from_island {
+        if self.is_new || self.a7m_rules().is_some_and(|a| a.info_from_island) {
             self.stage_island_side_files(install, project, &source)?;
         }
         // Shipped islands store each member as its own zlib block.
         let mut packer = rda::Packer::new(rda::PackOptions::island());
         packer.add("gamedata.data", &gamedata)?;
         packer.add("rd3d.data", &rd3d)?;
-        project.stage(&self.path, packer.to_vec()?);
+        project.stage(&self.path, packer.encode()?);
+        if let Some(xml) = &self.island.own_set {
+            project.stage(&self.island.material_set, xml.clone().into_bytes());
+        }
         self.history.mark_saved();
         self.listing_dirty = false;
+        Ok(())
+    }
+
+    /// Saves an island its game's codec writes (2070): the file as loaded
+    /// with the document's edits, staged at its path. Nothing else is
+    /// derived from it, so nothing else is staged.
+    fn stage_native(&mut self, project: &mut Project) -> Result<()> {
+        let islands = (self.module.islands()).context("this game has no islands to save")?;
+        let codec = (islands.codec().own()).context("an a7m island saves through `stage`")?;
+        let bytes = codec.write(&self.island, &self.path, self.assets.as_deref())?;
+        project.stage(&self.path, bytes);
+        self.history.mark_saved();
+        self.listing_dirty = false;
+        if self.is_new {
+            project.register_island(crate::project::IslandEntry {
+                path: self.path.clone(),
+                guid: project.island_guid(&self.path),
+                region: self.region(),
+                size: self.land_class().to_owned(),
+                listing: self.listing.clone(),
+            });
+        }
         Ok(())
     }
 
@@ -1801,19 +2733,29 @@ impl IslandEditor {
     /// rewritten, so shipped bytes survive where the terrain did not move.
     /// New islands rebuild everything, their bytes came from the template.
     fn derive_water(&mut self) {
-        let Some(g) = &mut self.doc.grids else { return };
-        let saved = self.source.heights();
-        let was = (!self.is_new && saved.data.len() == self.doc.field.heights.len()).then(|| {
-            anno_formats::water::Heights {
-                data: &saved.data,
-                width: saved.width,
-                spacing: self.doc.field.grid.spacing,
-            }
-        });
-        if was.is_some_and(|w| w.data == self.doc.field.heights.as_slice()) {
+        let (Some(g), Some(Native::A7m(source))) =
+            (&mut self.island.doc.grids, &self.island.native)
+        else {
+            return;
+        };
+        let saved = source.heights();
+        let was =
+            (!self.is_new && saved.data.len() == self.island.doc.field.heights.len()).then(|| {
+                anno_formats::a7m::water::Heights {
+                    data: &saved.data,
+                    width: saved.width,
+                    spacing: self.island.doc.field.grid.spacing,
+                }
+            });
+        if was.is_some_and(|w| w.data == self.island.doc.field.heights.as_slice()) {
             return;
         }
-        anno_formats::water::derive(Arc::make_mut(g), new::heights(&self.doc.field), was, None);
+        anno_formats::a7m::water::derive(
+            Arc::make_mut(g),
+            new::heights(&self.island.doc.field),
+            was,
+            None,
+        );
     }
 
     /// Side of the land's bounding square in metres: the active area's larger
@@ -1825,6 +2767,7 @@ impl IslandEditor {
             hi = [hi[0].max(x + 1), hi[1].max(y + 1)];
         };
         let cell = if let Some(active) = self
+            .island
             .doc
             .grids
             .as_ref()
@@ -1838,24 +2781,89 @@ impl IslandEditor {
                 }
             }
             active.cell_metres
-        } else {
-            let active = self.source.active_map();
+        } else if let Some(source) = self.island.a7m() {
+            let active = source.active_map();
             for (i, _) in active.data.iter().enumerate().filter(|(_, a)| **a) {
                 include(i % active.width, i / active.width);
             }
             self.world()[0] as f32 / active.width.max(1) as f32
+        } else {
+            // No active map (a game with its own codec): the land is the
+            // ground above the sea.
+            let field = &self.island.doc.field;
+            for z in 0..field.grid.depth {
+                for x in 0..field.grid.width {
+                    if field.at(x, z) > 0. {
+                        include(x, z);
+                    }
+                }
+            }
+            field.grid.spacing
         };
         (hi[0].saturating_sub(lo[0]).max(hi[1].saturating_sub(lo[1])) as f32 * cell) as u32
     }
 
     /// `IslandPlaceholderSize` the land gives: `Small` … `XL`.
     pub fn land_class(&self) -> &'static str {
-        self.game.profile().size_class(self.land_extent())
+        self.rules().size_class(self.land_extent())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn renderer(&self) -> &Arc<Renderer> {
+        &self.renderer
+    }
+
+    /// View `view`'s per-frame UI-thread times and camera moves since the
+    /// last take (`ANNO_EDITOR_BENCH`).
+    pub fn take_timing(&self, view: usize) -> gpui_editor_kit::gpu::PaneTiming {
+        self.views[view].viewport.take_timing()
+    }
+
+    /// How long the UI waited for the renderer while a view's thread
+    /// recorded, since the last take (`ANNO_EDITOR_BENCH`).
+    pub fn take_blocked(&self) -> std::time::Duration {
+        self.renderer.take_blocked()
     }
 
     /// The renderer's smoothed frame times, for the viewport readout.
     pub fn frame_stats(&self) -> gpui_editor_kit::gpu::Stats {
         self.renderer.stats()
+    }
+
+    /// Waves or uploads still want a present. The readout can follow them
+    /// without rebuilding the window.
+    pub fn wants_frames(&self) -> bool {
+        self.renderer.wants_frames()
+    }
+
+    /// Draws with `graphics` from the next refresh on.
+    pub fn set_graphics(&mut self, graphics: crate::graphics::Graphics) {
+        // Poses ride the renderer's pieces: turning animation on or off
+        // hands them over again, as a batch of models landing does.
+        if graphics.animation != self.graphics.animation {
+            self.pieces_stale = true;
+        }
+        self.graphics = graphics;
+        self.scene_stale = true;
+    }
+
+    /// The game this island belongs to.
+    pub fn module(&self) -> &'static dyn Module {
+        self.module
+    }
+
+    /// How this island's game lays out, names and generates islands. Every
+    /// island editor's game has islands: loading asks for them.
+    pub fn rules(&self) -> &'static anno_core::game::IslandRules {
+        (self.module.islands())
+            .expect("an island's game has islands")
+            .rules()
+    }
+
+    /// The a7m pipeline's rules, for an island read through it; `None`
+    /// for a game with its own codec.
+    pub fn a7m_rules(&self) -> Option<&'static anno_core::game::A7mRules> {
+        self.module.islands()?.codec().a7m()
     }
 
     /// Turns view `view`'s camera about its pivot by `radians`.
@@ -1889,15 +2897,62 @@ impl IslandEditor {
     /// The hierarchy group an item is listed under.
     pub(crate) fn item_group(&self, item: Item) -> Option<Group> {
         match item {
-            Item::Prop(id) => self.doc.prop(id).map(|p| Group::Prop(p.source.file)),
-            Item::Object(id) => (self.doc.objects.iter())
+            Item::Prop(id) => self.island.doc.prop(id).map(|p| Group::Prop(p.source.file)),
+            Item::Object(id) => (self.island.doc.objects.iter())
                 .find(|o| o.id == id)
                 .map(|o| Group::Object(o.guid)),
         }
     }
 
     pub fn region(&self) -> String {
-        self.game.island_region(&self.path).to_owned()
+        self.rules().island_region(&self.path).to_owned()
+    }
+
+    /// The region as the assets name it (AssociatedRegions, fertility sets).
+    pub fn asset_region(&self) -> String {
+        let rules = self.rules();
+        rules
+            .asset_region(rules.island_region(&self.path))
+            .to_owned()
+    }
+
+    /// What stops the island leaving the editor (level 5), its references
+    /// resolved against `install` and the files `project` holds. A project
+    /// island is used as its listing offers it; a shipped one as its kind
+    /// says, never as a start (its role isn't the editor's to know).
+    pub fn validate(&self, install: &Install, project: &Project) -> Vec<Problem> {
+        let Some(islands) = self.module.islands() else {
+            return Vec::new();
+        };
+        let rules = islands.rules();
+        let region = self.region();
+        let use_ = if self.is_new {
+            let start = self.listing.is_start(rules);
+            Use {
+                region: &region,
+                start,
+                playable: start || self.listing.is_regular(rules),
+            }
+        } else {
+            let asset_kind = (self.assets.as_deref())
+                .and_then(|a| {
+                    a.iter()
+                        .find_map(|a| a.island.as_ref().filter(|i| i.path == self.path))
+                })
+                .map(|i| i.kind.as_str());
+            Use {
+                region: &region,
+                start: false,
+                playable: islands.kind_of(&self.path, asset_kind) == IslandKind::Playable,
+            }
+        };
+        let has = |path: &str| project.has_file(path);
+        let refs = Refs {
+            install,
+            project: &has,
+            assets: self.assets.as_deref(),
+        };
+        islands.validate(&self.island, &refs, use_)
     }
 
     /// Whether the island is one the game does not ship (made in the editor).
@@ -1910,7 +2965,7 @@ impl IslandEditor {
     pub fn adopt(&mut self, entry: &crate::project::IslandEntry) {
         self.listing = entry.listing.clone();
         // Saved positions survive the f32 round trip to well under 1 cm.
-        for p in Arc::make_mut(&mut self.doc.props).iter_mut() {
+        for p in self.island.doc.props.iter_mut() {
             let t = math::translation(&p.matrix);
             p.auto_cliff = entry
                 .listing
@@ -1919,7 +2974,9 @@ impl IslandEditor {
                 .any(|a| (0..3).all(|i| (a[i] - t[i]).abs() < 0.01));
         }
         self.is_new = true;
-        self.source.mark_unshipped();
+        if let Some(source) = self.island.a7m_mut() {
+            source.mark_unshipped();
+        }
     }
 
     /// Changes a setting as an unsaved edit, so Save writes the project entry.
@@ -1935,14 +2992,14 @@ impl IslandEditor {
         project: &mut Project,
         source: &Island,
     ) -> Result<()> {
-        use anno_formats::a7minfo::{
+        use anno_formats::a7m::a7minfo::{
             A7mInfo, A7me, RandomSlotObject, Slots, TypedSlotGroup, TypedSlotObject,
         };
         let world = self.world();
         let stem = self.path.trim_end_matches(".a7m");
         let a7me = format!("{stem}.a7me");
         let active = source.active_map();
-        let mut info = if self.game.profile().info_from_island {
+        let mut info = if self.a7m_rules().is_some_and(|a| a.info_from_island) {
             A7mInfo::parse(
                 &source
                     .info()
@@ -1961,11 +3018,13 @@ impl IslandEditor {
         // The map generator only activates slots listed here (shipped Celtic
         // islands list their marsh slots too). The harbour records name
         // them; assets.xml covers slots of other kinds.
-        let lib = self.harbour.clone();
+        let lib = self.island.harbour.clone();
         let assets = self.assets.clone();
         info.slots = match &info.slots {
             Slots::Random(_) => {
-                Slots::Random(harbour::slot_groups(&self.doc.objects, |g| self.is_slot(g)))
+                Slots::Random(harbour::slot_groups(&self.island.doc.objects, |g| {
+                    self.is_slot(g)
+                }))
             }
             Slots::Typed(old) => {
                 let mut known: std::collections::BTreeMap<_, _> = old
@@ -1973,13 +3032,14 @@ impl IslandEditor {
                     .flat_map(|g| g.objects.iter().map(|o| (o.guid, g.kind)))
                     .collect();
                 if let Some(lib) = &lib {
-                    for group in lib.typed_slots(&self.doc.objects) {
+                    for group in lib.typed_slots(&self.island.doc.objects) {
                         known.extend(group.objects.iter().map(|o| (o.guid, group.kind)));
                     }
                 }
                 // Imported slot records may come from another island. Read
                 // its small placement header for the engine's slot-kind ID.
                 let mut missing: std::collections::BTreeSet<_> = self
+                    .island
                     .doc
                     .objects
                     .iter()
@@ -2015,7 +3075,7 @@ impl IslandEditor {
                     );
                 }
                 let mut groups = std::collections::BTreeMap::<u16, Vec<TypedSlotObject>>::new();
-                for o in self.doc.objects.iter() {
+                for o in self.island.doc.objects.iter() {
                     if let Some(&kind) = known.get(&o.guid) {
                         groups.entry(kind).or_default().push(TypedSlotObject {
                             guid: o.guid,
@@ -2034,16 +3094,9 @@ impl IslandEditor {
                 )
             }
         };
-        let start_guid = lib
-            .as_ref()
-            .and_then(|l| l.guid(harbour::Piece::StartCoast));
-        let start = self.doc.objects.iter().find(|o| {
-            Some(o.guid) == start_guid
-                || assets
-                    .as_ref()
-                    .and_then(|a| a.get(o.guid))
-                    .is_some_and(|a| a.template == "Coastline" && a.name.contains("StartCoast"))
-        });
+        let start_guid = lib.as_ref().and_then(|l| l.guid(Piece::StartCoast));
+        let start = (self.island.doc.objects.iter())
+            .find(|o| Some(o.guid) == start_guid || self.piece(o.guid) == Some(Piece::StartCoast));
         if let Some(curve) = start.and_then(|o| o.path.as_deref()) {
             let [x0, z0, x1, z1] = info.active_rect.map(|v| v as f32);
             info.start_coast_direction = Some(harbour::start_coast_direction(
@@ -2060,8 +3113,9 @@ impl IslandEditor {
         let mut listing = self.listing.clone();
         listing
             .slot_resources
-            .retain(|id, _| self.doc.objects.iter().any(|o| o.id == *id));
+            .retain(|id, _| self.island.doc.objects.iter().any(|o| o.id == *id));
         listing.auto_cliffs = self
+            .island
             .doc
             .props
             .iter()
@@ -2080,15 +3134,16 @@ impl IslandEditor {
 
     /// Replaces the heights through `f` as one undo step and redraws.
     pub fn replace_heights(&mut self, f: impl FnOnce(&mut Heightfield) -> Result<String>) {
-        let before = self.doc.clone();
-        match f(Arc::make_mut(&mut self.doc.field)) {
+        let before = self.island.doc.clone();
+        match f(Arc::make_mut(&mut self.island.doc.field)) {
             Ok(mut done) => {
+                self.block_lifted_from(&before.field);
                 // An island made here has nothing hand-made in its land
                 // grids yet: land, active area and buildable areas follow
                 // the new terrain in the same undo step.
-                if self.is_new && self.doc.grids.is_some() {
+                if self.is_new && self.island.doc.grids.is_some() {
                     let environment = self.land_environment();
-                    new::derive_land(&mut self.doc, environment);
+                    new::derive_land(&mut self.island.doc, environment);
                     self.derive_areas_from_slope();
                     done += "; land and buildable areas follow it";
                 }
@@ -2098,7 +3153,7 @@ impl IslandEditor {
                 self.say(done, false);
             }
             Err(e) => {
-                self.doc = before;
+                self.island.doc = before;
                 self.say(format!("Import failed: {e:#}"), true);
             }
         }
@@ -2106,7 +3161,13 @@ impl IslandEditor {
 
     /// Island size in metres, as the tint and grid formats take it.
     pub fn world(&self) -> [u32; 2] {
-        self.source.world_size()
+        match self.island.a7m() {
+            Some(source) => source.world_size(),
+            None => {
+                let g = self.island.doc.field.grid;
+                g.size().map(|s| s.round() as u32)
+            }
+        }
     }
 
     /// Replaces the tint as one undo step and redraws.
@@ -2114,7 +3175,7 @@ impl IslandEditor {
         match tint {
             Ok(map) => {
                 self.checkpoint();
-                self.doc.tint = Some(Arc::new(map));
+                self.island.doc.tint = Some(Arc::new(map));
                 self.layers.tint = true;
                 self.rebuild_tiles(None);
                 self.say(done, false);
@@ -2124,7 +3185,7 @@ impl IslandEditor {
     }
 
     pub fn export_heightmap(&mut self, path: &std::path::Path) {
-        let mut field = (*self.doc.field).clone();
+        let mut field = (*self.island.doc.field).clone();
         flip_north(&mut field);
         match files::export_heightmap(&field, path, HEIGHT_UNITS) {
             Ok(()) => self.say(format!("Heightmap written to {}", path.display()), false),
@@ -2184,16 +3245,16 @@ impl IslandEditor {
             // Whole-terrain rebuilds follow undo, imports and new islands:
             // start the GPU copy afresh rather than diffing.
             self.stale_colors = Rect::default();
-            self.gpu_heights = gpu::HeightMap::new(&self.doc.field)
+            self.gpu_heights = gpu::HeightMap::new(&self.drawn_field())
                 .map_err(|e| eprintln!("GPU heights unavailable, meshing on the CPU: {e:#}"))
                 .ok()
                 .map(Arc::new);
         }
-        self.drawn_look = Some((self.overlay(), self.layers.tint));
+        self.drawn_look = Some(self.look());
         if self.gpu_heights.is_some() {
             return self.recolor_terrain(rect);
         }
-        let grid = self.doc.field.grid;
+        let grid = self.island.doc.field.grid;
         let [tw, td] = grid.tile_count();
         let tiles: Vec<(usize, usize)> = match rect {
             Some(rect) => grid.tiles(rect),
@@ -2242,7 +3303,7 @@ impl IslandEditor {
     /// with a new color map and terrain. Writing texels is all a brush
     /// stroke or tint dab costs; the renderer meshes nothing.
     fn recolor_terrain(&mut self, rect: Option<Rect>) {
-        let grid = self.doc.field.grid;
+        let grid = self.island.doc.field.grid;
         let whole = Rect {
             x0: 0,
             z0: 0,
@@ -2276,6 +3337,22 @@ impl IslandEditor {
     }
 
     /// The terrain for the current heights, colors and ground material.
+    /// The heights as the terrain is drawn: the document's, with sinking
+    /// ground lowered as the game's displacement lowers it.
+    fn drawn_field(&self) -> std::borrow::Cow<'_, Heightfield> {
+        use std::borrow::Cow;
+        match &self.sink {
+            Some(sink) if sink.len() == self.island.doc.field.heights.len() => {
+                let heights = (self.island.doc.field.heights.iter())
+                    .zip(sink.iter())
+                    .map(|(h, s)| h + s)
+                    .collect();
+                Cow::Owned(Heightfield::new(self.island.doc.field.grid, heights))
+            }
+            _ => Cow::Borrowed(&*self.island.doc.field),
+        }
+    }
+
     fn make_terrain(&self) -> Option<Arc<gpu::Terrain>> {
         let inputs = self.tile_inputs();
         Some(Arc::new(gpu::Terrain {
@@ -2284,11 +3361,12 @@ impl IslandEditor {
             color_gain: inputs.gain,
             // Overlays and other shadings recolor the ground; models keep
             // their own color then.
-            tints: inputs.shading == Shading::Ground && inputs.overlay.is_none(),
-            material: match &inputs.splat {
-                Some(splat) => gpu::Material::Splat(splat.clone()),
-                None => gpu::Material::Lit,
-            },
+            tints: inputs.shading == Shading::Ground
+                && inputs.overlay.is_none()
+                && inputs.paths.is_none(),
+            // Under the splat's ground (`splat_ground`) this only shows,
+            // in vertex colours, while the ground uploads.
+            material: gpu::Material::Lit,
             texture: inputs.texture.clone().map(Into::into),
         }))
     }
@@ -2296,29 +3374,110 @@ impl IslandEditor {
     /// What terrain tiles are built from, borrowed so that tiles can be
     /// built on several threads (the editor itself is not `Sync`).
     fn tile_inputs(&self) -> TileInputs<'_> {
-        let splat = self
-            .splat
-            .clone()
-            .filter(|_| self.shading == Shading::Ground);
+        // Under a splat the ground draws its own paint, with no texture.
+        let splat = self.splat.is_some() && self.shading == Shading::Ground;
         TileInputs {
-            field: &self.doc.field,
+            field: &self.island.doc.field,
             overlay: self
                 .overlay()
-                .and_then(|kind| self.doc.grids.as_ref()?.layer(kind)),
-            tint: self.doc.tint.as_deref().filter(|_| self.layers.tint),
-            materials: self.doc.materials.as_ref(),
+                .and_then(|kind| self.island.doc.grids.as_ref()?.layer(kind)),
+            paths: (self.path_overlay()).and_then(|l| Some((self.island.doc.blockers()?, l))),
+            // Splat ground takes the tint per pixel instead (`ground_tint`).
+            tint: (self.island.doc.tint.as_deref())
+                .filter(|_| self.layers.tint && !self.tint_on_gpu()),
+            materials: self.island.doc.materials.as_ref(),
             palette: self.palette.as_deref(),
             shading: self.shading,
-            game: self.game,
+            rules: self.rules(),
             gain: self.color_gain(),
-            texture: if splat.is_some() {
-                None
-            } else {
-                self.texture()
-            },
-            splat,
+            texture: if splat { None } else { self.texture() },
             heights: self.gpu_heights.clone(),
         }
+    }
+
+    /// Whether the GPU tints the ground per pixel from the tint map, as the
+    /// game does, instead of the colors carrying it per height sample:
+    /// splat ground with the Tint layer on, and a map a control map holds.
+    fn tint_on_gpu(&self) -> bool {
+        self.layers.tint
+            && self.shading == Shading::Ground
+            && self.splat.is_some()
+            && (self.island.doc.tint.as_ref()).is_some_and(|m| m.width <= 4096 && m.height <= 4096)
+    }
+
+    /// The preset's water when the sea is drawn as 117's ocean: the Water
+    /// layer is on and the island's preset has one.
+    fn sea_water(&self) -> Option<Arc<dyn ambient::Sea>> {
+        self.layers.water.then(|| self.preset_water()).flatten()
+    }
+
+    fn preset_water(&self) -> Option<Arc<dyn ambient::Sea>> {
+        (self.ambient_lights.iter())
+            .find(|(name, _)| *name == self.island.doc.session.global_ambient)
+            .and_then(|(_, a)| a.sea.clone())
+    }
+
+    /// Whether the island's sea is 117's animated ocean.
+    pub fn has_ocean(&self) -> bool {
+        self.preset_water().is_some()
+    }
+
+    /// The tint for the scene: the working map, copied once into a control
+    /// map and kept by painting (`sync_tint`).
+    fn ground_tint(&mut self) -> Option<gpu::GroundTint> {
+        // Kept while not drawn: the ground's splat bakes after the first
+        // scene, and dropping the copy made then would make it again on the
+        // UI thread.
+        if !self.tint_on_gpu() {
+            return None;
+        }
+        let map = self.island.doc.tint.clone()?;
+        let key = Arc::as_ptr(&map) as usize;
+        // Made while the island loads (`tint_control`); again here only
+        // after a new map replaced it (an undo).
+        if self.tint_gpu.as_ref().is_none_or(|(k, ..)| *k != key) {
+            self.tint_gpu = tint_control(&map);
+        }
+        Some(gpu::GroundTint {
+            map: self.tint_gpu.as_ref()?.1.clone(),
+            // Tint texels lie on island metres from 0, as tint::sample reads them.
+            origin: [0., 0.],
+            size: [
+                map.width as f32 / map.per_metre,
+                map.height as f32 / map.per_metre,
+            ],
+        })
+    }
+
+    /// Marks the working tint under `window` (island metres x0, z0, x1, z1)
+    /// changed after a Tint dab: the GPU's copy draws it again. When painting
+    /// made a new map (the first dab after an undo step shares it), the copy
+    /// is made again with the scene instead.
+    fn sync_tint(&mut self, window: [f32; 4]) {
+        let (Some(map), Some((key, control, _))) = (&self.island.doc.tint, &self.tint_gpu) else {
+            return;
+        };
+        if Arc::as_ptr(map) as usize != *key {
+            self.scene_stale = true;
+            return;
+        }
+        let pm = map.per_metre;
+        let span = |lo: f32, hi: f32, n: usize| {
+            ((lo * pm).floor().max(0.) as usize).min(n)..((hi * pm).ceil().max(0.) as usize).min(n)
+        };
+        let (xs, ys) = (
+            span(window[0], window[2], map.width),
+            span(window[1], window[3], map.height),
+        );
+        if xs.is_empty() || ys.is_empty() {
+            return;
+        }
+        control.touch(Rect {
+            x0: xs.start,
+            z0: ys.start,
+            x1: xs.end,
+            z1: ys.end,
+        });
     }
 
     fn texture(&self) -> Option<Arc<Texture>> {
@@ -2326,6 +3485,24 @@ impl IslandEditor {
             Shading::Ground => self.ground.clone(),
             Shading::Map => self.map.clone(),
             Shading::Height | Shading::Materials => None,
+        }
+    }
+
+    /// What the terrain tiles' colors follow; see `drawn_look`.
+    fn look(&self) -> (Option<Kind>, bool, Option<anno_core::island::PathLayer>) {
+        (self.overlay(), self.layers.tint, self.path_overlay())
+    }
+
+    /// The path-blocker layer the ground shows: the one the Grid tool
+    /// paints on a 2070 island.
+    fn path_overlay(&self) -> Option<anno_core::island::PathLayer> {
+        match self.blocker {
+            grids::BlockerEdit::Paths(layer)
+                if self.tool == Tool::Grid && self.edits_blockers() =>
+            {
+                Some(layer)
+            }
+            _ => None,
         }
     }
 
@@ -2344,7 +3521,7 @@ impl IslandEditor {
     /// Vertex colors are divided by this and the renderer multiplies it
     /// back: Ground carries tint multipliers above 1.
     fn color_gain(&self) -> f32 {
-        if self.shading == Shading::Ground && self.layers.tint && self.doc.tint.is_some() {
+        if self.shading == Shading::Ground && self.layers.tint && self.island.doc.tint.is_some() {
             tint::GAIN
         } else {
             1.
@@ -2405,13 +3582,229 @@ impl IslandEditor {
         true
     }
 
+    /// Whether the ground's materials ship heights the Relief setting can
+    /// draw.
+    pub(crate) fn has_relief(&self) -> bool {
+        self.splat.as_ref().is_some_and(|s| s.relief.is_some())
+    }
+
+    /// The preset the island is lit by: its session's, else the default.
+    fn ambient(&self) -> Ambient {
+        (self.ambient_lights.iter())
+            .find(|(name, _)| *name == self.island.doc.session.global_ambient)
+            .map_or_else(Ambient::default, |(_, a)| a.clone())
+    }
+
+    /// The sky bake the scene lacks, to run off the UI thread: the sky at
+    /// the current time. A bake takes ~9 ms on 117. `None` while one runs
+    /// or when the scene has what it needs.
+    pub(crate) fn sky_job(&mut self) -> Option<impl FnOnce() -> SkyBaked + Send + use<>> {
+        if self.sky_baking.is_some() {
+            return None;
+        }
+        let ambient = self.ambient();
+        let sky = ambient.sky.clone()?;
+        let time = self.time_of_day;
+        let clock = gpu::clock();
+        let current = !sky.drifts() || clock - self.sky_clock < SKY_DRIFT_STEP;
+        let have = (self.sky.as_ref()).is_some_and(|(a, t, _)| *a == ambient && *t == time);
+        if have && current {
+            return None;
+        }
+        self.sky_baking = Some((ambient.clone(), time));
+        Some(move || SkyBaked {
+            ambient,
+            time,
+            clock,
+            baked: sky.bake(time),
+        })
+    }
+
+    /// How long until the sky is due to be baked again as its clouds
+    /// drift; `None` for a sky that holds still or a bake that runs.
+    pub(crate) fn sky_due_in(&self) -> Option<std::time::Duration> {
+        let drifts = self.ambient().sky.is_some_and(|s| s.drifts());
+        if !drifts || self.sky_baking.is_some() {
+            return None;
+        }
+        let left = SKY_DRIFT_STEP - (gpu::clock() - self.sky_clock);
+        Some(std::time::Duration::from_secs_f32(
+            left.clamp(0., SKY_DRIFT_STEP),
+        ))
+    }
+
+    /// Whether the game's sea shades rivers and lakes itself (117), else
+    /// they get the translucent stand-in.
+    fn shades_inland(&self) -> bool {
+        self.sea_water().is_some() && self.water_pass.as_ref().is_some_and(|p| p.shades_inland())
+    }
+
+    /// The rivers and lakes' surface, built off the UI thread, when the
+    /// scene asked for one and none is running: the curves are copied,
+    /// so edits meanwhile ask for the next.
+    pub(crate) fn inland_job(&mut self) -> Option<impl FnOnce() -> InlandBuilt + Send + use<>> {
+        if !self.inland_wanted || self.inland_building {
+            return None;
+        }
+        self.inland_wanted = false;
+        self.inland_building = true;
+        let shaded = self.shades_inland();
+        let strips = self.water_pass.as_ref().is_some_and(|p| p.river_strips());
+        // The shaded surface needs each curve's record, as stored: each game
+        // reads it with its own defaults.
+        type Curve = (
+            Vec<anno_core::island::objects::PathPoint>,
+            anno_core::water::Look,
+            bool,
+            u64,
+        );
+        let curves: Vec<Curve> = (self.island.doc.objects.iter())
+            .filter_map(|o| {
+                let path = o.path.as_deref()?;
+                let lake = self.water_kind(o.guid)?;
+                let fields = (self.island.object_store.as_ref())
+                    .filter(|_| shaded)
+                    .map(|s| s.component_floats(o, if lake { "Lake" } else { "River" }))
+                    .unwrap_or_default();
+                Some((
+                    path.to_vec(),
+                    anno_core::water::Look { lake, fields },
+                    lake,
+                    o.id,
+                ))
+            })
+            .collect();
+        // The shaded surface's flow map measures the water over the ground,
+        // so a new ground asks for a new surface (`refresh_scene`).
+        let ground = self.island.doc.field.clone();
+        self.inland_ground = Arc::downgrade(&ground);
+        Some(move || {
+            let surface = if shaded {
+                let curves: Vec<_> = (curves.iter())
+                    .map(|(path, look, ..)| (path.as_slice(), look.clone()))
+                    .collect();
+                river::inland(&curves, Some(&ground), strips).map(Inland::Shaded)
+            } else {
+                let curves: Vec<_> = (curves.iter())
+                    .map(|(path, _, lake, _)| (path.as_slice(), *lake))
+                    .collect();
+                river::water_mesh(&curves).map(Inland::Mesh)
+            };
+            let courses = river::courses(
+                curves
+                    .iter()
+                    .map(|(path, _, lake, id)| (*id, path.as_slice(), *lake)),
+            );
+            InlandBuilt { surface, courses }
+        })
+    }
+
+    /// The planned placement rows, built off the UI thread; one build at a
+    /// time, the newest plan next.
+    pub(crate) fn placement_job(
+        &mut self,
+    ) -> Option<impl FnOnce() -> placements::Built + Send + use<>> {
+        if self.placement_building {
+            return None;
+        }
+        let plan = self.placement_plan.take()?;
+        self.placement_building = true;
+        Some(move || plan.build())
+    }
+
+    /// A finished `placement_job`: its rows replace the drawn ones, unless
+    /// a newer plan waits (it lands next) or the rows changed meanwhile (a
+    /// drag or stroke: the scene plans again).
+    pub(crate) fn placement_built(&mut self, built: placements::Built) {
+        self.placement_building = false;
+        if self.placement_plan.is_some() {
+            return;
+        }
+        if self.placements.apply(built, &self.renderer) {
+            self.send_owner_words();
+            self.markers_stale = true;
+        } else {
+            self.scene_stale = true;
+        }
+    }
+
+    /// Each placed object's owner colour as its rows' instance words
+    /// (`SceneParts::owner_word`), from the player colour View settings
+    /// picks. Placing rows zeroes the words, so this follows every
+    /// placement change; a pick rebuilds the scene and lands here too. A
+    /// game without owner colours sends nothing. The words ride the
+    /// placements' upload and redraw no more than the placement change
+    /// that comes with them already did.
+    fn send_owner_words(&mut self) {
+        if let Some(words) = self.owner_words() {
+            self.renderer.set_instance_words(0, &words);
+        }
+    }
+
+    /// Every placement row's instance word, as `send_owner_words` sends
+    /// them; `None` where no object is dyed.
+    fn owner_words(&self) -> Option<Vec<u32>> {
+        let scene = self.module.scene()?;
+        let player = self.layers.player;
+        let mut owned: Vec<(u64, u32)> = (self.island.doc.objects.iter())
+            .filter(|o| o.owner != 0)
+            .map(|o| (o.id, scene.owner_word(o.owner, player)))
+            .filter(|&(_, word)| word != 0)
+            .collect();
+        if owned.is_empty() {
+            return None;
+        }
+        owned.sort_unstable_by_key(|&(id, _)| id);
+        let words = (self.placements.item.iter())
+            .map(|item| match item {
+                Some(Item::Object(id)) => owned
+                    .binary_search_by_key(id, |&(id, _)| id)
+                    .map_or(0, |k| owned[k].1),
+                _ => 0,
+            })
+            .collect();
+        Some(words)
+    }
+
+    /// A finished `inland_job`, drawn from the next scene refresh.
+    pub(crate) fn inland_built(&mut self, built: InlandBuilt) {
+        self.inland_building = false;
+        self.inland_water = built.surface;
+        self.water_courses = built.courses;
+        self.markers_stale = true;
+    }
+
+    /// A finished `sky_job`, for the next scene refresh.
+    pub(crate) fn sky_baked(&mut self, done: SkyBaked) {
+        self.sky_baking = None;
+        self.sky_clock = done.clock;
+        self.sky = Some((done.ambient, done.time, done.baked));
+        self.markers_stale = true;
+    }
+
     fn refresh_scene(&mut self) {
         let _span = gpui_editor_kit::profile::span("island refresh_scene");
         for view in 0..self.views.len() {
             self.apply_gizmo(view);
         }
         self.markers_stale |= self.sync_selection();
-        if Some((self.overlay(), self.layers.tint)) != self.drawn_look {
+        // The Relief setting rides on the splat: a copy with it flipped
+        // shares every texture, so only the tiles' material changes.
+        let relief = self.layers.relief;
+        if let Some(splat) = &self.splat
+            && let Some(r) = splat.relief.as_ref().filter(|r| r.on != relief)
+        {
+            let mut flipped = (**splat).clone();
+            flipped.relief = Some(anno_render::a7m::Relief {
+                on: relief,
+                ..r.clone()
+            });
+            let flipped = Arc::new(flipped);
+            self.splat_ground = anno_render::a7m::ground(&flipped);
+            self.splat = Some(flipped);
+            self.retexture_tiles();
+        }
+        if Some(self.look()) != self.drawn_look {
             self.dirty = Rect::default();
             self.rebuild_tiles(None);
         }
@@ -2424,10 +3817,18 @@ impl IslandEditor {
             && let Some((install, path)) = self.shipped_source.take()
         {
             self.shipped =
-                terrain::ShippedMeshes::load(&install, &path, self.doc.field.grid.size()[0]);
+                terrain::ShippedMeshes::load(&install, &path, self.island.doc.field.grid.size()[0]);
         }
         if self.layers.shipped && self.shipped_meshes.is_empty() && self.shipped.len() > 0 {
             self.refresh_shipped_meshes();
+        }
+        // The cliff tops sample the baked ground, skipped while hidden.
+        if self.bake_wanted()
+            && self.ground.is_none()
+            && self.palette.is_some()
+            && self.island.doc.materials.is_some()
+        {
+            self.ground_stale = true;
         }
         let lines_for = self.lines_for();
         if self.drawn_lines != Some(lines_for) {
@@ -2443,7 +3844,7 @@ impl IslandEditor {
         // adds about 3 ms, as every grown row and the renderer's bounds
         // are redone.
         let windows = std::mem::take(&mut self.vegetation_window);
-        let size = self.doc.field.grid.size();
+        let size = self.island.doc.field.grid.size();
         let area: f32 = (windows.iter())
             .map(|w| (w[2] - w[0]) * (w[3] - w[1]))
             .sum();
@@ -2457,7 +3858,20 @@ impl IslandEditor {
             let grown = (preview.models.iter())
                 .flat_map(|(cfg, ms)| ms.iter().map(move |m| (cfg.as_str(), *m)));
             self.placements.set_grown(grown, &self.renderer);
+            self.send_owner_words();
             self.vegetation = Some(preview);
+        }
+        if std::mem::take(&mut self.rails_stale) || self.scene_stale {
+            let _span = gpui_editor_kit::profile::span("refresh: rails");
+            // 55-85 ms of an 1800 island's first scene on a busy machine,
+            // its templates and bends: off the UI thread when a runner
+            // takes them.
+            if self.background_scene {
+                self.rails_wanted = true;
+            } else {
+                self.refresh_rails();
+            }
+            self.markers_stale = true;
         }
         if !self.scene_stale && !self.markers_stale {
             return;
@@ -2468,64 +3882,101 @@ impl IslandEditor {
         if self.scene_stale {
             let _span = gpui_editor_kit::profile::span("refresh: placements");
             if std::mem::take(&mut self.pieces_stale) {
-                self.placements
-                    .set_pieces(&self.library.models.loaded, &renderer);
+                self.placements.set_pieces(
+                    &self.library.models.loaded,
+                    self.graphics.animation,
+                    &renderer,
+                );
             }
             // Every visible item with a model, then the vegetation preview.
             self.vegetation = self.vegetation_preview();
-            let files: Vec<String> = (self.doc.meshes.iter())
-                .map(|m| m.replace('\\', "/"))
+            // Each model looked up once: per mesh file for props, per plant
+            // model, per object. Placements::model says why.
+            let placements = &self.placements;
+            let files: Vec<Option<placements::Model>> = (self.island.doc.meshes.iter())
+                .map(|m| placements.model(&m.replace('\\', "/")))
                 .collect();
             let hidden = &self.hidden_groups;
-            let props = (self.doc.props.iter())
+            let props = (self.island.doc.props.iter())
                 .filter(|_| layers.props)
                 .filter(|p| !hidden.contains(&Group::Prop(p.source.file)))
                 .filter_map(|p| {
-                    let cfg = files.get(p.source.file as usize)?;
-                    Some((Some(Item::Prop(p.id)), cfg.clone(), p.matrix))
+                    let model = *files.get(p.source.file as usize)?;
+                    let allow = p.source.adapt_terrain_height.is_some();
+                    Some((Some(Item::Prop(p.id)), model, p.matrix, allow))
                 });
             let assets = self.assets.clone();
-            let objects = (self.doc.objects.iter())
+            let objects = (self.island.doc.objects.iter())
                 .filter(|_| layers.objects)
                 .filter(|o| !hidden.contains(&Group::Object(o.guid)))
                 .filter_map(|o| {
-                    let cfgs = assets
-                        .as_ref()
-                        .and_then(|a| a.get(o.guid))
-                        .map(|a| a.cfgs.as_slice())
-                        .unwrap_or(&[]);
-                    let cfg = o.model(cfgs)?.replace('\\', "/");
+                    let asset = assets.as_ref().and_then(|a| a.get(o.guid));
+                    let cfgs = asset.map(|a| a.cfgs.as_slice()).unwrap_or(&[]);
+                    let cfg = o.model(cfgs)?;
+                    // Owned only where the record uses backslashes. What
+                    // the game draws only in its own editor has no model
+                    // here unless Layers::editor_only, so it shows as a
+                    // marker.
+                    let model = match cfg.contains('\\') {
+                        _ if !layers.editor_only
+                            && asset.is_some_and(|a| a.editor_only == Some(true)) =>
+                        {
+                            None
+                        }
+                        true => placements.model(&cfg.replace('\\', "/")),
+                        false => placements.model(cfg),
+                    };
                     Some((
                         Some(Item::Object(o.id)),
-                        cfg,
+                        model,
                         doc::trs(o.position, o.rotation, o.scale),
+                        true,
                     ))
                 });
             let vegetation = self.vegetation.clone();
             let grown = vegetation.iter().flat_map(|p| {
-                p.models
-                    .iter()
-                    .flat_map(|(cfg, ms)| ms.iter().map(move |m| (None, cfg.clone(), *m)))
+                p.models.iter().flat_map(|(cfg, ms)| {
+                    let model = placements.model(cfg);
+                    ms.iter().map(move |m| (None, model, *m, true))
+                })
             });
-            let placed: Vec<(Option<Item>, String, Mat4)> =
-                props.chain(objects).chain(grown).collect();
-            self.undrawn = self.placements.set(
-                placed.iter().map(|(i, c, m)| (*i, c.as_str(), *m)),
-                &renderer,
-            );
+            let (plan, missing) = placements.plan_models(props.chain(objects).chain(grown));
+            self.undrawn = missing;
+            // The rows' matrices and bounds take tens of milliseconds on a
+            // busy machine: off the UI thread when a runner takes them, the
+            // old rows drawn until the new land.
+            if self.background_scene {
+                self.placement_plan = Some(plan);
+            } else {
+                let built = gpui_editor_kit::task::interactive(|| plan.build());
+                if self.placements.apply(built, &renderer) {
+                    self.send_owner_words();
+                }
+            }
         }
-        if std::mem::take(&mut self.inland_stale) || self.scene_stale {
-            let curves: Vec<_> = (self.doc.objects.iter())
-                .filter_map(|o| Some((o.path.as_deref()?, self.water_kind(o.guid)?)))
-                .collect();
-            self.inland_water = river::water_mesh(&curves);
+        // A game's sea replaces the flat sea quad, and a sea that shades
+        // rivers and lakes gets their records to shade them by. The rivers'
+        // surface builds off the UI thread (`inland_job`): 22 ms of an 1800
+        // island's rebuild was its mesh.
+        let water = self.sea_water();
+        let built_shaded = matches!(self.inland_water, Some(Inland::Shaded(_)));
+        if std::mem::take(&mut self.inland_stale)
+            || self.scene_stale
+            || (self.inland_water.is_some() && built_shaded != self.shades_inland())
+            || (built_shaded && self.inland_ground.as_ptr() != Arc::as_ptr(&self.island.doc.field))
+        {
+            self.inland_wanted = true;
         }
         // `set` lays out new rows: the selection names them again.
         self.sync_selection();
         self.scene_stale = false;
         self.markers_stale = false;
-        let inland = self.inland_water.as_ref();
+        let inland = match &self.inland_water {
+            Some(Inland::Mesh(mesh)) => Some(mesh),
+            _ => None,
+        };
         let identity = self.identity.clone();
+        let quad = water.is_none().then_some(&self.water);
         let batches: Vec<Batch> = self
             .tiles
             .iter()
@@ -2536,100 +3987,245 @@ impl IslandEditor {
                     .filter(|_| layers.shipped),
             )
             .chain(
-                [Some(&self.water), inland]
+                [quad, inland]
                     .into_iter()
                     .flatten()
                     .filter(|_| layers.water),
             )
+            .chain(self.rails.meshes())
             .map(|mesh| Batch::new(mesh.clone(), identity.clone()))
             .collect();
         // Markers for items no model draws, and rings on the selected ones
         // among them; the GPU rings the rest (`sync_selection`).
-        let marked: BTreeSet<Item> = self
-            .undrawn
-            .iter()
-            .chain(&self.selection_unplaced)
-            .copied()
-            .collect();
         // One pass over the document: before models load every item is
         // marked, and looking each up by id was quadratic (~90 ms at 16k).
-        let props =
-            (self.doc.props.iter()).map(|p| (Item::Prop(p.id), math::translation(&p.matrix)));
-        let objects = (self.doc.objects.iter()).map(|o| (Item::Object(o.id), o.position));
-        let markers = props
-            .chain(objects)
-            .filter(|(item, _)| marked.contains(item))
-            .map(|(item, position)| {
-                let selected = self.selection.contains(&item);
-                Marker {
-                    position,
-                    radius: if selected { 6. } else { 3. },
-                    color: match (selected, item) {
-                        (true, _) => crate::colors::PICK,
-                        (false, Item::Prop(_)) => crate::colors::PROP_MARKER,
-                        (false, Item::Object(_)) => crate::colors::OBJECT_MARKER,
-                    },
-                    shape: match (selected, item) {
-                        (true, _) => Shape::Ring,
-                        (false, Item::Prop(_)) => Shape::Circle,
-                        (false, Item::Object(_)) => Shape::Square,
-                    },
-                }
-            })
-            .collect();
-        let ambient = (self.ambient_lights.iter())
-            .find(|(name, _)| *name == self.doc.session.global_ambient)
-            .map_or_else(vegetation::Ambient::default, |(_, a)| *a);
+        let selection = &self.selection;
+        let marker = |item: Item, position: Vec3| {
+            let selected = selection.contains(&item);
+            Marker {
+                position,
+                radius: if selected { 6. } else { 3. },
+                color: match (selected, item) {
+                    (true, _) => crate::colors::PICK,
+                    (false, Item::Prop(_)) => crate::colors::PROP_MARKER,
+                    (false, Item::Object(_)) => crate::colors::OBJECT_MARKER,
+                },
+                shape: match (selected, item) {
+                    (true, _) => Shape::Ring,
+                    (false, Item::Prop(_)) => Shape::Circle,
+                    (false, Item::Object(_)) => Shape::Square,
+                },
+            }
+        };
+        let doc = || {
+            let props = (self.island.doc.props.iter())
+                .map(|p| (Item::Prop(p.id), math::translation(&p.matrix)));
+            let objects =
+                (self.island.doc.objects.iter()).map(|o| (Item::Object(o.id), o.position));
+            props.chain(objects)
+        };
+        // The plan lists `undrawn` in the document's order (props, then
+        // objects), so walking both together finds them without a lookup:
+        // while models load all 68k of an 1800 island's items are marked,
+        // and a set of them took 10-24 ms a refresh. Out of step (never
+        // expected), the set again.
+        let unplaced: foldhash::HashSet<Item> = self.selection_unplaced.iter().copied().collect();
+        let undrawn = &self.undrawn;
+        let mut next = 0;
+        let mut markers = Vec::with_capacity(undrawn.len() + unplaced.len());
+        for (item, position) in doc() {
+            let listed = undrawn.get(next) == Some(&item);
+            next += usize::from(listed);
+            if listed || unplaced.contains(&item) {
+                markers.push(marker(item, position));
+            }
+        }
+        if next < undrawn.len() {
+            let marked: foldhash::HashSet<Item> =
+                undrawn.iter().chain(&unplaced).copied().collect();
+            markers = (doc())
+                .filter(|(item, _)| marked.contains(item))
+                .map(|(item, position)| marker(item, position))
+                .collect();
+        }
+        let ambient = self.ambient();
+        let sky = ambient.sky.clone();
+        let at = match &sky {
+            Some(sky) => sky.sun_moon(self.time_of_day),
+            None => SunMoon::at(self.time_of_day, ambient.elevation, ambient.min_elevation),
+        };
+        // The sky bakes off the UI thread (`sky_job`). Until the preset's
+        // first bake lands its fixed colours light the island, and a new
+        // time keeps the last bake's sky for the frames in between.
+        let baked = (self.sky.as_ref())
+            .filter(|(a, ..)| *a == ambient)
+            .map(|(_, _, b)| b.clone());
+        // Presets lit by fixed colors keep them; time only moves the sun,
+        // which stays a little above the horizon for them.
+        let sun = baked
+            .as_ref()
+            .map_or([at.sun[0], at.sun[1].max(0.05), at.sun[2]], |b| b.toward);
+        let horizon = baked.as_ref().map_or(ambient.horizon, Baked::horizon);
+        // Held waves stand at time 0; moving ones follow the renderer's
+        // clock. Mid-stroke the coast stays as it was: remeasuring takes
+        // tens of milliseconds, and the stroke's end brings a new one.
+        let stroking = (self.views.iter()).any(|v| matches!(v.drag, Some(Drag::Brush { .. })));
+        let mut passes: Vec<Arc<dyn gpu::Pass>> = Vec::new();
+        // The game's sky from the camera, and its haze in place of the
+        // editor's fog.
+        let mut hazed = false;
+        let graphics = self.graphics;
+        self.renderer.set_detail(graphics.kit(&self.view_distances));
+        (self.renderer).set_render_scale(self.render_scale_env.unwrap_or(graphics.render_scale));
+        // A view of the game's own stands in for its sky and water and
+        // lights the scene itself (2070 under water), so no editor fog.
+        let view = self.view.clone().filter(|_| layers.under_water);
+        if let Some(sky_pass) = &self.sky_pass {
+            sky_pass.detail(graphics.game());
+            sky_pass.show(sky.as_ref(), self.time_of_day);
+            hazed = sky_pass.hazes();
+            if view.is_none() {
+                passes.extend(sky_pass.passes());
+            }
+        }
+        if let Some(view) = &view {
+            hazed = true;
+            passes.extend(view.passes.iter().cloned());
+        }
+        if let Some(pass) = &self.water_pass {
+            let inland = match &self.inland_water {
+                Some(Inland::Shaded(inland)) if layers.water => Some(inland.clone()),
+                _ => None,
+            };
+            pass.show(
+                water.as_ref(),
+                &self.island.doc.field,
+                stroking,
+                inland,
+                (!layers.waves).then_some(0.),
+            );
+            pass.island_maps(self.island.doc.grids.as_ref());
+            pass.island_file(self.island.native.as_ref().and_then(Native::file));
+            pass.rain(if layers.rain { 1. } else { 0. });
+            let seasons =
+                (self.module().scene()).and_then(|s| s.seasons(&self.path, self.assets.as_deref()));
+            pass.season(&self.path, seasons, if layers.flood { 1. } else { 0. });
+            pass.detail(graphics.game());
+            if water.is_some() && view.is_none() {
+                passes.push(pass.clone());
+            }
+        }
         let scene = Scene {
             batches,
             terrain: self.terrain.clone(),
             lines: Arc::new(self.water_lines()),
             markers: Arc::new(markers),
+            // Placed models' own lights are not drawn on islands.
+            local_lights: Arc::default(),
             light: Light {
-                // From the south-west at the preset's elevation.
-                sun: [
-                    -0.67 * ambient.elevation.cos(),
-                    ambient.elevation.sin(),
-                    0.74 * ambient.elevation.cos(),
-                ],
-                sun_color: ambient.sun,
-                sky: ambient.sky,
+                sun,
+                sun_color: baked.as_ref().map_or(ambient.sun, |b| b.light),
+                // Only lights without a sky map; with one it lights.
+                sky: ambient.sky_light,
                 ground: ambient.ground,
-                // 4096² (64 MB a viewport): the map spans the whole island
-                // and is not redrawn per camera move, so on a 768 m island
-                // a texel is a quarter metre; a tight filter keeps trees'
-                // shadows from smearing.
-                shadows: layers.shadows.then_some(Shadows {
-                    resolution: 4096,
-                    softness: 1.,
-                }),
+                // Both games fit four shadow cascades to what the camera
+                // sees (functions_shadow.fxh, SDSM). The island's 4096² map
+                // (64 MB, shared by viewports) is not redrawn per camera
+                // move and spreads a quarter metre a texel over a 768 m
+                // island, so it shades only past three view cascades of
+                // 2048² (48 MB a viewport), which cover the game's 500 m
+                // shadow distance (1800's MAX_SHADOW_DISTANCE_WS; 117 sets
+                // its own at run time). Filtering is the game's: six taps
+                // 1.5 texels out (BRDF_SHADOW_RADIUS, BRDF_SHADOW_SAMPLES).
+                // High, Graphics' default; the View settings' Shadows
+                // switch still turns them off for this island alone.
+                shadows: graphics.shadow_maps().filter(|_| layers.shadows),
                 // Into the horizon's haze, so the island and the sea
                 // beyond the water quad meet the sky without a line.
-                fog: Some(Fog {
-                    color: ambient.horizon,
+                fog: (!hazed).then(|| Fog {
+                    color: horizon,
                     start: self.extent().size * 1.5,
                     end: self.extent().size * 6.,
                 }),
             },
-            tone: Some(Tone {
-                exposure: ambient.exposure,
-                sun_occlusion: ambient.sun_occlusion,
+            tone: Some(match sky.as_ref().and_then(|sky| sky.curve()) {
+                Some(curve) => Tone {
+                    exposure: ambient.exposure,
+                    sun_occlusion: ambient.sun_occlusion,
+                    ambient: 1.,
+                    curve,
+                    auto: None,
+                },
+                None => Tone {
+                    exposure: ambient.exposure,
+                    sun_occlusion: ambient.sun_occlusion,
+                    ambient: ambient.ambient * vegetation::NO_RT_AMBIENT,
+                    curve: (self.module.scene()).map_or_else(Default::default, |s| s.tone_curve()),
+                    auto: (self.module.scene()).and_then(|s| s.auto_exposure()),
+                },
             }),
-            // Anno's SSAO (ambient_ssao.fx, AOIntensity ~1 in the presets),
-            // reaching about a tree's foot and a rock's crevices.
-            occlusion: Some(Occlusion {
+            // Anno's HBAO+ (ambient_ssao.fx) at the preset's AOIntensity.
+            // The engine sets its radius, bias, power, scales and screen
+            // radius bounds at run time; these are HBAO+'s defaults but for
+            // a radius reaching about a tree's foot and a rock's crevices,
+            // and a 32 px floor that keeps it on the ground seen from the
+            // strategy camera (estimates).
+            occlusion: graphics.occlusion.then(|| Occlusion {
                 radius: 2.5,
-                strength: 0.85,
+                strength: ambient.occlusion,
+                min_pixels: 32.,
+                ..Default::default()
             }),
+            ground_tint: self.ground_tint(),
+            cloud_shadows: sky.as_ref().and_then(|s| s.cloud_shadows(self.time_of_day)),
+            // Lit windows, fires and lamps by the view's hour; dyed parts
+            // in the player colour picked in View settings.
+            glow: {
+                let look = self.module.model_look();
+                let colors = look.player_colors;
+                let tint =
+                    (colors.get(layers.player).or(colors.first())).map_or([1.; 3], |c| c.dye());
+                let glow =
+                    anno_core::ambient::glow(&ambient, self.time_of_day, tint, look.deferred_glow);
+                let mut glow = look.glow(&glow);
+                // The preset's own numbers for the scene's lighting (2070's
+                // scattering): a preset switch rewrites them, no pipeline.
+                if let Some(sky) = &sky {
+                    sky.host_words(&mut glow.host);
+                }
+                glow
+            },
+            // What models and water reflect: the sky pass's own cube.
+            environment: self.sky_pass.as_ref().and_then(|p| p.environment()),
+            // The sea's mirror, where the game's sea reads one and draws.
+            reflection: (self.water_pass.as_ref())
+                .filter(|_| water.is_some() && view.is_none())
+                .and_then(|p| p.reflection(graphics.game())),
+            view_mode: view.as_ref().map_or(0, |v| v.mode),
+            host_texture: view.and_then(|v| v.host_texture),
+            passes,
+            // A game's own ground draws its paint wherever the ground
+            // shows, and the a7m splat's where there is one. The kit's draws Map
+            // and Height in the terrain's material.
+            ground: match &self.own_ground {
+                Some(g) if self.shading == Shading::Ground => g.draw(),
+                _ if self.shading == Shading::Ground && self.splat.is_some() => {
+                    self.splat_ground.clone()
+                }
+                _ => gpu::GroundDraw::Kit,
+            },
             sky: Some(Sky {
-                zenith: ambient.zenith,
-                horizon: ambient.horizon,
+                zenith: baked.as_ref().map_or(ambient.zenith, Baked::zenith),
+                horizon,
                 // Past the water quad (terrain::water): about what the
                 // quad shows over deep floor.
                 sea: Some(Sea {
                     level: 0.,
                     color: terrain::SEA_BODY,
                 }),
+                sun_disc: baked.as_ref().map_or([0.; 3], |b| b.disc),
+                ambient: baked.as_ref().and_then(|b| b.ambient),
+                radiance: baked.map(|b| b.map),
             }),
         };
         self.renderer.set_scene(&scene);
@@ -2640,7 +4236,7 @@ impl IslandEditor {
     fn ground(&self, view: usize, cursor: Point<Pixels>) -> Option<Vec3> {
         let v = &self.views[view];
         let ray = v.camera.ray(cursor, v.bounds, self.extent());
-        self.doc.field.raycast(ray)
+        self.island.doc.field.raycast(ray)
     }
 
     /// The selection's mean position, where the gizmo sits. Every paint
@@ -2648,34 +4244,46 @@ impl IslandEditor {
     /// the selection, both sorted by id, as 20k lookups took 1.7 ms.
     fn pivot(&self) -> Option<Vec3> {
         let add = |(s, n): (Vec3, usize), p: Vec3| (math::add(s, p), n + 1);
-        let props = &self.doc.props;
-        let (sum, n) = if self.selection.len() < 64 || !props.windows(2).all(|w| w[0].id < w[1].id)
-        {
-            (self.selection.iter())
-                .filter_map(|&item| self.doc.matrix(item))
-                .map(|m| math::translation(&m))
-                .fold(([0.; 3], 0), add)
-        } else {
-            let mut selected = self.selection.range(..=Item::Prop(u64::MAX)).peekable();
-            let mut acc = ([0.; 3], 0);
-            for p in props.iter() {
-                while selected.next_if(|&&i| i < Item::Prop(p.id)).is_some() {}
-                if selected.next_if_eq(&&Item::Prop(p.id)).is_some() {
-                    acc = add(acc, math::translation(&p.matrix));
+        let props = &self.island.doc.props;
+        let (sum, n) =
+            if self.selection.len() < 64 || !props.iter().is_sorted_by(|a, b| a.id < b.id) {
+                (self.selection.iter())
+                    .filter_map(|&item| self.island.doc.matrix(item))
+                    .map(|m| math::translation(&m))
+                    .fold(([0.; 3], 0), add)
+            } else {
+                let mut selected = self.selection.range(..=Item::Prop(u64::MAX)).peekable();
+                let mut acc = ([0.; 3], 0);
+                for p in props.iter() {
+                    while selected.next_if(|&&i| i < Item::Prop(p.id)).is_some() {}
+                    if selected.next_if_eq(&&Item::Prop(p.id)).is_some() {
+                        acc = add(acc, math::translation(&p.matrix));
+                    }
                 }
-            }
-            (self.doc.objects.iter())
-                .filter(|o| self.selection.contains(&Item::Object(o.id)))
-                .fold(acc, |acc, o| add(acc, o.position))
-        };
+                (self.island.doc.objects.iter())
+                    .filter(|o| self.selection.contains(&Item::Object(o.id)))
+                    .fold(acc, |acc, o| add(acc, o.position))
+            };
         (n > 0).then(|| math::scale(sum, 1. / n as f32))
     }
 
     fn gizmo_frame(&self, view: usize) -> Option<gizmo::Frame> {
+        let v = &self.views[view];
+        // The path edit mode's points, and the River tool's picked point,
+        // move only.
+        if let Some(pivot) = self.road_pivot().or_else(|| self.river_pivot()) {
+            return gizmo::Frame::new(
+                gizmo::Mode::Move,
+                pivot,
+                None,
+                v.camera,
+                v.bounds,
+                self.extent(),
+            );
+        }
         if self.tool != Tool::Select {
             return None;
         }
-        let v = &self.views[view];
         // A GPU drag left the document behind: the pivot it began at, moved.
         let pivot = match &v.drag {
             Some(Drag::Gizmo {
@@ -2692,20 +4300,15 @@ impl IslandEditor {
         let center = [at[0], at[2]];
         match self.tool {
             Tool::Paint => {
-                let Some(m) = &mut self.doc.materials else {
+                let Some(m) = &mut self.island.doc.materials else {
                     return false;
                 };
                 if !m.paint(center, &self.brush, self.paint) {
                     return false;
                 }
-                // The splat shows the paint on the next frame: recompute the
-                // control texels under the brush in place.
+                // The ground shows the paint on the next frame.
                 let r = self.brush.radius + 1.;
-                if let (Some(palette), Some(splat)) = (&self.palette, &self.splat) {
-                    let size = self.doc.field.grid.size()[0];
-                    let area = [center[0] - r, center[1] - r, center[0] + r, center[1] + r];
-                    palette.update_splat(splat, &m.ids, &m.alphas, size, area);
-                }
+                self.show_paint([center[0] - r, center[1] - r, center[0] + r, center[1] + r]);
                 // The ground type picks what grows.
                 self.vegetation_changed([
                     center[0] - r,
@@ -2716,11 +4319,21 @@ impl IslandEditor {
                 // Vertex colors show materials only in the Ids shading; the
                 // cliff-top bake catches up after the stroke.
                 if self.shading == Shading::Materials || self.splat.is_none() {
-                    let rect = self.doc.field.grid.footprint(center, self.brush.radius);
+                    let rect = self
+                        .island
+                        .doc
+                        .field
+                        .grid
+                        .footprint(center, self.brush.radius);
                     self.dirty = self.dirty.union(rect);
                 }
                 true
             }
+            Tool::Grid if self.edits_blockers() => match self.blocker {
+                grids::BlockerEdit::Paths(layer) => self.path_dab(center, layer, invert),
+                // Points, not a brush: `shape_press`.
+                grids::BlockerEdit::Shapes => false,
+            },
             Tool::Grid => {
                 let (kind, mut value) = (self.grid, self.grid_value);
                 let mut invert = invert;
@@ -2744,6 +4357,7 @@ impl IslandEditor {
                     return false;
                 }
                 let Some(layer) = self
+                    .island
                     .doc
                     .grids
                     .as_mut()
@@ -2760,25 +4374,62 @@ impl IslandEditor {
                 if !painted {
                     return false;
                 }
-                let rect = self.doc.field.grid.footprint(center, self.brush.radius);
+                let rect = self
+                    .island
+                    .doc
+                    .field
+                    .grid
+                    .footprint(center, self.brush.radius);
                 self.dirty = self.dirty.union(rect);
+                if kind == Kind::Grit {
+                    // A cell past the brush each way: paint rounds outward.
+                    let r = self.brush.radius + 1.;
+                    self.sync_grit(Some([
+                        center[0] - r,
+                        center[1] - r,
+                        center[0] + r,
+                        center[1] + r,
+                    ]));
+                }
+                if kind == Kind::Marsh && self.marsh_shape && !invert {
+                    self.shape_marsh(center, baseline);
+                }
                 true
             }
             Tool::Tint => {
-                let Some(map) = &mut self.doc.tint else {
+                // The tint control draws from this map: let go of it while
+                // painting, so the map is not copied on write for it.
+                let source = self.tint_gpu.as_ref().map(|(.., s)| s.clone());
+                let mut lent = source.as_ref().map(|s| s.0.lock().unwrap());
+                if let Some(lent) = lent.as_mut() {
+                    lent.take();
+                }
+                let Some(map) = &mut self.island.doc.tint else {
                     return false;
                 };
-                if !tint::paint(
+                let painted = tint::paint(
                     Arc::make_mut(map),
                     center,
                     &self.brush,
                     self.tint_color,
                     invert,
-                ) {
+                );
+                if let Some(lent) = lent.as_mut() {
+                    **lent = Some(map.clone());
+                }
+                drop(lent);
+                if !painted {
                     return false;
                 }
-                let rect = self.doc.field.grid.footprint(center, self.brush.radius);
+                let rect = self
+                    .island
+                    .doc
+                    .field
+                    .grid
+                    .footprint(center, self.brush.radius);
                 self.dirty = self.dirty.union(rect);
+                let r = self.brush.radius + 1.;
+                self.sync_tint([center[0] - r, center[1] - r, center[0] + r, center[1] + r]);
                 true
             }
             Tool::Scatter => {
@@ -2788,10 +4439,14 @@ impl IslandEditor {
                     self.scatter.files.push(file);
                 }
                 let n = if invert {
-                    self.scatter.thin(&mut self.doc, center, &self.brush)
+                    self.scatter.thin(&mut self.island.doc, center, &self.brush)
                 } else {
-                    self.scatter
-                        .fill(&mut self.doc, center, &self.brush, &mut self.next_id)
+                    self.scatter.fill(
+                        &mut self.island.doc,
+                        center,
+                        &self.brush,
+                        &mut self.island.next_id,
+                    )
                 };
                 if n == 0 {
                     return false;
@@ -2801,7 +4456,12 @@ impl IslandEditor {
                 self.moves += 1;
                 self.scene_stale = true;
                 if self.scatter.mark_trees && self.overlay() == Some(Kind::Trees) {
-                    let rect = self.doc.field.grid.footprint(center, self.brush.radius);
+                    let rect = self
+                        .island
+                        .doc
+                        .field
+                        .grid
+                        .footprint(center, self.brush.radius);
                     self.dirty = self.dirty.union(rect);
                 }
                 true
@@ -2828,43 +4488,143 @@ impl IslandEditor {
                         _,
                     ) => return false,
                 };
-                let rect = Arc::make_mut(&mut self.doc.field).sculpt_from(
-                    center,
-                    &self.brush,
-                    op,
-                    baseline,
-                );
-                match &self.gpu_heights {
-                    Some(heights) if !rect.is_empty() => {
-                        heights.update(rect, &self.doc.field.heights);
-                        self.stale_colors = self.stale_colors.union(rect);
-                    }
-                    _ => self.dirty = self.dirty.union(rect),
-                }
-                if !rect.is_empty() {
-                    let g = self.doc.field.grid;
-                    let at = |x: usize, z: usize| {
-                        [
-                            g.origin[0] + x as f32 * g.spacing,
-                            g.origin[1] + z as f32 * g.spacing,
-                        ]
-                    };
-                    let (lo, hi) = (at(rect.x0, rect.z0), at(rect.x1, rect.z1));
-                    self.vegetation_changed([lo[0], lo[1], hi[0], hi[1]]);
-                }
-                // Bank outlines drape on the ground and show on a selected
-                // or hovered river; redrawing them costs little more than
-                // the markers.
-                let lit = |id: u64| {
-                    self.hover_water == Some(id) || self.selection.contains(&Item::Object(id))
-                };
-                self.markers_stale |= !rect.is_empty()
-                    && (self.doc.objects.iter()).any(|o| {
-                        o.path.is_some() && lit(o.id) && self.water_kind(o.guid) == Some(false)
-                    });
-                !rect.is_empty()
+                self.sculpt_dab(center, op, baseline)
             }
         }
+    }
+
+    /// The rest of a marsh under a Marsh grid dab, as every shipped Albion
+    /// marsh has it: ground flat at `MARSH_LEVEL`, the Marsh environment,
+    /// and the set's marsh floor with reeds over it (reeds are the `Marsh`
+    /// ground type the game grows marsh plants on). Sets without marsh
+    /// textures keep their ground.
+    fn shape_marsh(&mut self, center: [f32; 2], baseline: Option<&[f32]>) {
+        if let Some(env) = (self.island.doc.grids.as_mut())
+            .and_then(|g| Arc::make_mut(g).layer_mut(Kind::Environment))
+        {
+            grids::paint(env, center, &self.brush, harbour::MARSH_ENVIRONMENT, false);
+        }
+        self.sculpt_dab(center, Sculpt::Flatten(MARSH_LEVEL), baseline);
+        let Some(palette) = self.palette.clone() else {
+            return;
+        };
+        let stem = |id: &u8| {
+            let file = &palette.materials[id].file;
+            file.rsplit('/').next().unwrap_or(file).to_ascii_lowercase()
+        };
+        // TODO(alex): shipped marshes also stripe the floor with
+        // marshislands_01 patches; a noise mask over the brush would match.
+        let floor = palette
+            .materials
+            .keys()
+            .find(|id| stem(id).starts_with("marshfloor"));
+        let reed = (palette.ground_layers.iter())
+            .find(|(_, ground)| ground == "Marsh")
+            .map(|(id, _)| id);
+        let Some(m) = &mut self.island.doc.materials else {
+            return;
+        };
+        // Full strength whatever the grid brush says: the cells are on or
+        // off after one pass, and half-laid ground left grass showing
+        // through a finished marsh.
+        let mut painted = false;
+        if let Some(&floor) = floor {
+            let brush = Brush {
+                strength: 1.,
+                ..self.brush
+            };
+            painted |= m.paint(center, &brush, floor);
+        }
+        if let Some(&reed) = reed {
+            // Shipped marshes are about half reed over the floor.
+            let brush = Brush {
+                strength: 0.55,
+                ..self.brush
+            };
+            painted |= m.paint(center, &brush, reed);
+        }
+        if !painted {
+            return;
+        }
+        let r = self.brush.radius + 1.;
+        let area = [center[0] - r, center[1] - r, center[0] + r, center[1] + r];
+        self.show_paint(area);
+        self.vegetation_changed(area);
+    }
+
+    /// One sculpt dab of `op` at `center`: heights, the props that follow
+    /// the ground, the GPU heights and what reads them.
+    fn sculpt_dab(&mut self, center: [f32; 2], op: Sculpt, baseline: Option<&[f32]>) -> bool {
+        // Props with AdaptTerrainHeight keep their height above the
+        // ground, as the game's own editor keeps them: note the
+        // ground under those the brush may reach, lift them by its
+        // change. Bilinear heights reach a sample past the brush.
+        let reach = self.brush.radius + 2. * self.island.doc.field.grid.spacing;
+        let seated: Vec<(usize, f32)> = (self.island.doc.props.iter().enumerate())
+            .filter(|(_, p)| p.source.adapt_terrain_height.is_some())
+            .map(|(i, p)| (i, [p.matrix[12], p.matrix[14]]))
+            .filter(|(_, at)| {
+                (at[0] - center[0]).abs() <= reach && (at[1] - center[1]).abs() <= reach
+            })
+            .map(|(i, at)| (i, self.island.doc.field.height(at)))
+            .collect();
+        // 2070 blocks the ground a sculpt lifts off buildable land; the
+        // path blockers show it as the stroke goes.
+        let lift = self.lift_baseline(center, reach);
+        let rect = Arc::make_mut(&mut self.island.doc.field).sculpt_from(
+            center,
+            &self.brush,
+            op,
+            baseline,
+        );
+        if let Some(lift) = lift.filter(|_| !rect.is_empty()) {
+            self.block_lifted(&lift, rect);
+        }
+        if !rect.is_empty() && !seated.is_empty() {
+            let doc = &mut self.island.doc;
+            let props = &mut doc.props;
+            let mut moved = Vec::new();
+            for (i, was) in seated {
+                let p = &mut props[i];
+                let rise = doc.field.height([p.matrix[12], p.matrix[14]]) - was;
+                if rise != 0. {
+                    p.matrix[13] += rise;
+                    moved.push((Item::Prop(p.id), p.matrix));
+                }
+            }
+            if !moved.is_empty() {
+                let renderer = self.renderer.clone();
+                self.placements.move_items(&mut moved, &renderer);
+                self.moves += 1;
+            }
+        }
+        match &self.gpu_heights {
+            Some(heights) if !rect.is_empty() => {
+                heights.update(rect, &self.drawn_field().heights);
+                self.stale_colors = self.stale_colors.union(rect);
+            }
+            _ => self.dirty = self.dirty.union(rect),
+        }
+        if !rect.is_empty() {
+            let g = self.island.doc.field.grid;
+            let at = |x: usize, z: usize| {
+                [
+                    g.origin[0] + x as f32 * g.spacing,
+                    g.origin[1] + z as f32 * g.spacing,
+                ]
+            };
+            let (lo, hi) = (at(rect.x0, rect.z0), at(rect.x1, rect.z1));
+            self.vegetation_changed([lo[0], lo[1], hi[0], hi[1]]);
+        }
+        // Bank outlines drape on the ground and show on a selected
+        // or hovered river; redrawing them costs little more than
+        // the markers.
+        let lit =
+            |id: u64| self.hover_water == Some(id) || self.selection.contains(&Item::Object(id));
+        self.markers_stale |= !rect.is_empty()
+            && (self.island.doc.objects.iter())
+                .any(|o| o.path.is_some() && lit(o.id) && self.water_kind(o.guid) == Some(false));
+        !rect.is_empty()
     }
 
     fn mouse_down(&mut self, view: usize, event: &MouseDownEvent) {
@@ -2910,19 +4670,31 @@ impl IslandEditor {
                 }
                 None
             }
+            MouseButton::Left
+                if self.tool == Tool::Grid
+                    && self.blocker == grids::BlockerEdit::Shapes
+                    && self.edits_blockers() =>
+            {
+                ground.and_then(|at| {
+                    let double = event.click_count >= 2;
+                    self.shape_press([at[0], at[2]], event.modifiers.shift, double)
+                })
+            }
             MouseButton::Left if self.tool == Tool::Harbour => {
                 ground.and_then(|at| self.harbour_press(view, event, at))
+            }
+            MouseButton::Left if self.tool == Tool::River && gesture.is_some() => {
+                gesture.and_then(|g| self.river_gizmo_drag(g))
             }
             MouseButton::Left if self.tool == Tool::River => {
                 ground.and_then(|at| self.river_press(view, event, at))
             }
-            MouseButton::Left if self.tool == Tool::Slot => ground.and_then(|at| {
-                if self.auto_region && !event.modifiers.shift {
-                    return Some(Drag::Region { from: at, to: at });
-                }
-                self.slot_at(at, event.modifiers.shift);
-                None
-            }),
+            MouseButton::Left if self.tool == Tool::Slot && gesture.is_some() => {
+                gesture.and_then(|g| self.path_gizmo_drag(g))
+            }
+            MouseButton::Left if self.tool == Tool::Slot => {
+                ground.and_then(|at| self.slot_press(view, event, at))
+            }
             // Double-clicking a river or lake opens its curve for editing.
             MouseButton::Left
                 if self.tool == Tool::Select
@@ -2938,13 +4710,14 @@ impl IslandEditor {
                     targets: self
                         .selection
                         .iter()
-                        .filter_map(|&item| Some((item, self.doc.matrix(item)?)))
+                        .filter_map(|&item| Some((item, self.island.doc.matrix(item)?)))
                         .collect(),
                     gesture,
-                    before: Box::new(self.doc.clone()),
+                    before: Box::new(self.island.doc.clone()),
                     changed: false,
                     pending: None,
                     gpu: None,
+                    turn: self.selection_turn(),
                 }),
                 None => Some(Drag::Marquee(Marquee::new(
                     event.position,
@@ -2955,9 +4728,10 @@ impl IslandEditor {
                 self.flow_from = None;
                 let mut drag = Drag::Brush {
                     stroke: Stroke::default(),
-                    before: Box::new(self.doc.clone()),
+                    before: Box::new(self.island.doc.clone()),
                     level: at[1],
                     changed: false,
+                    hold: None,
                 };
                 self.continue_brush(&mut drag, at, event.modifiers.shift);
                 drag
@@ -2978,12 +4752,18 @@ impl IslandEditor {
 
     fn sample(&mut self, at: Vec3) {
         if self.tool == Tool::Paint {
-            if let Some(m) = &self.doc.materials {
-                self.paint = m.shown([at[0], at[2]], self.palette.as_deref());
+            if let Some(m) = &self.island.doc.materials {
+                self.paint = doc::shown(m, [at[0], at[2]], self.palette.as_deref());
                 self.say(format!("Picked material {}", self.paint), false);
             }
         } else if self.tool == Tool::Grid {
-            if let Some(layer) = self.doc.grids.as_ref().and_then(|g| g.layer(self.grid)) {
+            if let Some(layer) = self
+                .island
+                .doc
+                .grids
+                .as_ref()
+                .and_then(|g| g.layer(self.grid))
+            {
                 self.grid_value = grids::value_at(layer, at[0], at[2]);
                 self.say(
                     format!(
@@ -2995,7 +4775,7 @@ impl IslandEditor {
                 );
             }
         } else if self.tool == Tool::Tint {
-            if let Some(map) = &self.doc.tint {
+            if let Some(map) = &self.island.doc.tint {
                 self.tint_color = tint::sample(map, at[0], at[2]);
                 let [r, g, b] = self.tint_color;
                 self.say(format!("Picked tint ×{r:.2} ×{g:.2} ×{b:.2}"), false);
@@ -3006,17 +4786,70 @@ impl IslandEditor {
         }
     }
 
+    /// The turn objects of asset `guid` stand on (`IslandCodec::turn_step`);
+    /// 0 for free, `None` while the game still reads it.
+    fn turn_step(&self, guid: u32) -> Option<f32> {
+        let codec = self.module.islands().and_then(|i| i.codec().own());
+        match (codec, &self.install) {
+            (Some(codec), Some(install)) => codec.turn_step(install, guid),
+            _ => Some(0.),
+        }
+    }
+
+    /// The game's shared harbour and slot pieces (`Islands::harbours`).
+    fn harbours(&self) -> Option<&'static dyn anno_core::game::Harbours> {
+        self.module.islands()?.harbours()
+    }
+
+    /// The coarsest turn the selected objects stand on, which the rotate
+    /// gizmo snaps to; 0 where all turn freely, `None` while any is still
+    /// being read.
+    pub(crate) fn selection_turn(&self) -> Option<f32> {
+        let objects = &self.island.doc.objects;
+        (self.selection.iter())
+            .filter_map(|item| match item {
+                Item::Object(id) => objects.iter().find(|o| o.id == *id),
+                _ => None,
+            })
+            .try_fold(0., |turn: f32, o| Some(turn.max(self.turn_step(o.guid)?)))
+    }
+
     /// Adds the Place tool's prop at `at` with a random yaw, copying tint and
     /// flags from an existing instance of the same file.
     fn place_at(&mut self, at: Vec3) {
         // Cheap spread of yaws; reproducible per placement count.
-        let yaw = (self.next_id as f32 * 2.399_963).rem_euclid(std::f32::consts::TAU);
+        let yaw = (self.island.next_id as f32 * 2.399_963).rem_euclid(std::f32::consts::TAU);
         if let Some((template, config)) = self.place_object.clone() {
-            let Some(store) = &mut self.object_store else {
+            // 2070's records: a copy its codec numbers when it saves. An
+            // asset that ships only on quarter turns (its buildings) takes
+            // one; the game can't be run to say whether it refuses others.
+            if template.object.record().is_some() {
+                // The template came from the same index, so it is read.
+                let step = self.turn_step(template.object.guid).unwrap_or(0.);
+                let yaw = match step > 0. {
+                    true => (yaw / step).round() * step,
+                    false => yaw,
+                };
+                let id = (self.island.doc.objects.iter())
+                    .map(|o| o.id)
+                    .max()
+                    .unwrap_or(0)
+                    + 1;
+                let mut o = template.object.copied(id);
+                o.position = at;
+                o.set_direction(yaw);
+                self.checkpoint();
+                Arc::make_mut(&mut self.island.doc.objects).push(o);
+                self.selection = BTreeSet::from([Item::Object(id)]);
+                self.scene_stale = true;
+                return;
+            }
+            let Some(store) = &mut self.island.object_store else {
                 return self.say("This island has no object areas", true);
             };
-            store.objects.clone_from(&self.doc.objects);
+            store.objects.clone_from(&self.island.doc.objects);
             let area = self
+                .island
                 .doc
                 .grids
                 .as_ref()
@@ -3031,7 +4864,7 @@ impl IslandEditor {
             o.set_direction(yaw);
             self.checkpoint();
             let id = o.id;
-            Arc::make_mut(&mut self.doc.objects).push(o);
+            Arc::make_mut(&mut self.island.doc.objects).push(o);
             self.selection = BTreeSet::from([Item::Object(id)]);
             self.scene_stale = true;
             return;
@@ -3040,13 +4873,13 @@ impl IslandEditor {
             return self.say("Choose something in the Library first", true);
         };
         // A prop new to the island takes default settings.
-        let mut source = scatter::template(&self.doc, file);
+        let mut source = scatter::template(&self.island.doc, file);
         source.position = at;
         source.rotation = [0., (yaw / 2.).sin(), 0., (yaw / 2.).cos()];
         self.checkpoint();
-        let id = self.next_id;
-        self.next_id += 1;
-        Arc::make_mut(&mut self.doc.props).push(Prop {
+        let id = self.island.next_id;
+        self.island.next_id += 1;
+        self.island.doc.props.push(Prop {
             id,
             matrix: doc::trs(source.position, source.rotation, source.scale),
             source,
@@ -3058,28 +4891,10 @@ impl IslandEditor {
 
     /// Places props of the `.cfg` at `path` with the Place tool, adding the
     /// model to the island's prop files if it is new.
-    /// The island's prop file index of `path`, adding it to the file list
-    /// when the island has never used that model.
-    fn mesh_index(&mut self, path: &str) -> u32 {
-        let index = match self
-            .doc
-            .meshes
-            .iter()
-            .position(|m| m.eq_ignore_ascii_case(path))
-        {
-            Some(i) => i,
-            None => {
-                Arc::make_mut(&mut self.doc.meshes).push(path.to_owned());
-                self.doc.meshes.len() - 1
-            }
-        };
-        index as u32
-    }
-
     /// Adds the prop model `path` to the scatter set, or takes it out.
     /// True when it is in the set afterwards.
     pub fn toggle_scatter(&mut self, path: &str) -> bool {
-        let file = self.mesh_index(path);
+        let file = self.island.doc.mesh_index(path);
         if let Some(k) = self.scatter.files.iter().position(|&f| f == file) {
             self.scatter.files.remove(k);
             false
@@ -3091,13 +4906,17 @@ impl IslandEditor {
 
     /// Replaces the scatter set with `paths`.
     pub fn set_scatter(&mut self, paths: &[String]) {
-        self.scatter.files = paths.iter().map(|p| self.mesh_index(p)).collect();
+        self.scatter.files = paths
+            .iter()
+            .map(|p| self.island.doc.mesh_index(p))
+            .collect();
     }
 
     /// Whether the prop model `path` is in the scatter set.
     pub fn in_scatter(&self, path: &str) -> bool {
         self.scatter.files.iter().any(|&f| {
-            self.doc
+            self.island
+                .doc
                 .meshes
                 .get(f as usize)
                 .is_some_and(|m| m.replace('\\', "/").eq_ignore_ascii_case(path))
@@ -3109,16 +4928,16 @@ impl IslandEditor {
     /// earlier runs go first; existing cliffs and rocks are kept clear of
     /// either way, so reruns do not stack.
     pub fn auto_cliffs(&mut self, install: &Install) {
-        let kit = match cliffs::Kit::load(install, &self.region()) {
+        let kit = match cliffs::Kit::load(self.rules(), install, &self.region()) {
             Ok(kit) => kit,
             Err(e) => return self.say(format!("Auto cliffs: {e:#}"), true),
         };
-        let before = self.doc.clone();
-        let old = self.doc.props.len();
+        let before = self.island.doc.clone();
+        let old = self.island.doc.props.len();
         if self.cliffs.replace {
-            Arc::make_mut(&mut self.doc.props).retain(|p| !p.auto_cliff);
+            self.island.doc.props.retain(|p| !p.auto_cliff);
         }
-        let removed = old - self.doc.props.len();
+        let removed = old - self.island.doc.props.len();
         let shape_of = |doc: &Doc, p: &Prop| {
             let cfg = doc.meshes.get(p.source.file as usize)?;
             kit.shapes
@@ -3128,13 +4947,14 @@ impl IslandEditor {
         // Rocks of unknown size count as 4 m: the small end of the big
         // rocks, so hand-placed scatter does not block a whole face.
         let obstacles: Vec<cliffs::Obstacle> = self
+            .island
             .doc
             .props
             .iter()
-            .filter_map(|p| match shape_of(&self.doc, p) {
+            .filter_map(|p| match shape_of(&self.island.doc, p) {
                 Some(shape) => Some(cliffs::Obstacle::of(shape, &p.matrix)),
                 None => {
-                    let cfg = self.doc.meshes.get(p.source.file as usize)?;
+                    let cfg = self.island.doc.meshes.get(p.source.file as usize)?;
                     let t = math::translation(&p.matrix);
                     cliffs::is_rock(cfg).then_some(cliffs::Obstacle {
                         at: [t[0], t[2]],
@@ -3143,16 +4963,16 @@ impl IslandEditor {
                 }
             })
             .collect();
-        let placed = cliffs::plan(&self.doc.field, &kit, &self.cliffs, &obstacles);
+        let placed = cliffs::plan(&self.island.doc.field, &kit, &self.cliffs, &obstacles);
         if placed.is_empty() && removed == 0 {
-            self.doc = before;
+            self.island.doc = before;
             return self.say("No new spot steeper than 35° above sea for cliffs", true);
         }
         for p in &placed {
-            let file = self.mesh_index(&kit.shapes[p.shape].cfg);
+            let file = self.island.doc.mesh_index(&kit.shapes[p.shape].cfg);
             // Retail cliffs and rocks never carry AdaptTerrainHeight and
             // always the neutral color.
-            let source = anno_formats::island::Prop {
+            let source = anno_formats::a7m::island::Prop {
                 file,
                 position: p.position,
                 rotation: p.rotation,
@@ -3160,19 +4980,19 @@ impl IslandEditor {
                 color: [1.; 4],
                 adapt_terrain_height: None,
             };
-            Arc::make_mut(&mut self.doc.props).push(Prop {
-                id: self.next_id,
+            self.island.doc.props.push(Prop {
+                id: self.island.next_id,
                 matrix: doc::trs(source.position, source.rotation, source.scale),
                 source,
                 auto_cliff: true,
             });
-            self.next_id += 1;
+            self.island.next_id += 1;
         }
         let painted = self.paint_cliff_ground(&kit, &placed);
         let share = self.auto_cliff_coverage(&kit);
         self.checkpoint_owned(before);
         self.selection
-            .retain(|item| self.doc.matrix(*item).is_some());
+            .retain(|item| self.island.doc.matrix(*item).is_some());
         self.scene_stale = true;
         self.say(
             format!(
@@ -3198,7 +5018,9 @@ impl IslandEditor {
     /// new cliff pieces, so faces between and around them read as rock
     /// rather than stretched grass. False when the palette has none.
     fn paint_cliff_ground(&mut self, kit: &cliffs::Kit, placed: &[cliffs::Placement]) -> bool {
-        let (Some(palette), Some(m)) = (self.palette.clone(), &mut self.doc.materials) else {
+        let rules = self.rules();
+        let (Some(palette), Some(m)) = (self.palette.clone(), &mut self.island.doc.materials)
+        else {
             return false;
         };
         let names: Vec<(u8, String)> = palette
@@ -3206,7 +5028,7 @@ impl IslandEditor {
             .iter()
             .map(|(&id, mat)| (id, mat.file.clone()))
             .collect();
-        let Some(id) = cliffs::ground_material(self.game, &names) else {
+        let Some(id) = cliffs::ground_material(rules, &names) else {
             return false;
         };
         let dab = gpui_editor_kit::heightfield::Brush {
@@ -3219,7 +5041,7 @@ impl IslandEditor {
         for p in placed {
             let center = [p.position[0], p.position[2]];
             let radius = cliffs::width(&kit.shapes[p.shape], p.scale) / 2. + cliffs::PAINT_MARGIN;
-            for at in cliffs::paint_spots(&self.doc.field, center, radius) {
+            for at in cliffs::paint_spots(&self.island.doc.field, center, radius) {
                 m.paint(at, &dab, id);
             }
             lo = [lo[0].min(center[0] - radius), lo[1].min(center[1] - radius)];
@@ -3228,10 +5050,7 @@ impl IslandEditor {
         if placed.is_empty() {
             return false;
         }
-        if let Some(splat) = &self.splat {
-            let size = self.doc.field.grid.size()[0];
-            palette.update_splat(splat, &m.ids, &m.alphas, size, [lo[0], lo[1], hi[0], hi[1]]);
-        }
+        self.show_paint([lo[0], lo[1], hi[0], hi[1]]);
         // The cliff-top bake and map shading follow the new paint.
         self.ground_stale = true;
         true
@@ -3240,12 +5059,13 @@ impl IslandEditor {
     /// Share of ground over 35° under the auto-placed pieces.
     fn auto_cliff_coverage(&self, kit: &cliffs::Kit) -> f32 {
         let boxes: Vec<_> = self
+            .island
             .doc
             .props
             .iter()
             .filter(|p| p.auto_cliff)
             .filter_map(|p| {
-                let cfg = self.doc.meshes.get(p.source.file as usize)?;
+                let cfg = self.island.doc.meshes.get(p.source.file as usize)?;
                 let shape = kit
                     .shapes
                     .iter()
@@ -3253,11 +5073,44 @@ impl IslandEditor {
                 Some((p.matrix, shape.center, shape.extent))
             })
             .collect();
-        cliffs::coverage(&self.doc.field, &boxes)
+        cliffs::coverage(&self.island.doc.field, &boxes)
     }
 
     pub fn choose_prop(&mut self, path: &str) {
-        let index = self.mesh_index(path);
+        // A game whose own codec saves objects places models as objects of
+        // their asset (2070). Its trees, rocks and grass are props whose
+        // file names their record's GUID and variation, which the codec
+        // looks up when it saves a kind the island never held.
+        let mut path = path.to_owned();
+        if self.island.saves_through_codec() {
+            let codec = self.module.islands().and_then(|i| i.codec().own());
+            let (Some(islands), Some(install), Some(assets)) = (codec, &self.install, &self.assets)
+            else {
+                return self.say("The asset database is still loading", true);
+            };
+            if !islands.places_as_prop(assets, &path) {
+                match islands.object_for(install, assets, &self.island, &path) {
+                    Some(Ok(o)) => {
+                        self.choose_object(anno_core::island::objects::Template::of_record(o), None)
+                    }
+                    Some(Err(e)) => self.say(format!("{e:#}"), true),
+                    None => self.say("This game places no models on its islands", true),
+                }
+                return;
+            }
+            // Its prop files are spelled with forward slashes.
+            path = path.replace('\\', "/");
+            // A kind new to the island saves as a copy of a shipped record
+            // of its asset, which the island keeps for its save.
+            if !self.island.doc.meshes.contains(&path) {
+                match islands.object_for(install, assets, &self.island, &path) {
+                    Some(Ok(o)) => keep_foreign(&mut self.island, &o),
+                    Some(Err(e)) => return self.say(format!("{e:#}"), true),
+                    None => {}
+                }
+            }
+        }
+        let index = self.island.doc.mesh_index(&path);
         self.place = Some(index);
         self.place_object = None;
         self.tool = Tool::Place;
@@ -3266,7 +5119,7 @@ impl IslandEditor {
     /// Places copies of a shipped object record with the Place tool.
     pub fn choose_object(
         &mut self,
-        template: anno_formats::objects::Template,
+        template: anno_core::island::objects::Template,
         config: Option<String>,
     ) {
         self.place_object = Some((template, config));
@@ -3307,11 +5160,26 @@ impl IslandEditor {
 
     /// The tools need shipped records to copy; the editor loads them.
     pub fn needs_harbour_library(&self) -> bool {
-        self.harbour.is_none() && matches!(self.tool, Tool::Harbour | Tool::Slot | Tool::River)
+        // An island whose game lays its own harbours needs no coast pieces.
+        let lays_own = self.tool == Tool::Harbour && self.island.saves_through_codec();
+        self.island.harbour.is_none()
+            && !lays_own
+            && matches!(self.tool, Tool::Harbour | Tool::Slot | Tool::River)
     }
 
     /// Says why a tool has no shipped records yet. A failed load is not
     /// retried, so it must not read as "still loading" forever.
+    /// Says why a harbour or slot was not placed; `no_record` when the
+    /// province ships none of the piece.
+    fn say_unplaced(&mut self, why: anno_core::island::Unplaced, what: &str, no_record: &str) {
+        use anno_core::island::Unplaced;
+        match why {
+            Unplaced::NoRecords => self.say_no_records(what),
+            Unplaced::NoRecord => self.say(no_record, true),
+            Unplaced::NoObjectAreas => self.say("This island has no object areas", true),
+        }
+    }
+
     fn say_no_records(&mut self, what: &str) {
         if self.harbour_failed {
             self.say(
@@ -3330,7 +5198,7 @@ impl IslandEditor {
     fn harbour_at(&mut self, at: Vec3, remove: bool) {
         let coasts = self.coast_guids();
         if remove {
-            let near = self.doc.objects.iter().position(|o| {
+            let near = self.island.doc.objects.iter().position(|o| {
                 coasts.contains(&o.guid)
                     && o.path.as_deref().is_some_and(|pts| {
                         pts.iter()
@@ -3341,16 +5209,16 @@ impl IslandEditor {
                 return self.say("No harbour spot there", true);
             };
             self.checkpoint();
-            let gone = Arc::make_mut(&mut self.doc.objects).remove(i);
+            let gone = Arc::make_mut(&mut self.island.doc.objects).remove(i);
             self.selection.remove(&Item::Object(gone.id));
-            self.coast_point = None;
+            self.curve_point = None;
             self.refresh_areas();
             return self.say("Harbour spot removed", false);
         }
-        let Some(curve) = harbour::trace_coast(&self.doc.field, [at[0], at[2]]) else {
+        let Some(curve) = harbour::trace_coast(&self.island.doc.field, [at[0], at[2]]) else {
             return self.say("Click closer to the shore: no coast within 24 m", true);
         };
-        let before = self.doc.clone();
+        let before = self.island.doc.clone();
         if self.push_harbour(curve) {
             self.checkpoint_owned(before);
         }
@@ -3358,44 +5226,25 @@ impl IslandEditor {
 
     /// Adds a harbour (or the start coast) along `curve`, without an undo
     /// step of its own. False when nothing was added.
-    fn push_harbour(&mut self, curve: Vec<anno_formats::objects::PathPoint>) -> bool {
-        let Some(lib) = self.harbour.clone() else {
-            self.say_no_records("Harbour");
-            return false;
-        };
-        let piece = if self.start_coast {
-            harbour::Piece::StartCoast
-        } else {
-            harbour::Piece::Coast
-        };
-        let Some(guid) = lib.guid(piece) else {
-            self.say("This province ships no start coast to copy", true);
-            return false;
-        };
-        let Some(store) = &mut self.object_store else {
-            self.say("This island has no object areas", true);
-            return false;
-        };
-        store.objects.clone_from(&self.doc.objects);
-        let areas = self.doc.grids.as_ref().and_then(|g| g.layer(Kind::AreaIds));
-        let Some(mut o) = lib.place(store, piece, areas, curve[0].p) else {
-            return false;
-        };
-        o.area = harbour::CONSTRUCTION as u16;
-        let length = curve_length(&curve);
-        o.path = Some(curve);
-        // One start coast per island.
-        if piece == harbour::Piece::StartCoast {
-            Arc::make_mut(&mut self.doc.objects).retain(|x| x.guid != guid);
+    fn push_harbour(&mut self, curve: Vec<anno_core::island::objects::PathPoint>) -> bool {
+        if self.island.saves_through_codec() {
+            return self.lay_harbour(&curve);
         }
-        let id = o.id;
-        Arc::make_mut(&mut self.doc.objects).push(o);
+        let length = curve_length(&curve);
+        let id = match self.island.add_harbour(curve) {
+            Ok(id) => id,
+            Err(why) => {
+                self.say_unplaced(why, "Harbour", "This province ships no start coast to copy");
+                return false;
+            }
+        };
         self.refresh_areas();
         self.selection = BTreeSet::from([Item::Object(id)]);
-        self.coast_point = None;
+        self.curve_point = None;
         self.scene_stale = true;
         let coasts = self.coast_guids();
         let count = self
+            .island
             .doc
             .objects
             .iter()
@@ -3410,6 +5259,40 @@ impl IslandEditor {
         true
     }
 
+    /// The Harbour tool on an island whose game lays its harbours as
+    /// objects by its own rules (2070's 1 m tiles): the tiles along
+    /// `curve`'s shore, selected. The caller makes the undo step.
+    fn lay_harbour(&mut self, curve: &[anno_core::island::objects::PathPoint]) -> bool {
+        let coast: Vec<[f32; 2]> = curve.iter().map(|p| [p.p[0], p.p[2]]).collect();
+        let codec = self.module.islands().and_then(|i| i.codec().own());
+        let (Some(codec), Some(install)) = (codec, &self.install) else {
+            self.say("The install is still loading", true);
+            return false;
+        };
+        match codec.harbour_along(install, &self.island, &coast) {
+            Some(Ok(tiles)) if !tiles.is_empty() => {
+                let count = tiles.len();
+                self.selection = tiles.iter().map(|o| Item::Object(o.id)).collect();
+                Arc::make_mut(&mut self.island.doc.objects).extend(tiles);
+                self.scene_stale = true;
+                self.say(format!("Harbour laid: {count} tiles of 1 m"), false);
+                true
+            }
+            Some(Ok(_)) => {
+                self.say("No water along that shore for a harbour to face", true);
+                false
+            }
+            Some(Err(e)) => {
+                self.say(format!("{e:#}"), true);
+                false
+            }
+            None => {
+                self.say("This game lays no harbours", true);
+                false
+            }
+        }
+    }
+
     /// Press with the Harbour tool: pick a point handle, select a harbour or
     /// add a point to it, start drawing one, or start a region.
     fn harbour_press(&mut self, view: usize, event: &MouseDownEvent, at: Vec3) -> Option<Drag> {
@@ -3418,20 +5301,20 @@ impl IslandEditor {
             return None;
         }
         if self.auto_region {
-            return Some(Drag::Region { from: at, to: at });
+            return Some(self.region_drag(at));
         }
-        if let Some((id, index)) = self.coast_handle_at(view, event.position) {
-            self.coast_point = Some((id, index));
+        if let Some((id, index)) = self.curve_handle_at(view, event.position) {
+            self.curve_point = Some((id, index));
             self.selection = BTreeSet::from([Item::Object(id)]);
             return Some(Drag::CoastPoint {
                 id,
                 index,
-                before: Box::new(self.doc.clone()),
+                before: Box::new(self.island.doc.clone()),
                 changed: false,
             });
         }
-        self.coast_point = None;
-        if let Some((id, segment)) = self.coast_segment_at(view, event.position) {
+        self.curve_point = None;
+        if let Some((id, segment)) = self.curve_segment_at(view, event.position) {
             // A click on a harbour selects it; a double click adds a point.
             self.selection = BTreeSet::from([Item::Object(id)]);
             if event.click_count >= 2 {
@@ -3447,11 +5330,19 @@ impl IslandEditor {
     }
 
     /// Screen positions of every harbour curve point: object, index, point.
-    pub(super) fn coast_handles(&self, view: usize) -> Vec<(u64, usize, Point<Pixels>)> {
+    /// With the Slot tool, the points of the path being edited instead.
+    pub(super) fn curve_handles(&self, view: usize) -> Vec<(u64, usize, Point<Pixels>)> {
         let v = &self.views[view];
         let extent = self.extent();
+        if self.tool == Tool::Slot {
+            return match self.road_editing() {
+                Some(e) => self.road_handles(view, Some(e.work)),
+                None => Vec::new(),
+            };
+        }
         let coasts = self.coast_guids();
-        self.doc
+        self.island
+            .doc
             .objects
             .iter()
             .filter(|o| coasts.contains(&o.guid))
@@ -3465,10 +5356,10 @@ impl IslandEditor {
             .collect()
     }
 
-    fn coast_handle_at(&self, view: usize, at: Point<Pixels>) -> Option<(u64, usize)> {
+    fn curve_handle_at(&self, view: usize, at: Point<Pixels>) -> Option<(u64, usize)> {
         // Handles are drawn 6 px across; give the cursor a little more.
         const HIT: f32 = 9.;
-        self.coast_handles(view)
+        self.curve_handles(view)
             .into_iter()
             .map(|(id, i, p)| (id, i, f32::from(p.x - at.x).hypot(f32::from(p.y - at.y))))
             .filter(|&(.., d)| d < HIT)
@@ -3478,34 +5369,60 @@ impl IslandEditor {
 
     /// The harbour segment under the cursor: object, and the index of the
     /// segment's first point.
-    fn coast_segment_at(&self, view: usize, at: Point<Pixels>) -> Option<(u64, usize)> {
-        const HIT: f32 = 8.;
-        let handles = self.coast_handles(view);
-        let (px, py) = (f32::from(at.x), f32::from(at.y));
-        handles
-            .windows(2)
-            .filter(|w| w[0].0 == w[1].0)
-            .filter_map(|w| {
-                let (ax, ay) = (f32::from(w[0].2.x), f32::from(w[0].2.y));
-                let (bx, by) = (f32::from(w[1].2.x), f32::from(w[1].2.y));
-                let (dx, dy) = (bx - ax, by - ay);
-                let l2 = dx * dx + dy * dy;
-                let t = if l2 > 0. {
-                    (((px - ax) * dx + (py - ay) * dy) / l2).clamp(0., 1.)
-                } else {
-                    0.
-                };
-                let d = (px - ax - t * dx).hypot(py - ay - t * dy);
-                (d < HIT).then_some((w[0].0, w[0].1, d))
-            })
-            .min_by(|a, b| a.2.total_cmp(&b.2))
-            .map(|(id, i, _)| (id, i))
+    fn curve_segment_at(&self, view: usize, at: Point<Pixels>) -> Option<(u64, usize)> {
+        segment_at(&self.curve_handles(view), at)
     }
 
+    /// Screen positions of the points of every work area's path, or of
+    /// `only`'s: object, index, point.
+    fn road_handles(&self, view: usize, only: Option<u64>) -> Vec<(u64, usize, Point<Pixels>)> {
+        let v = &self.views[view];
+        let extent = self.extent();
+        let Some(assets) = self.assets.as_deref() else {
+            return Vec::new();
+        };
+        (self.island.doc.objects.iter())
+            .filter(|o| only.is_none_or(|id| o.id == id) && o.path.is_some())
+            .filter(|o| harbour::link_end(assets, o.guid) == Some(harbour::LinkEnd::WorkArea))
+            .flat_map(|o| {
+                (o.path.iter().flatten())
+                    .enumerate()
+                    .map(move |(i, p)| (o.id, i, v.camera.project(p.p, v.bounds, extent)))
+            })
+            .collect()
+    }
+}
+
+/// The segment of `handles` (object, index, screen point, in path order)
+/// under the cursor: object, and the index of the segment's first point.
+fn segment_at(handles: &[(u64, usize, Point<Pixels>)], at: Point<Pixels>) -> Option<(u64, usize)> {
+    const HIT: f32 = 8.;
+    let (px, py) = (f32::from(at.x), f32::from(at.y));
+    handles
+        .windows(2)
+        .filter(|w| w[0].0 == w[1].0)
+        .filter_map(|w| {
+            let (ax, ay) = (f32::from(w[0].2.x), f32::from(w[0].2.y));
+            let (bx, by) = (f32::from(w[1].2.x), f32::from(w[1].2.y));
+            let (dx, dy) = (bx - ax, by - ay);
+            let l2 = dx * dx + dy * dy;
+            let t = if l2 > 0. {
+                (((px - ax) * dx + (py - ay) * dy) / l2).clamp(0., 1.)
+            } else {
+                0.
+            };
+            let d = (px - ax - t * dx).hypot(py - ay - t * dy);
+            (d < HIT).then_some((w[0].0, w[0].1, d))
+        })
+        .min_by(|a, b| a.2.total_cmp(&b.2))
+        .map(|(id, i, _)| (id, i))
+}
+
+impl IslandEditor {
     /// Rewrites one harbour's points through `f` on their ground positions,
     /// keeping heights on the waterline and `d` toward the sea.
     fn edit_coast(&mut self, id: u64, f: impl FnOnce(&mut Vec<[f32; 2]>)) {
-        let Some(o) = Arc::make_mut(&mut self.doc.objects)
+        let Some(o) = Arc::make_mut(&mut self.island.doc.objects)
             .iter_mut()
             .find(|o| o.id == id)
         else {
@@ -3514,28 +5431,29 @@ impl IslandEditor {
         let Some(path) = &o.path else { return };
         let mut ground: Vec<[f32; 2]> = path.iter().map(|p| [p.p[0], p.p[2]]).collect();
         f(&mut ground);
-        let curve = harbour::with_directions(&self.doc.field, &ground);
+        let curve = harbour::with_directions(&self.island.doc.field, &ground);
         o.position = curve[0].p;
         o.path = Some(curve);
         self.scene_stale = true;
     }
 
     fn insert_coast_point(&mut self, id: u64, segment: usize, at: Vec3) {
-        let Some(p) = harbour::snap_to_shore(&self.doc.field, [at[0], at[2]]) else {
+        let Some(p) = harbour::snap_to_shore(&self.island.doc.field, [at[0], at[2]]) else {
             return self.say("No shore there to add a point on", true);
         };
         self.checkpoint();
         self.edit_coast(id, |pts| pts.insert(segment + 1, p));
-        self.coast_point = Some((id, segment + 1));
+        self.curve_point = Some((id, segment + 1));
         self.refresh_areas();
         self.say("Point added; drag it along the shore", false);
     }
 
     fn remove_coast_point(&mut self) {
-        let Some((id, index)) = self.coast_point else {
+        let Some((id, index)) = self.curve_point else {
             return;
         };
         let len = self
+            .island
             .doc
             .objects
             .iter()
@@ -3553,7 +5471,7 @@ impl IslandEditor {
         self.edit_coast(id, |pts| {
             pts.remove(index.min(pts.len() - 1));
         });
-        self.coast_point = None;
+        self.curve_point = None;
         self.refresh_areas();
     }
 
@@ -3563,7 +5481,7 @@ impl IslandEditor {
         let coasts = self.coast_guids();
         let selection = self.selection.clone();
         self.checkpoint();
-        for o in Arc::make_mut(&mut self.doc.objects)
+        for o in Arc::make_mut(&mut self.island.doc.objects)
             .iter_mut()
             .filter(|o| coasts.contains(&o.guid) && selection.contains(&Item::Object(o.id)))
         {
@@ -3579,8 +5497,8 @@ impl IslandEditor {
         if self.overlay() != Some(Kind::AreaIds) {
             return None;
         }
-        let layer = self.doc.grids.as_ref()?.layer(Kind::AreaIds)?;
-        let h = |x: f32, z: f32| self.doc.field.height([x, z]);
+        let layer = self.island.doc.grids.as_ref()?.layer(Kind::AreaIds)?;
+        let h = |x: f32, z: f32| self.island.doc.field.height([x, z]);
         let (dx, dz) = (
             (h(at[0] + 1., at[2]) - h(at[0] - 1., at[2])) / 2.,
             (h(at[0], at[2] + 1.) - h(at[0], at[2] - 1.)) / 2.,
@@ -3598,29 +5516,40 @@ impl IslandEditor {
     /// Whether any selected item is a harbour.
     pub fn harbour_selected(&self) -> bool {
         let coasts = self.coast_guids();
-        self.doc
+        self.island
+            .doc
             .objects
             .iter()
             .any(|o| coasts.contains(&o.guid) && self.selection.contains(&Item::Object(o.id)))
+    }
+
+    /// The region drag a press starts in auto mode.
+    fn region_drag(&self, at: Vec3) -> Drag {
+        Drag::Region {
+            from: at,
+            to: at,
+            lasso: self.auto_lasso.then(|| vec![[at[0], at[2]]]),
+        }
     }
 
     /// Auto placement in a dragged region, for the active tool; one undo
     /// step.
     fn auto_place(&mut self, region: harbour::Region) {
         let count = self.auto_count as usize;
-        let before = self.doc.clone();
+        let before = self.island.doc.clone();
         let placed = if self.tool == Tool::Harbour {
             let coasts = self.coast_guids();
-            let existing: Vec<Vec<anno_formats::objects::PathPoint>> = self
+            let existing: Vec<Vec<anno_core::island::objects::PathPoint>> = self
+                .island
                 .doc
                 .objects
                 .iter()
                 .filter(|o| coasts.contains(&o.guid))
                 .filter_map(|o| o.path.clone())
                 .collect();
-            let refs: Vec<&[anno_formats::objects::PathPoint]> =
+            let refs: Vec<&[anno_core::island::objects::PathPoint]> =
                 existing.iter().map(Vec::as_slice).collect();
-            let curves = harbour::auto_harbours(&self.doc.field, region, &refs, count);
+            let curves = harbour::auto_harbours(&self.island.doc.field, &region, &refs, count);
             if curves.is_empty() {
                 return self.say(
                     "No room for a harbour there: it needs shore with water 2 m deep in front, 70 m from other harbours",
@@ -3632,37 +5561,49 @@ impl IslandEditor {
                 .filter(|c| self.push_harbour(c.clone()))
                 .count()
         } else {
-            let Some(lib) = self.harbour.clone() else {
+            let Some(lib) = self.island.harbour.clone() else {
                 return self.say_no_records("Slot");
             };
-            let Some(slot_guid) = lib.guid(self.resource.pieces(self.fixed_slots).0) else {
+            let Some(slot_guid) = lib.guid(self.island.resource.pieces(self.island.fixed_slots).0)
+            else {
                 return self.say("This province ships no slot of that kind", true);
             };
+            // Random and fixed slots of the kind alike: a new random mine
+            // on a shipped fixed one would be two mines on one spot.
             let existing: Vec<[f32; 2]> = self
+                .island
                 .doc
                 .objects
                 .iter()
-                .filter(|o| o.guid == slot_guid)
+                .filter(|o| {
+                    o.guid == slot_guid || lib.resource_of(o.guid) == Some(self.island.resource)
+                })
                 .map(|o| [o.position[0], o.position[2]])
                 .collect();
-            let river = self.doc.grids.as_ref().and_then(|g| g.layer(Kind::River));
+            let river = self
+                .island
+                .doc
+                .grids
+                .as_ref()
+                .and_then(|g| g.layer(Kind::River));
             let environment = self
+                .island
                 .doc
                 .grids
                 .as_ref()
                 .and_then(|g| g.layer(Kind::Environment));
             let spots = harbour::auto_slots(
-                &self.doc.field,
+                &self.island.doc.field,
                 river,
                 environment,
-                region,
-                self.resource,
+                &region,
+                self.island.resource,
                 &existing,
                 count,
             );
             if spots.is_empty() {
                 return self.say(
-                    match self.resource {
+                    match self.island.resource {
                         harbour::Resource::Mine => {
                             "No room for a mine there: it needs land 8 m from the sea, 30 m from other mines"
                         }
@@ -3697,17 +5638,22 @@ impl IslandEditor {
     fn replace_generated(
         &mut self,
         guids: &[u32],
-        placed: Vec<(&anno_formats::objects::Template, [f32; 3], u32)>,
+        placed: Vec<(&anno_core::island::objects::Template, [f32; 3], u32)>,
     ) -> usize {
-        let Some(store) = &mut self.object_store else {
+        let Some(store) = &mut self.island.object_store else {
             self.say("This island has no object areas", true);
             return 0;
         };
-        let before = self.doc.clone();
-        Arc::make_mut(&mut self.doc.objects)
+        let before = self.island.doc.clone();
+        Arc::make_mut(&mut self.island.doc.objects)
             .retain(|o| !(guids.contains(&o.guid) && is_generated(o.id)));
-        store.objects.clone_from(&self.doc.objects);
-        let areas = self.doc.grids.as_ref().and_then(|g| g.layer(Kind::AreaIds));
+        store.objects.clone_from(&self.island.doc.objects);
+        let areas = self
+            .island
+            .doc
+            .grids
+            .as_ref()
+            .and_then(|g| g.layer(Kind::AreaIds));
         let mut low = store
             .objects
             .iter()
@@ -3732,11 +5678,11 @@ impl IslandEditor {
             o.scale = [1.; 3];
             o.direction = 0.;
             o.rotation = objects::yaw_rotation(0.);
-            Arc::make_mut(&mut self.doc.objects).push(o);
+            Arc::make_mut(&mut self.island.doc.objects).push(o);
         }
-        let doc = &self.doc;
+        let doc = &self.island.doc;
         self.selection.retain(|&item| doc.matrix(item).is_some());
-        if self.doc.objects != before.objects {
+        if self.island.doc.objects != before.objects {
             self.checkpoint_owned(before);
         }
         self.scene_stale = true;
@@ -3746,13 +5692,15 @@ impl IslandEditor {
     /// Sound spots and build blockers for the overlay: position, blocker
     /// side in metres (0 for a spot), and whether the editor generated it.
     pub(super) fn spot_marks(&self) -> Vec<([f32; 3], f32, bool)> {
-        self.doc
+        self.island
+            .doc
             .objects
             .iter()
             .filter_map(|o| {
-                let side = if o.guid == blockers::BLOCKER {
+                let blocker = self.rules().build_blocker;
+                let side = if blocker != 0 && o.guid == blocker {
                     *blockers::SIZES.get(o.variation as usize)? as f32
-                } else if sound::guids(self.game).contains(&o.guid)
+                } else if sound::guids(self.rules()).contains(&o.guid)
                     || self
                         .assets
                         .as_ref()
@@ -3771,21 +5719,15 @@ impl IslandEditor {
     /// whether it is a problem.
     pub fn harbour_report(&self) -> Vec<(String, bool)> {
         let coasts = self.coast_guids();
-        let name = |g: u32| {
-            self.assets
-                .as_ref()
-                .and_then(|a| a.get(g))
-                .map_or(String::new(), |a| a.name.clone())
-        };
         let curves: Vec<_> = self
+            .island
             .doc
             .objects
             .iter()
             .filter(|o| coasts.contains(&o.guid))
             .collect();
-        let starts = curves
-            .iter()
-            .filter(|o| name(o.guid).contains("StartCoast"))
+        let starts = (curves.iter())
+            .filter(|o| self.piece(o.guid) == Some(Piece::StartCoast))
             .count();
         let harbours = curves.len() - starts;
         let mut out = vec![if harbours == 0 {
@@ -3796,7 +5738,7 @@ impl IslandEditor {
         } else {
             (format!("{harbours} harbour spot(s)"), false)
         }];
-        if self.listing.is_start() {
+        if self.listing.is_start(self.rules()) {
             out.push(if starts == 0 {
                 (
                     "No start coast: a start island needs one (Harbour tool → Start coast)".into(),
@@ -3817,6 +5759,7 @@ impl IslandEditor {
             ));
         }
         let slots: Vec<u64> = self
+            .island
             .doc
             .objects
             .iter()
@@ -3840,7 +5783,10 @@ impl IslandEditor {
     /// Whether `guid` is a resource slot (mine, river or marsh, random or
     /// fixed), from the library or assets.xml.
     pub(super) fn is_slot(&self, guid: u32) -> bool {
-        self.harbour.as_ref().is_some_and(|l| l.is_slot(guid))
+        self.island
+            .harbour
+            .as_ref()
+            .is_some_and(|l| l.is_slot(guid))
             || self.assets.as_ref().is_some_and(|a| {
                 matches!(
                     harbour::template_of(a, guid).as_str(),
@@ -3854,38 +5800,51 @@ impl IslandEditor {
         let [Item::Object(id)] = self.selection.iter().copied().collect::<Vec<_>>()[..] else {
             return None;
         };
-        let o = self.doc.objects.iter().find(|o| o.id == id)?;
-        if self.game.profile().slots == anno_formats::game::ResourceSlots::Random {
+        let o = self.island.doc.objects.iter().find(|o| o.id == id)?;
+        let slots = self.rules().slots;
+        if slots == anno_core::game::ResourceSlots::None {
+            return None;
+        }
+        if slots == anno_core::game::ResourceSlots::Random {
             let asset = self.assets.as_ref()?.get(o.guid)?;
             if asset.template != "Slot" || asset.slot_type.as_deref() != Some("Random") {
                 return None;
             }
-            let kind = if let Some(kind) = self
-                .harbour
-                .as_ref()
+            // The library's records, else the piece the game names it; a
+            // random slot of no resource it names is a mine.
+            let kind = (self.island.harbour.as_ref())
                 .and_then(|lib| lib.resource_of(o.guid))
-            {
-                kind
-            } else if asset.slot_type.as_deref() == Some("River")
-                || asset.name.to_ascii_lowercase().contains("river")
-            {
-                harbour::Resource::River
-            } else if asset.slot_type.as_deref() == Some("Clay") || asset.name.contains("clay") {
-                harbour::Resource::Clay
-            } else if asset.slot_type.as_deref() == Some("Oil") || asset.name.contains("oil pump") {
-                harbour::Resource::Oil
-            } else if asset.slot_type.as_deref() == Some("Gas") || asset.name.contains("gas arctic")
-            {
-                harbour::Resource::Gas
-            } else {
-                harbour::Resource::Mine
-            };
+                .or_else(|| self.piece(o.guid).and_then(harbour::Resource::of_slot))
+                .unwrap_or(harbour::Resource::Mine);
             return Some((id, kind));
         }
-        Some((id, self.harbour.as_ref()?.resource_of(o.guid)?))
+        Some((id, self.island.harbour.as_ref()?.resource_of(o.guid)?))
     }
 
     /// Gives the selected slot a deposit for the test map, or clears it.
+    /// Sets `AdaptTerrainHeight` on every selected prop: whether it keeps
+    /// its height above the ground through sculpting and moves, and may
+    /// bend to the ground where its model asks to.
+    pub fn set_follows_terrain(&mut self, on: bool) {
+        let ids: Vec<u64> = (self.selection.iter())
+            .filter_map(|i| match i {
+                Item::Prop(id) => Some(*id),
+                _ => None,
+            })
+            .collect();
+        if ids.is_empty() {
+            return;
+        }
+        self.checkpoint();
+        for id in ids {
+            if let Some(p) = self.island.doc.prop_mut(id) {
+                p.source.adapt_terrain_height = on.then_some(1);
+            }
+        }
+        // Rows carry whether they may bend.
+        self.scene_stale = true;
+    }
+
     pub fn set_slot_resource(&mut self, deposit: Option<u32>) {
         let Some((id, _)) = self.selected_slot() else {
             return;
@@ -3898,62 +5857,96 @@ impl IslandEditor {
                 l.slot_resources.remove(&id);
             }
         });
+        // The resource picks the building, and so the model along its
+        // work areas' paths.
+        self.rails_stale = true;
+        self.markers_stale = true;
     }
 
-    /// Slots with a test-map deposit: position and deposit name.
-    pub(super) fn slot_labels(&self) -> Vec<([f32; 3], String)> {
-        let Some(assets) = &self.assets else {
+    /// Every resource slot, for the markers the slot tool keeps over them:
+    /// its kind, any test-map deposit, and whether it is the kind being
+    /// placed.
+    pub(super) fn slot_marks(&self) -> Vec<SlotMark> {
+        let Some(lib) = &self.island.harbour else {
             return Vec::new();
         };
-        self.doc
+        self.island
+            .doc
             .objects
             .iter()
             .filter_map(|o| {
-                let g = self.listing.slot_resources.get(&o.id)?;
-                Some((o.position, fertility::label(assets, *g)))
+                let resource = lib.resource_of(o.guid)?;
+                let fixed = lib.guid(resource.pieces(true).0) == Some(o.guid)
+                    && lib.guid(resource.pieces(false).0) != Some(o.guid);
+                let name = (harbour::Resource::ALL.iter())
+                    .find(|(r, _)| *r == resource)
+                    .map_or("Slot", |(_, n)| n);
+                let mut label = name.to_owned();
+                if let (Some(assets), Some(g)) =
+                    (&self.assets, self.listing.slot_resources.get(&o.id))
+                {
+                    label = format!("{label} · {}", fertility::label(assets, *g));
+                }
+                Some(SlotMark {
+                    at: o.position,
+                    label,
+                    resource,
+                    fixed,
+                    yaw: o.direction,
+                    current: resource == self.island.resource,
+                })
             })
             .collect()
     }
 
-    /// Places a slot and its work area at `at`, or removes the ones there.
+    /// Places a slot and its work areas at `at`, or removes the ones there.
     fn slot_at(&mut self, at: Vec3, remove: bool) {
-        let Some(lib) = self.harbour.clone() else {
+        let Some(lib) = self.island.harbour.clone() else {
             return self.say_no_records("Slot");
         };
         // Removal takes random and fixed slots of the resource alike.
-        let ((slot, area), (fixed, _)) = (self.resource.pieces(false), self.resource.pieces(true));
-        let guids: Vec<u32> = [Some(slot), Some(fixed), area]
-            .iter()
-            .flatten()
+        let ((slot, work), (fixed, _)) = (
+            self.island.resource.pieces(false),
+            self.island.resource.pieces(true),
+        );
+        let guids: Vec<u32> = ([slot, fixed].iter().chain(work))
             .filter_map(|&p| lib.guid(p))
             .collect();
         // A click on a slot selects it, for the resource picker, instead of
         // stacking a second one there.
         if !remove
-            && let Some(o) = self.doc.objects.iter().find(|o| {
+            && let Some(o) = self.island.doc.objects.iter().find(|o| {
                 lib.is_slot(o.guid) && (o.position[0] - at[0]).hypot(o.position[2] - at[2]) < 4.
             })
         {
             self.selection = BTreeSet::from([Item::Object(o.id)]);
-            return self.say("Slot selected; pick its test-map resource above", false);
+            return self.say(
+                "Slot selected; pick its test-map resource above. Ctrl-click adds a work area",
+                false,
+            );
         }
         if remove {
-            let before = self.doc.objects.len();
-            let snapshot = self.doc.clone();
-            Arc::make_mut(&mut self.doc.objects).retain(|o| {
-                !(guids.contains(&o.guid)
-                    && (o.position[0] - at[0]).hypot(o.position[2] - at[2]) < 6.)
-            });
-            if self.doc.objects.len() == before {
+            let mut gone: BTreeSet<Item> = (self.island.doc.objects.iter())
+                .filter(|o| {
+                    guids.contains(&o.guid)
+                        && (o.position[0] - at[0]).hypot(o.position[2] - at[2]) < 6.
+                })
+                .map(|o| Item::Object(o.id))
+                .collect();
+            if gone.is_empty() {
                 return self.say("No slot of that kind there", true);
             }
-            let doc = &self.doc;
+            gone.extend(self.served_work_areas(&gone));
+            let snapshot = self.island.doc.clone();
+            Arc::make_mut(&mut self.island.doc.objects)
+                .retain(|o| !gone.contains(&Item::Object(o.id)));
+            let doc = &self.island.doc;
             self.selection.retain(|&item| doc.matrix(item).is_some());
             self.checkpoint_owned(snapshot);
             self.scene_stale = true;
             return self.say("Slot removed", false);
         }
-        let before = self.doc.clone();
+        let before = self.island.doc.clone();
         if self.push_slot(at) {
             self.checkpoint_owned(before);
             self.say(
@@ -3963,62 +5956,710 @@ impl IslandEditor {
         }
     }
 
-    /// Adds a slot of the chosen resource and its work area at `at`,
+    /// Adds a slot of the chosen resource and its work areas at `at`,
     /// without an undo step of its own. False when nothing was added.
     fn push_slot(&mut self, at: Vec3) -> bool {
-        let Some(lib) = self.harbour.clone() else {
-            self.say_no_records("Slot");
+        let islands = self.module.islands().expect("island workspace");
+        // Turned the way shipped slots of the kind face: into the mountain,
+        // with the river alongside, towards the sea.
+        let river = (self.island.doc.grids.as_ref()).and_then(|g| g.layer(Kind::River));
+        let yaw = harbour::slot_yaw(
+            &self.island.doc.field,
+            river,
+            self.island.resource,
+            [at[0], at[2]],
+            islands.rules().slot_yaw_step,
+        );
+        let Some(harbours) = islands.harbours() else {
+            self.say("This game lays no slots", true);
             return false;
         };
-        let (slot, area) = self
-            .resource
-            .pieces(self.fixed_slots && self.resource.has_fixed());
-        let Some(store) = &mut self.object_store else {
-            self.say("This island has no object areas", true);
-            return false;
+        let id = match self.island.add_slot(at, yaw, harbours) {
+            Ok(id) => id,
+            Err(why) => {
+                self.say_unplaced(why, "Slot", "This province ships no slot of that kind");
+                return false;
+            }
         };
-        store.objects.clone_from(&self.doc.objects);
-        let areas = self.doc.grids.as_ref().and_then(|g| g.layer(Kind::AreaIds));
-        let Some(s) = lib.place(store, slot, areas, at) else {
-            self.say("This province ships no slot of that kind", true);
-            return false;
-        };
-        // The work area's ID must not collide with the slot's.
-        store.objects.push(s.clone());
-        let work = harbour::work_area_position(&self.doc.field, at);
-        let w = area
-            .and_then(|area| lib.place(store, area, areas, work))
-            .map(|mut w| {
-                harbour::link_work_area(&mut w, at);
-                w
-            });
-        store.objects.pop();
-        let id = s.id;
-        Arc::make_mut(&mut self.doc.objects).push(s);
-        Arc::make_mut(&mut self.doc.objects).extend(w);
         self.selection = BTreeSet::from([Item::Object(id)]);
         self.scene_stale = true;
         true
     }
 
+    /// The selected slots (the Slot tool's subject): id, GUID, position,
+    /// yaw.
+    fn selected_slots(&self) -> Vec<(u64, u32, Vec3, f32)> {
+        let Some(assets) = self.assets.as_deref() else {
+            return Vec::new();
+        };
+        (self.island.doc.objects.iter())
+            .filter(|o| self.selection.contains(&Item::Object(o.id)))
+            .filter(|o| harbour::link_end(assets, o.guid) == Some(harbour::LinkEnd::Slot))
+            .map(|o| (o.id, o.guid, o.position, o.direction))
+            .collect()
+    }
+
+    /// The Inspector's path preview: for the selected slot, or the slot a
+    /// selected work area serves.
+    pub(super) fn path_preview(&self) -> Option<PathPreview> {
+        let assets = self.assets.as_deref()?;
+        let [Item::Object(id)] = self.selection.iter().copied().collect::<Vec<_>>()[..] else {
+            return None;
+        };
+        let o = self.island.doc.objects.iter().find(|o| o.id == id)?;
+        let slot = match harbour::link_end(assets, o.guid)? {
+            harbour::LinkEnd::Slot => id,
+            harbour::LinkEnd::WorkArea => {
+                (self.slot_links([Item::Object(id)]).into_iter())
+                    .find(|l| l.work == id)?
+                    .slot
+            }
+        };
+        let guid = self.island.doc.objects.iter().find(|o| o.id == slot)?.guid;
+        // Only buildings that lay something on one of the slot's work areas
+        // are worth a choice.
+        let works: Vec<u32> = (self.slot_links([Item::Object(slot)]).into_iter())
+            .filter(|l| l.slot == slot)
+            .filter_map(|l| {
+                self.island
+                    .doc
+                    .objects
+                    .iter()
+                    .find(|o| o.id == l.work)
+                    .map(|o| o.guid)
+            })
+            .collect();
+        // Scenario copies of a mine share its name and models: one choice.
+        let mut seen: Vec<(String, Vec<Option<&str>>)> = Vec::new();
+        let candidates = assets.slot_buildings(guid, &self.asset_region(), None);
+        let buildings: Vec<(u32, String)> = (candidates.into_iter())
+            .filter_map(|b| {
+                let lays: Vec<Option<&str>> = (works.iter())
+                    .map(|&w| assets.building_work_area_path(b.guid, w))
+                    .collect();
+                let name = b.text.clone().unwrap_or_else(|| b.name.clone());
+                let key = (name.clone(), lays);
+                if key.1.iter().all(Option::is_none) || seen.contains(&key) {
+                    return None;
+                }
+                seen.push(key);
+                Some((b.guid, name))
+            })
+            .collect();
+        (!buildings.is_empty()).then(|| PathPreview {
+            slot,
+            buildings,
+            current: self.path_previews.get(&slot).copied(),
+        })
+    }
+
+    /// Sets the path preview of `slot`: a building, 0 for none, None for
+    /// Auto.
+    pub fn set_path_preview(&mut self, slot: u64, choice: Option<u32>) {
+        match choice {
+            Some(c) => self.path_previews.insert(slot, c),
+            None => self.path_previews.remove(&slot),
+        };
+        self.rails_stale = true;
+        self.markers_stale = true;
+    }
+
+    /// Work areas whose path carries a model, and the model's cfg: what
+    /// the assets say a building on their slot lays along it
+    /// (`Assets::work_area_path`), narrowed by the slot's test-map resource
+    /// if one is picked ("Empty" lays nothing). With the objects layer on
+    /// and the work area's group shown.
+    fn rail_works(&self) -> Vec<(u64, String)> {
+        let Some(assets) = self.assets.as_deref() else {
+            return Vec::new();
+        };
+        if !self.layers.objects {
+            return Vec::new();
+        }
+        let region = self.asset_region();
+        let objects = &self.island.doc.objects;
+        let guid = |id: u64| objects.iter().find(|o| o.id == id).map(|o| o.guid);
+        harbour::links(objects, |g| harbour::link_end(assets, g), |_| true)
+            .into_iter()
+            .filter_map(|l| {
+                let work = guid(l.work)?;
+                if self.hidden_groups.contains(&Group::Object(work)) {
+                    return None;
+                }
+                let cfg = match self.path_previews.get(&l.slot) {
+                    Some(0) => return None,
+                    Some(&building) => assets.building_work_area_path(building, work)?,
+                    None => {
+                        let resource = self.listing.slot_resources.get(&l.slot).copied();
+                        if resource == Some(0) {
+                            return None;
+                        }
+                        assets.work_area_path(guid(l.slot)?, work, &region, resource)?
+                    }
+                };
+                Some((l.work, cfg.replace('\\', "/")))
+            })
+            .collect()
+    }
+
+    /// Bends each work area's path model along its path where either
+    /// changed. Models load with the island's; until one has, its paths
+    /// show none.
+    fn refresh_rails(&mut self) {
+        let job = self.rails_work();
+        self.rails_built(job());
+    }
+
+    /// The rails due a bend (`rails_wanted`), to bend off the UI thread;
+    /// one bend at a time, the newest request next.
+    pub(crate) fn rails_job(&mut self) -> Option<impl FnOnce() -> RailsBuilt + Send + use<>> {
+        if !self.rails_wanted || self.rails_building {
+            return None;
+        }
+        self.rails_wanted = false;
+        self.rails_building = true;
+        Some(self.rails_work())
+    }
+
+    /// Each work area's path and model, with the template it bends (or
+    /// the pieces to make one from) and the rails drawn now, whose
+    /// unchanged paths keep their meshes.
+    fn rails_work(&self) -> impl FnOnce() -> RailsBuilt + Send + use<> {
+        type Wanted = (
+            u64,
+            String,
+            Vec<anno_core::island::objects::PathPoint>,
+            Option<Arc<rail::Template>>,
+        );
+        let mut wanted: Vec<Wanted> = Vec::new();
+        let mut pieces: HashMap<String, Vec<(Mat4, Arc<Mesh>)>> = HashMap::new();
+        let objects = &self.island.doc.objects;
+        for (id, cfg) in self.rail_works() {
+            let Some(path) = (objects.iter().find(|o| o.id == id)).and_then(|o| o.path.clone())
+            else {
+                continue;
+            };
+            let template = self.rail_templates.get(&cfg).cloned();
+            if template.is_none()
+                && !pieces.contains_key(&cfg)
+                && let Some(loaded) = self.library.models.loaded.get(&cfg)
+            {
+                let loaded = loaded.iter().map(|p| (p.local, p.mesh.clone()));
+                pieces.insert(cfg.clone(), loaded.collect());
+            }
+            wanted.push((id, cfg, path, template));
+        }
+        let mut rails = self.rails.clone();
+        move || {
+            let made: HashMap<String, Arc<rail::Template>> = (pieces.into_iter())
+                .filter_map(|(cfg, pieces)| {
+                    let pieces = pieces.iter().map(|(local, mesh)| (*local, mesh.geometry()));
+                    Some((cfg, Arc::new(rail::Template::new(pieces)?)))
+                })
+                .collect();
+            let paths = wanted.iter().filter_map(|(id, cfg, path, template)| {
+                let template = template.as_ref().or_else(|| made.get(cfg))?;
+                Some((*id, cfg.as_str(), template.as_ref(), path.as_slice()))
+            });
+            rails.update(paths);
+            RailsBuilt {
+                rails,
+                templates: made,
+            }
+        }
+    }
+
+    /// A finished `rails_job`, drawn from the next scene refresh.
+    pub(crate) fn rails_built(&mut self, built: RailsBuilt) {
+        self.rails_building = false;
+        self.rail_templates.extend(built.templates);
+        self.rails = built.rails;
+        self.markers_stale = true;
+    }
+
+    /// Which piece an object of `guid` plays on this game's islands
+    /// (`Islands::piece_of`): a work area's for its road's shape, a slot's
+    /// resource, a start coast.
+    fn piece(&self, guid: u32) -> Option<Piece> {
+        harbour::piece_of(self.module, self.assets.as_deref()?, guid)
+    }
+
+    /// The Slot tool's Road button: lays each selected slot's work areas
+    /// and their roads anew the way shipped islands of this game do, and
+    /// adds the work areas its resource ships but the slot lacks (an 1800
+    /// mine's mountain and cave ones). One undo step.
+    pub fn rebuild_slot_roads(&mut self) {
+        let Some(lib) = self.island.harbour.clone() else {
+            return self.say_no_records("Slot");
+        };
+        let slots = self.selected_slots();
+        if slots.is_empty() {
+            return self.say("Select a mine or river slot first", true);
+        }
+        let before = self.island.doc.clone();
+        let links = self.slot_links(slots.iter().map(|&(id, ..)| Item::Object(id)));
+        let field = self.island.doc.field.clone();
+        let Some(harbours) = self.harbours() else {
+            return self.say("This game lays no work areas", true);
+        };
+        let (mut laid, mut added) = (0, 0);
+        for (id, guid, at, yaw) in slots {
+            let mut kinds = Vec::new();
+            for link in links.iter().filter(|l| l.slot == id) {
+                let Some(w) = (self.island.doc.objects.iter()).find(|o| o.id == link.work) else {
+                    continue;
+                };
+                let kind = self.piece(w.guid);
+                kinds.push(kind);
+                let shape = harbours.road_shape(kind);
+                let objects = Arc::make_mut(&mut self.island.doc.objects);
+                let Some(w) = objects.iter_mut().find(|o| o.id == link.work) else {
+                    continue;
+                };
+                w.position = shape.work_area_position(&field, at, yaw);
+                shape.link(w, &field, at);
+                laid += 1;
+            }
+            // Missing kinds; marsh, clay and oil slots ship none.
+            let missing: Vec<Piece> = (lib.resource_of(guid))
+                .map_or(&[][..], |r| r.pieces(false).1)
+                .iter()
+                .copied()
+                .filter(|p| !kinds.contains(&Some(*p)))
+                .collect();
+            let Some(slot) = (self.island.doc.objects.iter())
+                .find(|o| o.id == id)
+                .cloned()
+            else {
+                continue;
+            };
+            let new = self
+                .island
+                .with_store(|store, areas| {
+                    lib.place_work_areas(store, areas, &field, harbours, &missing, &slot)
+                })
+                .unwrap_or_default();
+            added += new.len();
+            Arc::make_mut(&mut self.island.doc.objects).extend(new);
+        }
+        if laid + added == 0 {
+            self.island.doc = before;
+            return self.say("These slots take no work area", true);
+        }
+        self.checkpoint_owned(before);
+        self.scene_stale = true;
+        let roads = crate::project::plural(laid + added, "road", "roads");
+        match added {
+            0 => self.say(format!("Laid {roads}"), false),
+            n => self.say(format!("Laid {roads}, {n} with a new work area"), false),
+        }
+    }
+
+    /// Ctrl-click with the Slot tool: a work area at `at` for the selected
+    /// slot, of the first kind its resource ships that the slot lacks, else
+    /// a second of its first kind. Shipped 1800 slots serve up to two (one
+    /// serves three); the game reads each path on its own.
+    fn add_work_area(&mut self, at: Vec3) {
+        let Some(lib) = self.island.harbour.clone() else {
+            return self.say_no_records("Slot");
+        };
+        let [(id, guid, slot, _)] = self.selected_slots()[..] else {
+            return self.say(
+                "Select one slot, then Ctrl-click where its work area goes",
+                true,
+            );
+        };
+        let have: Vec<Option<Piece>> = (self.slot_links([Item::Object(id)]).iter())
+            .filter(|l| l.slot == id)
+            .filter_map(|l| (self.island.doc.objects.iter()).find(|o| o.id == l.work))
+            .map(|o| self.piece(o.guid))
+            .collect();
+        let kinds = lib.resource_of(guid).map_or(&[][..], |r| r.pieces(false).1);
+        let kinds: Vec<Piece> = kinds
+            .iter()
+            .copied()
+            .filter(|p| lib.guid(*p).is_some())
+            .collect();
+        let Some(&kind) = (kinds.iter())
+            .find(|p| !have.contains(&Some(**p)))
+            .or(kinds.first())
+        else {
+            return self.say("This slot takes no work area", true);
+        };
+        let Some(harbours) = self.harbours() else {
+            return self.say("This game lays no work areas", true);
+        };
+        let shape = harbours.road_shape(Some(kind));
+        let field = self.island.doc.field.clone();
+        let placed = self
+            .island
+            .with_store(|store, areas| {
+                let mut w = lib.place(
+                    store,
+                    kind,
+                    areas,
+                    [at[0], field.height([at[0], at[2]]), at[2]],
+                )?;
+                shape.link(&mut w, &field, slot);
+                Some(w)
+            })
+            .flatten();
+        let Some(w) = placed else {
+            return self.say("No work area record to place here", true);
+        };
+        self.checkpoint();
+        let wid = w.id;
+        Arc::make_mut(&mut self.island.doc.objects).push(w);
+        self.selection = BTreeSet::from([Item::Object(wid)]);
+        self.scene_stale = true;
+        self.say("Work area added; drag its first point to move it", false);
+    }
+
+    /// Press with the Slot tool. In the path edit mode: pick points
+    /// (Shift adds), add one by double-clicking the path, switch paths by
+    /// double-clicking another, nothing else. Otherwise: add a work area
+    /// (Ctrl), start a region, select a path (double-click edits it), or
+    /// select, place or remove (Shift) a slot.
+    fn slot_press(&mut self, view: usize, event: &MouseDownEvent, at: Vec3) -> Option<Drag> {
+        let shift = event.modifiers.shift;
+        if let Some(edit) = self.road_editing().cloned() {
+            let len = self.road_points(edit.work).len();
+            if let Some((_, index)) = self.curve_handle_at(view, event.position)
+                && index + 1 < len
+            {
+                let picked = &mut self.road_edit.as_mut()?.picked;
+                if !shift {
+                    picked.clear();
+                }
+                if !picked.remove(&index) {
+                    picked.insert(index);
+                }
+                return None;
+            }
+            if event.click_count >= 2
+                && let Some((id, segment)) =
+                    segment_at(&self.road_handles(view, None), event.position)
+            {
+                if id == edit.work {
+                    self.insert_road_point(segment, Some(at));
+                } else {
+                    self.start_road_edit(id);
+                }
+                return None;
+            }
+            if !shift && let Some(e) = &mut self.road_edit {
+                e.picked.clear();
+            }
+            return None;
+        }
+        if event.modifiers.control {
+            self.add_work_area(at);
+            return None;
+        }
+        if self.auto_region && !shift {
+            return Some(self.region_drag(at));
+        }
+        // A click on a slot is for the slot, though its paths end there.
+        let near_slot = (self.island.harbour.as_ref()).is_some_and(|lib| {
+            (self.island.doc.objects.iter()).any(|o| {
+                lib.is_slot(o.guid) && (o.position[0] - at[0]).hypot(o.position[2] - at[2]) < 4.
+            })
+        });
+        if !shift
+            && !near_slot
+            && let Some((id, _)) = segment_at(&self.road_handles(view, None), event.position)
+        {
+            self.selection = BTreeSet::from([Item::Object(id)]);
+            if event.click_count >= 2 {
+                self.start_road_edit(id);
+            } else {
+                self.say(
+                    "Path selected; double-click it or press Edit path to edit its points",
+                    false,
+                );
+            }
+            return None;
+        }
+        self.slot_at(at, shift);
+        None
+    }
+
+    /// The path edit mode, while the Slot tool is on and its work area and
+    /// path still exist (undo can take them).
+    pub(super) fn road_editing(&self) -> Option<&RoadEdit> {
+        let e = self
+            .road_edit
+            .as_ref()
+            .filter(|_| self.tool == Tool::Slot)?;
+        (self.island.doc.objects.iter())
+            .any(|o| o.id == e.work && o.path.as_ref().is_some_and(|p| p.len() > 1))
+            .then_some(e)
+    }
+
+    /// Points of work area `id`'s path.
+    fn road_points(&self, id: u64) -> Vec<Vec3> {
+        (self.island.doc.objects.iter())
+            .find(|o| o.id == id)
+            .and_then(|o| o.path.as_ref())
+            .map(|p| p.iter().map(|p| p.p).collect())
+            .unwrap_or_default()
+    }
+
+    /// The edit mode's picked points that still exist, ascending.
+    fn picked_road_points(&self) -> Vec<usize> {
+        let Some(e) = self.road_editing() else {
+            return Vec::new();
+        };
+        let len = self.road_points(e.work).len();
+        e.picked.iter().copied().filter(|&i| i + 1 < len).collect()
+    }
+
+    /// Where the path gizmo stands: the picked points' centre.
+    fn road_pivot(&self) -> Option<Vec3> {
+        let picked = self.picked_road_points();
+        let points = self.road_points(self.road_editing()?.work);
+        let n = picked.len() as f32;
+        (n > 0.).then(|| {
+            let sum = (picked.iter()).fold([0.; 3], |acc, &i| math::add(acc, points[i]));
+            math::scale(sum, 1. / n)
+        })
+    }
+
+    /// Opens work area `id`'s path in the edit mode.
+    pub fn start_road_edit(&mut self, id: u64) {
+        self.tool = Tool::Slot;
+        self.road_edit = Some(RoadEdit {
+            work: id,
+            picked: BTreeSet::new(),
+        });
+        self.selection = BTreeSet::from([Item::Object(id)]);
+        self.say(
+            "Editing the path: click points (Shift adds) and move them with the gizmo; double-click the path to add a point; Enter when done",
+            false,
+        );
+    }
+
+    /// The Edit path button: the selected work area's path, or the first
+    /// of the selected slot's.
+    pub fn edit_selected_path(&mut self) {
+        let Some(assets) = self.assets.clone() else {
+            return;
+        };
+        let end = |o: &anno_core::island::objects::Object| harbour::link_end(&assets, o.guid);
+        let selected = (self.island.doc.objects.iter())
+            .filter(|o| self.selection.contains(&Item::Object(o.id)));
+        let work = selected
+            .clone()
+            .find(|o| end(o) == Some(harbour::LinkEnd::WorkArea))
+            .map(|o| o.id);
+        let work = work.or_else(|| {
+            let slots: Vec<u64> = (selected.filter(|o| end(o) == Some(harbour::LinkEnd::Slot)))
+                .map(|o| o.id)
+                .collect();
+            let links = self.slot_links(slots.iter().map(|&id| Item::Object(id)));
+            links
+                .into_iter()
+                .find(|l| slots.contains(&l.slot))
+                .map(|l| l.work)
+        });
+        match work {
+            Some(id) => self.start_road_edit(id),
+            None => self.say("Select a slot with a work area, or a work area", true),
+        }
+    }
+
+    /// Rewrites work area `id`'s path through `f` on its points in 3D,
+    /// then its Bezier handles by its kind's shape. The last point stays on
+    /// the slot.
+    fn set_road_points(&mut self, id: u64, f: impl FnOnce(&mut Vec<Vec3>)) {
+        let Some(guid) = (self.island.doc.objects.iter())
+            .find(|o| o.id == id)
+            .map(|o| o.guid)
+        else {
+            return;
+        };
+        let Some(harbours) = self.harbours() else {
+            return;
+        };
+        let shape = harbours.road_shape(self.piece(guid));
+        let mut points = self.road_points(id);
+        let Some(&last) = points.last() else { return };
+        f(&mut points);
+        if let Some(end) = points.last_mut() {
+            *end = last;
+        }
+        if let Some(o) = Arc::make_mut(&mut self.island.doc.objects)
+            .iter_mut()
+            .find(|o| o.id == id)
+        {
+            o.path = Some(shape.handles(&points));
+        }
+        self.markers_stale = true;
+        self.rails_stale = true;
+    }
+
+    /// Adds a point to the edited path after `segment`'s first point: at
+    /// `at` (its height read off the segment), else halfway. Picks it.
+    fn insert_road_point(&mut self, segment: usize, at: Option<Vec3>) {
+        let Some(work) = self.road_editing().map(|e| e.work) else {
+            return;
+        };
+        self.checkpoint();
+        self.set_road_points(work, |pts| {
+            let (a, b) = (pts[segment], pts[segment + 1]);
+            let p = match at {
+                Some(at) => {
+                    let (dx, dz) = (b[0] - a[0], b[2] - a[2]);
+                    let l2 = (dx * dx + dz * dz).max(1e-6);
+                    let t = (((at[0] - a[0]) * dx + (at[2] - a[2]) * dz) / l2).clamp(0., 1.);
+                    [at[0], a[1] + (b[1] - a[1]) * t, at[2]]
+                }
+                None => std::array::from_fn(|k| (a[k] + b[k]) / 2.),
+            };
+            pts.insert(segment + 1, p);
+        });
+        if let Some(e) = &mut self.road_edit {
+            e.picked = BTreeSet::from([segment + 1]);
+        }
+    }
+
+    /// The Add point button: a point halfway along the segment after each
+    /// picked point, or along the longest segment with none picked. Picks
+    /// the new points. One undo step.
+    pub fn add_road_points(&mut self) {
+        let Some(work) = self.road_editing().map(|e| e.work) else {
+            return;
+        };
+        let points = self.road_points(work);
+        let mut after = self.picked_road_points();
+        if after.is_empty() {
+            let len = |k: usize| {
+                let (a, b) = (points[k], points[k + 1]);
+                (b[0] - a[0]).hypot(b[2] - a[2])
+            };
+            after = (0..points.len() - 1)
+                .max_by(|&a, &b| len(a).total_cmp(&len(b)))
+                .into_iter()
+                .collect();
+        }
+        self.checkpoint();
+        // Back to front, so earlier indices hold.
+        self.set_road_points(work, |pts| {
+            for &k in after.iter().rev() {
+                let mid = std::array::from_fn(|x| (pts[k][x] + pts[k + 1][x]) / 2.);
+                pts.insert(k + 1, mid);
+            }
+        });
+        if let Some(e) = &mut self.road_edit {
+            // The n-th new point (ascending) lands at k + 1, shifted by
+            // the n inserted before it.
+            e.picked = (after.iter().enumerate())
+                .map(|(n, &k)| k + 1 + n)
+                .collect();
+        }
+    }
+
+    /// Deletes the picked points; the first and last stay, as every path
+    /// keeps its two ends. One undo step.
+    pub fn remove_road_points(&mut self) {
+        let Some(work) = self.road_editing().map(|e| e.work) else {
+            return;
+        };
+        let doomed: Vec<usize> = (self.picked_road_points().into_iter())
+            .filter(|&i| i > 0)
+            .collect();
+        if doomed.is_empty() {
+            return self.say(
+                "Pick an inner point to delete; a path keeps its first and last points",
+                true,
+            );
+        }
+        self.checkpoint();
+        self.set_road_points(work, |pts| {
+            for &i in doomed.iter().rev() {
+                pts.remove(i);
+            }
+        });
+        if let Some(e) = &mut self.road_edit {
+            e.picked.clear();
+        }
+    }
+
+    /// A press on the path gizmo: drags the picked points.
+    fn path_gizmo_drag(&self, gesture: Gesture) -> Option<Drag> {
+        let points = self.road_points(self.road_editing()?.work);
+        let start: Vec<(usize, Vec3)> = (self.picked_road_points().into_iter())
+            .map(|i| (i, points[i]))
+            .collect();
+        (!start.is_empty()).then(|| Drag::PathGizmo {
+            gesture,
+            start,
+            before: Box::new(self.island.doc.clone()),
+            changed: false,
+        })
+    }
+
+    /// Slot links touching objects among `items`, taken before an edit
+    /// moves or removes them.
+    fn slot_links(&self, items: impl IntoIterator<Item = Item>) -> Vec<harbour::Link> {
+        let Some(assets) = self.assets.as_deref() else {
+            return Vec::new();
+        };
+        let ids: BTreeSet<u64> = (items.into_iter())
+            .filter_map(|i| match i {
+                Item::Object(id) => Some(id),
+                Item::Prop(_) => None,
+            })
+            .collect();
+        let end = |guid| harbour::link_end(assets, guid);
+        // Most edits move no slot; skip the island-wide scan for them.
+        if !(self.island.doc.objects.iter()).any(|o| ids.contains(&o.id) && end(o.guid).is_some()) {
+            return Vec::new();
+        }
+        harbour::links(&self.island.doc.objects, end, |id| ids.contains(&id))
+    }
+
+    /// After a move: each work area's path runs from it to its slot again.
+    fn follow_slot_links(&mut self, links: &[harbour::Link]) {
+        if links.is_empty() {
+            return;
+        }
+        let objects = Arc::make_mut(&mut self.island.doc.objects);
+        let at = |id: u64| objects.iter().find(|o| o.id == id).map(|o| o.position);
+        let paths: Vec<_> = (links.iter())
+            .filter_map(|l| Some((l.work, l.follow(at(l.work)?, at(l.slot)?)?)))
+            .collect();
+        for (work, path) in paths {
+            if let Some(o) = objects.iter_mut().find(|o| o.id == work) {
+                o.path = Some(path);
+                self.rails_stale = true;
+            }
+        }
+    }
+
+    /// The work areas serving slots among `items`: they go when their slot
+    /// does. 1800 work areas stand about 12 m away, past any click radius.
+    fn served_work_areas(&self, items: &BTreeSet<Item>) -> Vec<Item> {
+        (self.slot_links(items.iter().copied()).into_iter())
+            .filter(|l| items.contains(&Item::Object(l.slot)))
+            .map(|l| Item::Object(l.work))
+            .collect()
+    }
+
     /// GUIDs of coastline assets, from the library or assets.xml.
     pub(super) fn coast_guids(&self) -> Vec<u32> {
-        if let Some(lib) = &self.harbour {
-            return [harbour::Piece::Coast, harbour::Piece::StartCoast]
+        if let Some(lib) = &self.island.harbour {
+            return [Piece::Coast, Piece::StartCoast]
                 .iter()
                 .filter_map(|&p| lib.guid(p))
                 .collect();
         }
-        self.doc
+        self.island
+            .doc
             .objects
             .iter()
             .map(|o| o.guid)
-            .filter(|&g| {
-                self.assets
-                    .as_ref()
-                    .and_then(|a| a.get(g))
-                    .is_some_and(|a| a.template == "Coastline")
-            })
+            .filter(|&g| matches!(self.piece(g), Some(Piece::Coast | Piece::StartCoast)))
             .collect()
     }
 
@@ -4028,12 +6669,12 @@ impl IslandEditor {
     /// still running (its result is dropped).
     pub(super) fn sync_land(&mut self) {
         if let Some((_, was)) = self.land_job.take() {
-            self.doc.land_heights = was;
+            self.island.doc.land_heights = was;
         }
         self.land_stale = false;
         let coasts = self.coast_paths();
         let environment = self.land_environment();
-        if new::sync_land(&mut self.doc, &coasts, environment) {
+        if new::sync_land(&mut self.island.doc, &coasts, environment) {
             self.land_redrawn();
         }
     }
@@ -4053,14 +6694,17 @@ impl IslandEditor {
         }
         self.land_stale = false;
         // Paint strokes leave the heights shared with the last sync.
-        if Arc::ptr_eq(&self.doc.land_heights, &self.doc.field) {
+        if Arc::ptr_eq(&self.island.doc.land_heights, &self.island.doc.field) {
             return None;
         }
-        let grids = self.doc.grids.clone()?;
-        let was = std::mem::replace(&mut self.doc.land_heights, self.doc.field.clone());
-        let now = self.doc.land_heights.clone();
-        let (grid, coasts) = (self.doc.field.grid, self.coast_paths());
-        let environment = self.land_environment().to_owned();
+        let grids = self.island.doc.grids.clone()?;
+        let was = std::mem::replace(
+            &mut self.island.doc.land_heights,
+            self.island.doc.field.clone(),
+        );
+        let now = self.island.doc.land_heights.clone();
+        let (grid, coasts) = (self.island.doc.field.grid, self.coast_paths());
+        let environment = self.land_environment();
         self.land_jobs += 1;
         self.land_job = Some((self.land_jobs, was.clone()));
         Some((self.land_jobs, move || {
@@ -4070,7 +6714,7 @@ impl IslandEditor {
                 &now.heights,
                 &grids,
                 &coasts,
-                &environment,
+                environment,
             )
         }))
     }
@@ -4081,7 +6725,7 @@ impl IslandEditor {
             return;
         }
         self.land_job = None;
-        if let (Some(changes), Some(grids)) = (changes, &mut self.doc.grids) {
+        if let (Some(changes), Some(grids)) = (changes, &mut self.island.doc.grids) {
             changes.apply(Arc::make_mut(grids));
             self.land_redrawn();
         }
@@ -4096,9 +6740,9 @@ impl IslandEditor {
     }
 
     /// Paths of the coast objects, which harbour pads follow.
-    fn coast_paths(&self) -> Vec<Vec<anno_formats::objects::PathPoint>> {
+    fn coast_paths(&self) -> Vec<Vec<anno_core::island::objects::PathPoint>> {
         let guids = self.coast_guids();
-        (self.doc.objects.iter())
+        (self.island.doc.objects.iter())
             .filter(|o| guids.contains(&o.guid))
             .filter_map(|o| o.path.clone())
             .collect()
@@ -4120,31 +6764,7 @@ impl IslandEditor {
         // Areas follow the water grid, which follows the heights.
         self.sync_land();
         let coasts = self.coast_guids();
-        let paths: Vec<Vec<anno_formats::objects::PathPoint>> = self
-            .doc
-            .objects
-            .iter()
-            .filter(|o| coasts.contains(&o.guid))
-            .filter_map(|o| o.path.clone())
-            .collect();
-        let Some(grids) = &mut self.doc.grids else {
-            return;
-        };
-        let grids = Arc::make_mut(grids);
-        let Some(ground) = grids.layer(Kind::Water).cloned() else {
-            return;
-        };
-        let Some(areas) = grids.layer_mut(Kind::AreaIds) else {
-            return;
-        };
-        let refs: Vec<&[anno_formats::objects::PathPoint]> =
-            paths.iter().map(Vec::as_slice).collect();
-        let interior = if from_slope {
-            harbour::Interior::Slope(&self.doc.field)
-        } else {
-            harbour::Interior::Keep
-        };
-        harbour::derive_areas(&ground, areas, &refs, interior, None);
+        harbour::refresh_areas(&mut self.island.doc, &coasts, from_slope);
         if self.overlay() == Some(Kind::AreaIds) {
             // Ground colors carry the overlay; redraw them.
             self.drawn_look = None;
@@ -4156,11 +6776,12 @@ impl IslandEditor {
     /// chunks alone from the tree cells, environment, herds. Replaces what
     /// was painted. Returns what changed for the status line.
     pub fn derive_grids(&mut self, kind: Option<Kind>) -> String {
+        let rules = self.rules();
         let marsh = self
             .palette
             .as_ref()
             .is_some_and(|p| p.materials.values().any(|m| m.file.contains("marsh")));
-        let doc = &mut self.doc;
+        let doc = &mut self.island.doc;
         let Some(grids) = &mut doc.grids else {
             return "This island has no gameplay grids".into();
         };
@@ -4176,7 +6797,7 @@ impl IslandEditor {
                 .filter(|p| {
                     doc.meshes
                         .get(p.source.file as usize)
-                        .is_some_and(|m| landscape::is_harvestable_tree(self.game, m))
+                        .is_some_and(|m| landscape::is_harvestable_tree(rules.tree_exclusions, m))
                 })
                 .map(|p| {
                     let t = math::translation(&p.matrix);
@@ -4184,6 +6805,7 @@ impl IslandEditor {
                 })
                 .collect(),
             marsh,
+            environments: rules.environment_values(),
         };
         let grids = Arc::make_mut(grids);
         let text = match kind {
@@ -4223,9 +6845,15 @@ impl IslandEditor {
     /// the land and harbour spots, and one player-island marker by the
     /// first harbour. Returns a warning when it cannot be settled.
     fn prepare_new_island(&mut self) -> Option<String> {
+        // A game without the shared coast pieces (2070's harbours are
+        // tiles) has no harbour spot or player marker to check.
+        if (self.harbours()).is_none_or(|h| h.required_pieces(&self.region()).is_empty()) {
+            return None;
+        }
         self.refresh_areas();
         let coasts = self.coast_guids();
         let first = self
+            .island
             .doc
             .objects
             .iter()
@@ -4236,20 +6864,25 @@ impl IslandEditor {
                 "No harbour spot yet: players cannot found a settlement here. Add one with the Harbour tool (H)".into(),
             );
         };
-        let lib = self.harbour.clone()?;
-        let marker = lib.guid(harbour::Piece::Marker)?;
-        if self.doc.objects.iter().any(|o| o.guid == marker) {
+        let lib = self.island.harbour.clone()?;
+        let marker = lib.guid(Piece::Marker)?;
+        if self.island.doc.objects.iter().any(|o| o.guid == marker) {
             return None;
         }
         // Shipped markers sit just off a harbour, at sea level.
         let mid = curve[curve.len() / 2];
         let d = mid.d.unwrap_or([0., -1.]);
         let at = [mid.p[0] + d[0] * 6., 0.3, mid.p[2] + d[1] * 6.];
-        let store = self.object_store.as_mut()?;
-        store.objects.clone_from(&self.doc.objects);
-        let areas = self.doc.grids.as_ref().and_then(|g| g.layer(Kind::AreaIds));
-        let o = lib.place(store, harbour::Piece::Marker, areas, at)?;
-        Arc::make_mut(&mut self.doc.objects).push(o);
+        let store = self.island.object_store.as_mut()?;
+        store.objects.clone_from(&self.island.doc.objects);
+        let areas = self
+            .island
+            .doc
+            .grids
+            .as_ref()
+            .and_then(|g| g.layer(Kind::AreaIds));
+        let o = lib.place(store, Piece::Marker, areas, at)?;
+        Arc::make_mut(&mut self.island.doc.objects).push(o);
         None
     }
 
@@ -4259,14 +6892,24 @@ impl IslandEditor {
             level,
             changed,
             before,
+            hold,
         } = drag
         else {
             return;
         };
+        // From the press on, the stroke's dabs leave the shadows as they are,
+        // and the release draws them once over the whole stroke; a click
+        // shades on the frame after its release. With wgpu's indirect-draw
+        // checks on, a dab that redraws the shadows costs about 2 ms more.
+        // Sculpt brushes hold as paint does; for live sculpt shadows, take
+        // the hold only for `Tool::Paint`.
+        if hold.is_none() {
+            *hold = Some(self.renderer.hold_shadows());
+        }
         // Quarter-radius spacing keeps strokes even without over-applying.
         // Absolute mode measures against the heights from stroke start.
         for dab in stroke.to([at[0], at[2]], self.brush.radius * 0.25) {
-            let y = self.doc.field.height(dab);
+            let y = self.island.doc.field.height(dab);
             *changed |= self.dab(
                 [dab[0], y, dab[1]],
                 *level,
@@ -4317,28 +6960,90 @@ impl IslandEditor {
             Drag::Shore { from, to, preview } => {
                 if let Some(at) = self.cursor {
                     *to = at;
-                    *preview =
-                        harbour::trace_between(&self.doc.field, [from[0], from[2]], [at[0], at[2]]);
+                    *preview = harbour::trace_between(
+                        &self.island.doc.field,
+                        [from[0], from[2]],
+                        [at[0], at[2]],
+                    );
                 }
             }
-            Drag::Region { to, .. } => {
+            Drag::Region { to, lasso, .. } => {
                 if let Some(at) = self.cursor {
                     *to = at;
+                    // A point a metre on keeps the outline smooth without
+                    // one per motion event.
+                    if let Some(points) = lasso
+                        && points
+                            .last()
+                            .is_none_or(|l| (l[0] - at[0]).hypot(l[1] - at[2]) >= 1.)
+                    {
+                        points.push([at[0], at[2]]);
+                    }
                 }
             }
-            &mut Drag::RiverKnot { index, handle } => {
+            Drag::RiverKnot {
+                index,
+                handle,
+                start,
+            } => {
                 if let Some(at) = self.cursor {
-                    self.river_drag(index, handle, at);
+                    self.river_drag(*index, *handle, start, at);
+                }
+            }
+            Drag::RiverGizmo {
+                gesture,
+                index,
+                start,
+                surfaces,
+            } => {
+                if let Some(gizmo::Delta::Move(d)) =
+                    gesture.delta(event.position, snap.then_some(self.snap_step))
+                {
+                    let at = start[*index];
+                    self.river_move(*index, start, [at[0] + d[0], at[1] + d[2]]);
+                    if d[1] != 0. {
+                        self.river_raise(*index, start, surfaces, d[1]);
+                    }
+                }
+            }
+            Drag::ShapePoint {
+                shape,
+                point,
+                changed,
+                ..
+            } => {
+                if let Some(at) = self.cursor
+                    && self.move_shape_point(*shape, *point, [at[0], at[2]])
+                {
+                    *changed = true;
                 }
             }
             Drag::CoastPoint {
                 id, index, changed, ..
             } => {
                 if let Some(at) = self.cursor
-                    && let Some(p) = harbour::snap_to_shore(&self.doc.field, [at[0], at[2]])
+                    && let Some(p) = harbour::snap_to_shore(&self.island.doc.field, [at[0], at[2]])
                 {
                     let i = *index;
                     self.edit_coast(*id, |pts| pts[i] = p);
+                    *changed = true;
+                }
+            }
+            Drag::PathGizmo {
+                gesture,
+                start,
+                changed,
+                ..
+            } => {
+                if let Some(gizmo::Delta::Move(d)) =
+                    gesture.delta(event.position, snap.then_some(self.snap_step))
+                    && let Some(work) = self.road_editing().map(|e| e.work)
+                {
+                    self.set_road_points(work, |pts| {
+                        for &(i, p) in start.iter() {
+                            pts[i] = math::add(p, d);
+                        }
+                    });
                     *changed = true;
                 }
             }
@@ -4358,12 +7063,21 @@ impl IslandEditor {
     /// seconds behind. The frame (`refresh_scene`) and the release apply the
     /// newest one only.
     fn apply_gizmo(&mut self, view: usize) {
+        // A turn still being read when the drag began: ask again, so the
+        // drag snaps from the move it arrives on.
+        if let Some(Drag::Gizmo { turn: None, .. }) = &self.views[view].drag {
+            let now = self.selection_turn();
+            if let Some(Drag::Gizmo { turn, .. }) = &mut self.views[view].drag {
+                *turn = now;
+            }
+        }
         let Some(Drag::Gizmo {
             gesture,
             targets,
             changed,
             pending,
             gpu,
+            turn,
             ..
         }) = &mut self.views[view].drag
         else {
@@ -4372,9 +7086,10 @@ impl IslandEditor {
         let Some((position, snap)) = pending.take() else {
             return;
         };
-        let Some(delta) = gesture.delta(position, snap.then_some(self.snap_step)) else {
+        let Some(mut delta) = gesture.delta(position, snap.then_some(self.snap_step)) else {
             return;
         };
+        delta = whole_turns(delta, turn.unwrap_or(0.));
         *changed = true;
         let pivot = gesture.frame.pivot();
         // The delta is affine: what it does to the identity it does to any
@@ -4395,24 +7110,26 @@ impl IslandEditor {
             .filter(|(item, _)| !on_gpu || unplaced(item))
             .copied()
             .collect();
+        let links = self.slot_links(cpu.iter().map(|(item, _)| *item));
         for (item, start) in &cpu {
-            let m = delta.apply(start, pivot);
+            let m = self.keep_above_ground(*item, start, delta.apply(start, pivot));
             // Props thin the vegetation around them, where they were and
             // where they land.
             if let Item::Prop(_) = item
-                && let Some(was) = self.doc.matrix(*item)
+                && let Some(was) = self.island.doc.matrix(*item)
             {
                 for p in [was, m] {
                     let r = vegetation::prop_reach(math::length([p[0], p[1], p[2]]));
                     self.vegetation_changed([p[12] - r, p[14] - r, p[12] + r, p[14] + r]);
                 }
             }
-            self.doc.set_matrix(*item, m);
+            self.island.doc.set_matrix(*item, m);
             // Objects store TRS: read back what was kept.
-            if let Some(m) = self.doc.matrix(*item) {
+            if let Some(m) = self.island.doc.matrix(*item) {
                 moved.push((*item, m));
             }
         }
+        self.follow_slot_links(&links);
         if let Some(Drag::Gizmo { targets: t, .. }) = &mut self.views[view].drag {
             *t = targets;
         }
@@ -4422,7 +7139,7 @@ impl IslandEditor {
         self.placements.move_items(&mut moved, &renderer);
         // Curves move with their object (`set_matrix`). `moved` is sorted
         // now.
-        self.inland_stale |= (self.doc.objects.iter()).any(|o| {
+        self.inland_stale |= (self.island.doc.objects.iter()).any(|o| {
             o.path.is_some()
                 && moved
                     .binary_search_by_key(&Item::Object(o.id), |(i, _)| *i)
@@ -4430,6 +7147,23 @@ impl IslandEditor {
         });
         self.moves += 1;
         self.markers_stale = true;
+    }
+
+    /// `to`, for a prop with AdaptTerrainHeight moved from `from`, lifted by
+    /// the ground's rise between the two: the game keeps such props at
+    /// their height above the ground. Other items move as dragged.
+    fn keep_above_ground(&self, item: Item, from: &Mat4, mut to: Mat4) -> Mat4 {
+        let Item::Prop(id) = item else { return to };
+        if self
+            .island
+            .doc
+            .prop(id)
+            .is_some_and(|p| p.source.adapt_terrain_height.is_some())
+        {
+            let field = &self.island.doc.field;
+            to[13] += field.height([to[12], to[14]]) - field.height([from[12], from[14]]);
+        }
+        to
     }
 
     fn finish_drag(&mut self, view: usize) {
@@ -4444,15 +7178,19 @@ impl IslandEditor {
         {
             let (targets, m) = (targets.clone(), *m);
             let mut moved = Vec::with_capacity(targets.len());
+            let placed = |item: &Item| self.selection_unplaced.binary_search(item).is_err();
+            let links = self.slot_links(targets.iter().map(|(i, _)| *i).filter(placed));
             for (item, start) in &targets {
                 if self.selection_unplaced.binary_search(item).is_ok() {
                     continue;
                 }
-                self.doc.set_matrix(*item, math::multiply(&m, start));
-                if let Some(m) = self.doc.matrix(*item) {
+                let to = self.keep_above_ground(*item, start, math::multiply(&m, start));
+                self.island.doc.set_matrix(*item, to);
+                if let Some(m) = self.island.doc.matrix(*item) {
                     moved.push((*item, m));
                 }
             }
+            self.follow_slot_links(&links);
             let renderer = self.renderer.clone();
             self.placements.move_items(&mut moved, &renderer);
             self.renderer.drag_selection(None);
@@ -4470,7 +7208,18 @@ impl IslandEditor {
                 if self.tool == Tool::Grid && self.grid == Kind::AreaIds {
                     self.refresh_areas();
                 }
-                self.ground_stale |= self.tool == Tool::Paint;
+                self.ground_stale |= self.tool == Tool::Paint
+                    || (self.tool == Tool::Grid && self.grid == Kind::Marsh && self.marsh_shape);
+                let skipped = (self.island.doc.materials.as_mut()).map_or(0, |m| m.take_skipped());
+                if skipped > 0 {
+                    self.say(
+                        format!(
+                            "Left {} as they were: a chunk there already holds 24 layers",
+                            crate::project::plural(skipped, "vertex", "vertices")
+                        ),
+                        false,
+                    );
+                }
                 let stale = std::mem::take(&mut self.stale_colors);
                 self.dirty = self.dirty.union(stale);
                 // Dabs regrew the vegetation under the brush; a full scatter
@@ -4496,7 +7245,7 @@ impl IslandEditor {
                 if (from[0] - to[0]).hypot(from[2] - to[2]) < 6. {
                     self.harbour_at(from, false);
                 } else if let Some(curve) = preview {
-                    let before = self.doc.clone();
+                    let before = self.island.doc.clone();
                     if self.push_harbour(curve) {
                         self.checkpoint_owned(before);
                     }
@@ -4507,12 +7256,16 @@ impl IslandEditor {
                     );
                 }
             }
-            Some(Drag::Region { from, to }) => {
-                self.auto_place(harbour::Region::spanning(
+            Some(Drag::Region { from, to, lasso }) => match lasso {
+                Some(points) => match harbour::Region::lasso(&points) {
+                    Some(region) => self.auto_place(region),
+                    None => self.say("Trace a loop around the ground to fill", true),
+                },
+                None => self.auto_place(harbour::Region::spanning(
                     [from[0], from[2]],
                     [to[0], to[2]],
-                ));
-            }
+                )),
+            },
             Some(Drag::CoastPoint {
                 before,
                 changed: true,
@@ -4521,13 +7274,23 @@ impl IslandEditor {
                 self.checkpoint_owned(*before);
                 self.refresh_areas();
             }
-            Some(Drag::RiverKnot { .. }) => self.river_moved(),
+            Some(Drag::PathGizmo {
+                before,
+                changed: true,
+                ..
+            })
+            | Some(Drag::ShapePoint {
+                before,
+                changed: true,
+                ..
+            }) => self.checkpoint_owned(*before),
+            Some(Drag::RiverKnot { .. } | Drag::RiverGizmo { .. }) => self.river_moved(),
             Some(Drag::Marquee(m)) => {
                 let v = &self.views[view];
                 let extent = self.extent();
                 let layers = self.layers;
                 // Hidden layers are not selectable.
-                let props = self.doc.items().filter(|(item, _)| {
+                let props = self.island.doc.items().filter(|(item, _)| {
                     let shown = match item {
                         Item::Prop(_) => layers.props,
                         Item::Object(_) => layers.objects,
@@ -4645,6 +7408,7 @@ impl IslandEditor {
             "m" => self.tool = Tool::Slot,
             "v" => self.tool = Tool::River,
             "enter" if self.tool == Tool::River && self.river.is_some() => self.finish_river(),
+            "enter" if self.tool == Tool::Grid && !self.outline.is_empty() => self.close_outline(),
             "i" => {
                 if let Some(at) = self.cursor {
                     self.sample(at);
@@ -4658,9 +7422,11 @@ impl IslandEditor {
             "[" => self.brush.radius = (self.brush.radius / 1.25).max(1.),
             "]" => self.brush.radius = (self.brush.radius * 1.25).min(256.),
             "f" => self.frame(),
-            "delete" | "backspace" if self.tool == Tool::Harbour && self.coast_point.is_some() => {
+            "delete" | "backspace" if self.tool == Tool::Harbour && self.curve_point.is_some() => {
                 self.remove_coast_point()
             }
+            "delete" | "backspace" if self.road_editing().is_some() => self.remove_road_points(),
+            "enter" if self.road_editing().is_some() => self.road_edit = None,
             "delete" | "backspace" if self.tool == Tool::River && self.river.is_some() => {
                 self.remove_river_knot()
             }
@@ -4671,9 +7437,12 @@ impl IslandEditor {
                     .views
                     .iter_mut()
                     .filter_map(|v| match v.drag.take() {
-                        Some(Drag::Brush { before, .. } | Drag::Gizmo { before, .. }) => {
-                            Some(*before)
-                        }
+                        Some(
+                            Drag::Brush { before, .. }
+                            | Drag::Gizmo { before, .. }
+                            | Drag::PathGizmo { before, .. }
+                            | Drag::ShapePoint { before, .. },
+                        ) => Some(*before),
                         _ => None,
                     })
                     .collect();
@@ -4681,12 +7450,16 @@ impl IslandEditor {
                 // the starts.
                 self.renderer.drag_selection(None);
                 if let Some(before) = befores.into_iter().next() {
-                    self.doc = before;
+                    self.island.doc = before;
                     self.dirty = Rect::default();
                     self.rebuild_tiles(None);
                 }
-                // Drops a river draft; nothing of it is in the document yet.
+                // Drops a river draft and a blocker outline; nothing of
+                // either is in the document yet.
                 self.river = None;
+                self.outline.clear();
+                // Leaves the path edit mode; its edits stay.
+                self.road_edit = None;
                 self.river_history.close();
                 self.selection.clear();
                 self.scene_stale = true;
@@ -4705,15 +7478,48 @@ impl IslandEditor {
             Field::Density => self.scatter.spread.density = value.clamp(0.05, 400.),
             Field::Jitter => self.scatter.spread.scale_jitter = (value / 100.).clamp(0., 0.9),
             Field::GridValue => {
-                self.grid_value = (value.max(0.) as u32).min(grids::max_value(self.game, self.grid))
+                self.grid_value =
+                    (value.max(0.) as u32).min(grids::max_value(self.rules(), self.grid))
+            }
+            Field::TimeOfDay => {
+                // Wraps, so scrolling past midnight carries on into the day.
+                // Only the light changes: the scene keeps its placements.
+                self.time_of_day = value.rem_euclid(24.);
+                self.markers_stale = true;
+            }
+            Field::Flow(bank) => {
+                let Some(i) = self.river.as_ref().and_then(|d| d.picked) else {
+                    return;
+                };
+                if self.flow_step != Some(i) {
+                    self.river_step();
+                    self.flow_step = Some(i);
+                }
+                if let Some(knot) = self.river.as_mut().and_then(|d| d.knots.get_mut(i)) {
+                    let mut flow = knot.flow.unwrap_or(river::U0);
+                    flow[bank] = value.clamp(0., anno_core::water::MAX_FLOW_SPEED);
+                    knot.flow = Some(flow);
+                }
+            }
+            Field::Falloff => self.river_falloff = value.clamp(0., 200.),
+            Field::Bed(f) => {
+                let b = &mut self.river_bed;
+                match f {
+                    BedField::Depth => b.depth = value.clamp(0.05, 3.),
+                    BedField::Bank => b.bank = value.clamp(0.1, 5.),
+                    BedField::Reach => b.reach = value.clamp(0.5, 20.),
+                    BedField::Bends => b.bends = (value / 100.).clamp(0., 1.),
+                    BedField::Pools => b.pools = (value / 100.).clamp(0., 1.),
+                }
             }
             Field::Position(_) | Field::Yaw | Field::Scale => {
                 if self.selection.is_empty() {
                     return;
                 }
                 self.checkpoint();
+                let links = self.slot_links(self.selection.iter().copied());
                 for &item in &self.selection {
-                    let Some(mut m) = self.doc.matrix(item) else {
+                    let Some(mut m) = self.island.doc.matrix(item) else {
                         continue;
                     };
                     match field {
@@ -4731,8 +7537,9 @@ impl IslandEditor {
                         }
                         _ => {}
                     }
-                    self.doc.set_matrix(item, m);
+                    self.island.doc.set_matrix(item, m);
                 }
+                self.follow_slot_links(&links);
                 self.moves += 1;
                 self.scene_stale = true;
             }
@@ -4751,7 +7558,14 @@ impl IslandEditor {
             Field::Level => (-20., 80., false),
             Field::Density => (0.1, 50., true),
             Field::Jitter => (0., 90., false),
-            Field::GridValue => (0., grids::max_value(self.game, self.grid) as f32, false),
+            Field::GridValue => (0., grids::max_value(self.rules(), self.grid) as f32, false),
+            Field::TimeOfDay => (0., 23.99, false),
+            Field::Flow(_) => (0., anno_core::water::MAX_FLOW_SPEED, false),
+            Field::Falloff => (0., 60., false),
+            Field::Bed(BedField::Depth) => (0.05, 1.5, false),
+            Field::Bed(BedField::Bank) => (0.1, 3., false),
+            Field::Bed(BedField::Reach) => (0.5, 12., false),
+            Field::Bed(BedField::Bends | BedField::Pools) => (0., 100., false),
             Field::Position(_) | Field::Yaw | Field::Scale => return None,
         })
     }
@@ -4779,7 +7593,13 @@ impl IslandEditor {
             lo + (hi - lo) * f
         };
         // Whole numbers where the field is a count or a class.
-        let v = if matches!(field, Field::GridValue | Field::Jitter | Field::Inner) {
+        let v = if matches!(
+            field,
+            Field::GridValue
+                | Field::Jitter
+                | Field::Inner
+                | Field::Bed(BedField::Bends | BedField::Pools)
+        ) {
             v.round()
         } else {
             v
@@ -4796,8 +7616,29 @@ impl IslandEditor {
             Field::Density => self.scatter.spread.density,
             Field::Jitter => self.scatter.spread.scale_jitter * 100.,
             Field::GridValue => self.grid_value as f32,
+            Field::TimeOfDay => self.time_of_day,
+            Field::Flow(bank) => self
+                .river
+                .as_ref()
+                .and_then(|d| d.knots.get(d.picked?))
+                .map_or(river::U0[bank], |k| k.flow.unwrap_or(river::U0)[bank]),
+            Field::Falloff => self.river_falloff,
+            Field::Bed(f) => {
+                let b = &self.river_bed;
+                match f {
+                    BedField::Depth => b.depth,
+                    BedField::Bank => b.bank,
+                    BedField::Reach => b.reach,
+                    BedField::Bends => b.bends * 100.,
+                    BedField::Pools => b.pools * 100.,
+                }
+            }
             Field::Position(_) | Field::Yaw | Field::Scale => {
-                let Some(m) = self.selection.iter().find_map(|&i| self.doc.matrix(i)) else {
+                let Some(m) = self
+                    .selection
+                    .iter()
+                    .find_map(|&i| self.island.doc.matrix(i))
+                else {
                     return 0.;
                 };
                 match field {
@@ -4846,7 +7687,7 @@ impl IslandEditor {
     /// fitting it leaves the island small in the middle of the view.
     pub(crate) fn fit_island(&mut self) {
         let extent = self.extent();
-        let (center, size) = match self.doc.field.bounds_above(0.5) {
+        let (center, size) = match self.island.doc.field.bounds_above(0.5) {
             // About half the land's size: Camera::frame leaves a wide margin
             // and the tilted view is shorter than it is wide, so this is
             // what fills roughly three quarters of the height.
@@ -4874,9 +7715,15 @@ impl IslandEditor {
             return;
         }
         self.checkpoint();
+        let served = self.served_work_areas(&self.selection);
+        self.selection.extend(served);
         let selection = &self.selection;
-        Arc::make_mut(&mut self.doc.props).retain(|p| !selection.contains(&Item::Prop(p.id)));
-        Arc::make_mut(&mut self.doc.objects).retain(|o| !selection.contains(&Item::Object(o.id)));
+        self.island
+            .doc
+            .props
+            .retain(|p| !selection.contains(&Item::Prop(p.id)));
+        Arc::make_mut(&mut self.island.doc.objects)
+            .retain(|o| !selection.contains(&Item::Object(o.id)));
         self.selection.clear();
         self.scene_stale = true;
         self.refresh_areas();
@@ -4889,6 +7736,7 @@ impl IslandEditor {
         self.checkpoint();
         let selection = std::mem::take(&mut self.selection);
         let copies: Vec<Prop> = self
+            .island
             .doc
             .props
             .iter()
@@ -4896,18 +7744,36 @@ impl IslandEditor {
             .cloned()
             .collect();
         for mut p in copies {
-            p.id = self.next_id;
-            self.next_id += 1;
+            p.id = self.island.next_id;
+            self.island.next_id += 1;
             // A copy is the user's own; a rerun of Auto cliffs keeps it.
             p.auto_cliff = false;
             // Offset copies so they are visible and grabbable.
             p.matrix[12] += 4.;
             self.selection.insert(Item::Prop(p.id));
-            Arc::make_mut(&mut self.doc.props).push(p);
+            self.island.doc.props.push(p);
+        }
+        // 2070's objects copy their records; its codec numbers the copies
+        // when it saves them, so these ids only tell them apart until then.
+        let records: Vec<_> = (self.island.doc.objects.iter())
+            .filter(|o| o.record().is_some() && selection.contains(&Item::Object(o.id)))
+            .cloned()
+            .collect();
+        let mut next = (self.island.doc.objects.iter())
+            .map(|o| o.id)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        for o in records {
+            let mut copy = o.copied(next);
+            next += 1;
+            copy.position[0] += 4.;
+            self.selection.insert(Item::Object(copy.id));
+            Arc::make_mut(&mut self.island.doc.objects).push(copy);
         }
         // Objects get fresh ids from the store so they stay unique on save.
-        if let Some(store) = &mut self.object_store {
-            store.objects.clone_from(&self.doc.objects);
+        if let Some(store) = &mut self.island.object_store {
+            store.objects.clone_from(&self.island.doc.objects);
             let picked: Vec<usize> = (0..store.objects.len())
                 .filter(|&i| selection.contains(&Item::Object(store.objects[i].id)))
                 .collect();
@@ -4916,7 +7782,7 @@ impl IslandEditor {
                 copy.position[0] += 4.;
                 self.selection.insert(Item::Object(copy.id));
                 store.objects.push(copy.clone());
-                Arc::make_mut(&mut self.doc.objects).push(copy);
+                Arc::make_mut(&mut self.island.doc.objects).push(copy);
             }
         }
         self.scene_stale = true;
@@ -5002,16 +7868,20 @@ fn mix(a: u32, b: u32, t: f32) -> u32 {
 /// See `IslandEditor::tile_inputs`.
 struct TileInputs<'a> {
     field: &'a Heightfield,
-    overlay: Option<&'a anno_formats::grids::Layer>,
+    overlay: Option<&'a anno_formats::a7m::grids::Layer>,
+    /// 2070's path blockers, shown over the ground in place of a grid.
+    paths: Option<(
+        &'a anno_core::island::Blockers,
+        anno_core::island::PathLayer,
+    )>,
     /// The working tint, when shown.
-    tint: Option<&'a anno_formats::tint::TintMap>,
+    tint: Option<&'a anno_formats::a7m::tint::TintMap>,
     materials: Option<&'a Materials>,
     palette: Option<&'a crate::terrain::Palette>,
     shading: Shading,
-    game: anno_formats::game::Game,
+    rules: &'static anno_core::game::IslandRules,
     gain: f32,
     texture: Option<Arc<Texture>>,
-    splat: Option<Arc<Splat>>,
     heights: Option<Arc<gpu::HeightMap>>,
 }
 
@@ -5035,8 +7905,15 @@ impl TileInputs<'_> {
                             self.field.at(x, z),
                             g.origin[1] + z as f32 * g.spacing,
                         ];
-                        let c = self.terrain_color(p, self.overlay, self.gain);
-                        texel[..3].copy_from_slice(&[(c >> 16) as u8, (c >> 8) as u8, c as u8]);
+                        let (c, cover) = self.ground_color(p, self.overlay, self.gain, true);
+                        // Alpha 255 is no cover, so a map written before
+                        // overlays existed still multiplies everywhere.
+                        texel.copy_from_slice(&[
+                            (c >> 16) as u8,
+                            (c >> 8) as u8,
+                            c as u8,
+                            255 - (cover * 255.).round() as u8,
+                        ]);
                     }
                 });
             }
@@ -5054,7 +7931,7 @@ impl TileInputs<'_> {
             .iter()
             .map(|&p| self.terrain_color(p, overlay, gain))
             .collect();
-        let (splat, texture) = (self.splat.clone(), self.texture.clone());
+        let texture = self.texture.clone();
         // Displaced tiles take height and normals from the GPU map.
         let normals = if self.heights.is_some() {
             Vec::new()
@@ -5064,7 +7941,7 @@ impl TileInputs<'_> {
         Arc::new(
             Mesh::new(MeshData {
                 positions: tile.positions,
-                uvs: if texture.is_some() || splat.is_some() {
+                uvs: if texture.is_some() {
                     tile.uvs
                 } else {
                     Vec::new()
@@ -5075,10 +7952,8 @@ impl TileInputs<'_> {
                 heights: self.heights.clone(),
                 indices: tile.indices,
                 texture: texture.map(Into::into),
-                material: match splat {
-                    Some(splat) => gpu::Material::Splat(splat),
-                    None => gpu::Material::Lit,
-                },
+                // CPU tiles draw no splat (retexture_tiles).
+                material: gpu::Material::Lit,
                 ..Default::default()
             })
             .expect("heightfield tiles are valid meshes"),
@@ -5098,9 +7973,23 @@ impl TileInputs<'_> {
     fn terrain_color(
         &self,
         p: Vec3,
-        overlay: Option<&anno_formats::grids::Layer>,
+        overlay: Option<&anno_formats::a7m::grids::Layer>,
         gain: f32,
     ) -> u32 {
+        self.ground_color(p, overlay, gain, false).0
+    }
+
+    /// The vertex color and, with `cover`, how far an overlay color covers
+    /// the ground texture (the GPU color map's alpha). Without it the
+    /// overlay is blended into the color the texture multiplies, as the
+    /// CPU-meshed fallback draws it.
+    fn ground_color(
+        &self,
+        p: Vec3,
+        overlay: Option<&anno_formats::a7m::grids::Layer>,
+        gain: f32,
+        cover: bool,
+    ) -> (u32, f32) {
         let rgb = |c: u32| [(c >> 16) & 255, (c >> 8) & 255, c & 255].map(|v| v as f32 / 255.);
         let lerp = |a: [f32; 3], b: [f32; 3], t: f32| -> [f32; 3] {
             std::array::from_fn(|i| a[i] + (b[i] - a[i]) * t)
@@ -5114,7 +8003,7 @@ impl TileInputs<'_> {
             Shading::Map => [1.; 3],
             Shading::Height => rgb(height_color(h)),
             Shading::Materials => match self.materials {
-                Some(m) => rgb(material_color(m.shown([p[0], p[2]], self.palette))),
+                Some(m) => rgb(material_color(doc::shown(m, [p[0], p[2]], self.palette))),
                 None => [0.5; 3],
             },
         };
@@ -5126,24 +8015,35 @@ impl TileInputs<'_> {
                 (-h / 8.).clamp(0.25, 0.8),
             );
         }
-        if let Some(layer) = overlay.filter(|l| l.kind == Kind::AreaIds) {
-            if let Some((color, alpha)) = buildable_overlay(layer, p) {
-                c = lerp(c, color, alpha);
+        let paths = (self.paths).map(|(b, layer)| {
+            grids::path_at(b, layer, p[0], p[2]).then(|| grids::path_overlay(layer))
+        });
+        let shown = match overlay {
+            _ if paths.is_some() => paths.flatten(),
+            Some(layer) if layer.kind == Kind::AreaIds => buildable_overlay(layer, p),
+            Some(layer) => {
+                grids::overlay(self.rules, layer.kind, grids::value_at(layer, p[0], p[2]))
             }
-        } else if let Some(layer) = overlay
-            && let Some((color, alpha)) =
-                grids::overlay(self.game, layer.kind, grids::value_at(layer, p[0], p[2]))
-        {
-            // Textured ground multiplies the color; lift it so it reads.
-            let lift = if matches!(self.shading, Shading::Ground | Shading::Map) {
-                1.6
+            None => None,
+        };
+        let mut covered = 0.;
+        if let Some((color, alpha)) = shown {
+            let textured = matches!(self.shading, Shading::Ground | Shading::Map);
+            if cover && textured {
+                // The shader paints the color over the texture by `alpha`
+                // and multiplies the rest, which keeps the ground's detail.
+                c = color;
+                covered = alpha;
+            } else if overlay.is_some_and(|l| l.kind == Kind::AreaIds) {
+                c = lerp(c, color, alpha);
             } else {
-                1.
-            };
-            c = lerp(c, color.map(|v| v * lift), alpha);
+                // Textured ground multiplies the color; lift it so it reads.
+                let lift = if textured { 1.6 } else { 1. };
+                c = lerp(c, color.map(|v| v * lift), alpha);
+            }
         }
         let [r, g, b] = c.map(|v| ((v / gain).clamp(0., 1.) * 255.).round() as u32);
-        r << 16 | g << 8 | b
+        (r << 16 | g << 8 | b, covered)
     }
 }
 
@@ -5166,32 +8066,62 @@ fn retexture(meshes: &mut [Arc<Mesh>], f: impl Fn(&MeshData) -> Option<MeshData>
     });
 }
 
-/// The sample rectangle (half-open) where two height arrays of `grid`
-/// differ, `None` when they are equal.
-fn changed_samples(grid: Grid, a: &[f32], b: &[f32]) -> Option<Rect> {
+/// Where the grit map differs between two steps' grids: `None` when it
+/// does not, `Some(None)` for all of it (no grit before, or another size),
+/// else island metres x0, z0, x1, z1 over the changed cells.
+fn changed_grit(a: Option<&Grids>, b: Option<&Grids>) -> Option<Option<[f32; 4]>> {
+    let b = b?.layer(Kind::Grit)?;
+    let a = a.and_then(|a| a.layer(Kind::Grit));
+    let Some(a) = a.filter(|a| a.width == b.width && a.height == b.height) else {
+        return Some(None);
+    };
+    if Arc::ptr_eq(&a.values, &b.values) {
+        return None;
+    }
     let mut rect: Option<Rect> = None;
-    for (z, (ra, rb)) in a.chunks(grid.width).zip(b.chunks(grid.width)).enumerate() {
-        if ra == rb {
+    for z in 0..b.height {
+        let differs = |x: &usize| a.get(*x, z) != b.get(*x, z);
+        let Some(x0) = (0..b.width).find(differs) else {
             continue;
-        }
-        let x0 = ra.iter().zip(rb).position(|(p, q)| p != q).unwrap_or(0);
-        let x1 = grid.width
-            - ra.iter()
-                .zip(rb)
-                .rev()
-                .position(|(p, q)| p != q)
-                .unwrap_or(0);
-        let r = rect.get_or_insert(Rect {
+        };
+        let x1 = (0..b.width).rfind(differs).unwrap() + 1;
+        let row = Rect {
             x0,
             z0: z,
             x1,
             z1: z + 1,
-        });
-        r.x0 = r.x0.min(x0);
-        r.x1 = r.x1.max(x1);
-        r.z1 = z + 1;
+        };
+        rect = Some(rect.map_or(row, |r| r.union(row)));
     }
-    rect
+    let r = rect?;
+    let cell = b.cell_metres;
+    Some(Some([
+        r.x0 as f32 * cell,
+        r.z0 as f32 * cell,
+        r.x1 as f32 * cell,
+        r.z1 as f32 * cell,
+    ]))
+}
+
+/// `delta` with a turn about the vertical rounded to whole steps of `turn`
+/// (2070's buildings stand on quarter turns); 0 leaves it free.
+fn whole_turns(delta: gizmo::Delta, turn: f32) -> gizmo::Delta {
+    match delta {
+        gizmo::Delta::Rotate(axis, angle) if turn > 0. && axis[1].abs() > 0.99 => {
+            gizmo::Delta::Rotate(axis, (angle / turn).round() * turn)
+        }
+        other => other,
+    }
+}
+
+/// Keeps the shipped record `o` carries (2070's `object_for` for a tree,
+/// rock or grass) on `island` for its save to copy, once.
+fn keep_foreign(island: &mut anno_core::island::Island, o: &anno_core::island::objects::Object) {
+    if let Some(anno_core::island::objects::Record::Foreign(bytes)) = o.record()
+        && !island.foreign.iter().any(|b| **b == *bytes)
+    {
+        island.foreign.push(bytes);
+    }
 }
 
 #[cfg(test)]
@@ -5204,9 +8134,2093 @@ mod tests {
         Grids, IslandEditor, Item, Kind, Project, Start, Tool, grids, height_color,
         island_data_dir, material_color, mix, tint,
     };
-    use anno_formats::{island, vfs::Install};
+    use anno_core::harbour::Piece;
+    use anno_formats::{a7m::island, vfs::Install};
     use gpui_editor_kit::heightfield::{Brush, Falloff};
     use std::sync::Arc;
+
+    // Needs Anno 2070: n_m02 opens with its objects placed as their records
+    // store them, each drawn with the model its GUID names in the asset
+    // database: its trees and rocks as props, its handles and decoration as
+    // objects. The ones drawn are exactly those whose model reads with a
+    // mesh to draw, each at its record's matrix, and a save with them in
+    // place still writes the file as shipped.
+    #[test]
+    fn a_2070_island_draws_its_objects_with_their_models() {
+        let Some(dir) = anno_formats::vfs::install_dir("ANNO2070_DIR") else {
+            eprintln!("skip: ANNO2070_DIR unset");
+            return;
+        };
+        use anno_core::game::Module;
+        let module = &anno2070::MODULE;
+        let install = Install::open(dir, module.profile().archive_families).unwrap();
+        let path = "data/levels/islands/normal/n_m02.isd";
+        let shipped = install.read(path).unwrap();
+        let mut editor = IslandEditor::load(
+            crate::games::module(crate::games::of(&install)),
+            &install,
+            path,
+        )
+        .unwrap();
+        let objects = anno_formats::isd::objects::read(
+            &anno_formats::isd::Doc::parse(&shipped).unwrap(),
+            path,
+        )
+        .unwrap();
+        assert_eq!(objects.len(), 5_368);
+        // Records and the document's items, in file order.
+        let items: Vec<Item> = {
+            let (mut prop, mut object) = (
+                editor.island.doc.props.iter(),
+                editor.island.doc.objects.iter(),
+            );
+            // Where the record stands.
+            let matrix = |o: &anno_formats::isd::objects::Object| {
+                anno_core::island::trs(o.position, o.rotation, [o.scale; 3])
+            };
+            (objects.iter())
+                .map(|o| match o.section {
+                    anno_formats::isd::objects::Section::Nature
+                    | anno_formats::isd::objects::Section::Grass => {
+                        let p = prop.next().unwrap();
+                        assert_eq!(p.matrix, matrix(o));
+                        Item::Prop(p.id)
+                    }
+                    _ => {
+                        let n = object.next().unwrap();
+                        assert_eq!(n.id, o.id);
+                        assert_eq!(
+                            editor.island.doc.matrix(Item::Object(n.id)),
+                            Some(matrix(o))
+                        );
+                        Item::Object(n.id)
+                    }
+                })
+                .collect()
+        };
+        assert_eq!(
+            editor.island.doc.props.len() + editor.island.doc.objects.len(),
+            objects.len()
+        );
+
+        let assets = Arc::new(
+            anno_formats::assets::Assets::load(&install, module.database().unwrap()).unwrap(),
+        );
+        editor.assets = Some(assets.clone());
+        let install = Arc::new(install);
+        while let Some(job) = editor.models_job(install.clone()) {
+            editor.models_loaded(job());
+        }
+        editor.refresh_scene();
+        let drawn: std::collections::HashSet<Item> =
+            editor.placements.item.iter().flatten().copied().collect();
+
+        // Independently: the cfg its asset names, read by formats, has a
+        // part with a mesh, a decal or a nested model.
+        let mut reads = std::collections::HashMap::<String, bool>::new();
+        let mut with_models = std::collections::HashSet::new();
+        for (k, o) in objects.iter().enumerate() {
+            let Some(cfg) = anno2070::objects::model(&assets, o) else {
+                continue;
+            };
+            let cfg = cfg.replace('\\', "/");
+            let draws = *reads.entry(cfg.clone()).or_insert_with(|| {
+                anno_formats::model::Model::load(&install, &cfg).is_ok_and(|m| {
+                    m.parts.iter().any(|p| p.mesh.is_some() && !p.bone_linked)
+                        || !m.decals.is_empty()
+                        || !m.props.is_empty()
+                })
+            });
+            if draws {
+                with_models.insert(items[k]);
+            }
+        }
+        let mut only_drawn: Vec<_> = drawn.difference(&with_models).collect();
+        let mut only_models: Vec<_> = with_models.difference(&drawn).collect();
+        only_drawn.sort();
+        only_models.sort();
+        eprintln!(
+            "{} of {} objects drawn; {} models",
+            drawn.len(),
+            objects.len(),
+            reads.len()
+        );
+        assert!(
+            only_drawn.is_empty() && only_models.is_empty(),
+            "drawn without a model: {only_drawn:?}; with a model, not drawn: {only_models:?}"
+        );
+        // The one left is GUID 352, `rainbow`, an effect with no mesh.
+        assert_eq!(drawn.len(), 5_367);
+
+        // Its buildings draw in 2070's building family, its leaves (cut
+        // out, no glow) in the kit's own.
+        let family = anno_render::a2070_buildings::families()
+            .id(anno_render::a2070_buildings::NAME)
+            .unwrap();
+        let (mut buildings, mut kit) = (0, 0);
+        for piece in editor.library.models.loaded.values().flat_map(|p| p.iter()) {
+            match piece.mesh.data().family == family {
+                true => buildings += 1,
+                false => kit += 1,
+            }
+        }
+        eprintln!("{buildings} pieces in the building family, {kit} in the kit's");
+        assert!(buildings > 0 && kit > 0);
+
+        let (_config, project) = staged(&install, &mut editor);
+        assert!(project.files[path] == shipped, "it saves as shipped");
+    }
+
+    // Needs Anno 2070: n_m02's objects take the editor's own tools. The
+    // inspector moves the rock 17617 four metres east and nothing else;
+    // Delete takes the simple record 18304 and nothing else; one undo brings
+    // it back where it stood, a second puts the rock back, and the document's
+    // objects are again the records as loaded.
+    #[test]
+    fn a_2070_object_moves_deletes_and_undoes() {
+        let Some(dir) = anno_formats::vfs::install_dir("ANNO2070_DIR") else {
+            eprintln!("skip: ANNO2070_DIR unset");
+            return;
+        };
+        use anno_core::game::Module;
+        let install = Install::open(dir, anno2070::MODULE.profile().archive_families).unwrap();
+        let path = "data/levels/islands/normal/n_m02.isd";
+        let mut editor = IslandEditor::load(
+            crate::games::module(crate::games::of(&install)),
+            &install,
+            path,
+        )
+        .unwrap();
+        let loaded = editor.island.doc.objects.clone();
+        let get =
+            |e: &IslandEditor, id: u64| e.island.doc.objects.iter().find(|o| o.id == id).cloned();
+        let rock = get(&editor, 17617).unwrap();
+
+        editor.selection = [Item::Object(17617)].into();
+        editor.set_field(super::Field::Position(0), rock.position[0] + 4.);
+        let moved = get(&editor, 17617).unwrap();
+        assert_eq!(
+            moved.position,
+            [rock.position[0] + 4., rock.position[1], rock.position[2]]
+        );
+        assert_eq!(
+            (moved.guid, moved.variation, moved.record()),
+            (rock.guid, rock.variation, rock.record())
+        );
+        for (a, b) in editor.island.doc.objects.iter().zip(loaded.iter()) {
+            if a.id != 17617 {
+                assert_eq!(a, b);
+            }
+        }
+
+        editor.selection = [Item::Object(18304)].into();
+        editor.delete_selected();
+        assert_eq!(editor.island.doc.objects.len(), loaded.len() - 1);
+        assert!(get(&editor, 18304).is_none());
+        assert_eq!(get(&editor, 17617), Some(moved.clone()));
+
+        assert!(editor.undo(false));
+        assert_eq!(
+            get(&editor, 18304).as_ref(),
+            loaded.iter().find(|o| o.id == 18304)
+        );
+        assert_eq!(get(&editor, 17617), Some(moved));
+        assert!(editor.undo(false));
+        assert_eq!(*editor.island.doc.objects, *loaded);
+    }
+
+    // Needs Anno 2070: n_m02's objects edited with the editor's own tools
+    // save into its file. The inspector moves the rock 17617 four metres
+    // east, Ctrl-D copies the stone 17630, and Delete takes the simple record
+    // 18304; the staged file reopens with the rock moved, the copy beside
+    // its original under a fresh id, 18304 gone, and every other record
+    // untouched.
+    #[test]
+    fn a_2070_object_move_copy_and_delete_save_and_reopen() {
+        let Some(dir) = anno_formats::vfs::install_dir("ANNO2070_DIR") else {
+            eprintln!("skip: ANNO2070_DIR unset");
+            return;
+        };
+        use anno_core::game::Module;
+        let install = Install::open(dir, anno2070::MODULE.profile().archive_families).unwrap();
+        let path = "data/levels/islands/normal/n_m02.isd";
+        let mut editor = IslandEditor::load(
+            crate::games::module(crate::games::of(&install)),
+            &install,
+            path,
+        )
+        .unwrap();
+        let loaded = editor.island.doc.objects.clone();
+        let find = |id: u64| loaded.iter().find(|o| o.id == id).unwrap().clone();
+        let (rock, stone) = (find(17617), find(17630));
+
+        editor.selection = [Item::Object(17617)].into();
+        editor.set_field(super::Field::Position(0), rock.position[0] + 4.);
+        editor.selection = [Item::Object(17630)].into();
+        editor.duplicate_selected();
+        assert_eq!(editor.island.doc.objects.len(), loaded.len() + 1);
+        editor.selection = [Item::Object(18304)].into();
+        editor.delete_selected();
+        let (_config, project) = staged(&install, &mut editor);
+        assert!(!editor.dirty(), "the save is the document's");
+
+        let registry = anno2070::island::registry(&install).unwrap();
+        let saved: Arc<[u8]> = project.files[path].clone().into();
+        let back = anno2070::island::from_bytes(saved, path, registry, None).unwrap();
+        let objects = &back.doc.objects;
+        assert_eq!(objects.len(), loaded.len());
+        assert!(objects.iter().all(|o| o.id != 18304));
+        let moved = objects.iter().find(|o| o.id == 17617).unwrap();
+        assert_eq!(
+            moved.position,
+            [rock.position[0] + 4., rock.position[1], rock.position[2]]
+        );
+        let largest = loaded.iter().map(|o| o.id).max().unwrap();
+        let copy = objects.iter().find(|o| o.id > largest).unwrap();
+        assert_eq!(
+            (copy.guid, copy.rotation, copy.section),
+            (stone.guid, stone.rotation, stone.section)
+        );
+        assert_eq!(
+            copy.position,
+            [stone.position[0] + 4., stone.position[1], stone.position[2]]
+        );
+        for o in loaded.iter().filter(|o| ![17617, 18304].contains(&o.id)) {
+            let b = objects.iter().find(|b| b.id == o.id).unwrap();
+            assert_eq!(
+                (b.guid, b.position, b.rotation, b.scale),
+                (o.guid, o.position, o.rotation, o.scale)
+            );
+        }
+        assert_eq!(back.doc.props.len(), editor.island.doc.props.len());
+    }
+
+    // Needs Anno 2070: n_d11's trees, rocks and grass take the editor's own
+    // tools and save into its file. The Library places a tree n_d11 never
+    // had, Ctrl-D copies a tree, the inspector moves a rock four metres
+    // east, and Delete takes a grass tuft. The staged file reopens with a
+    // record of the new tree's GUID where it was put, a tree record of the
+    // copied one's GUID, variation, turn and scale four metres east of it,
+    // both under ids no record had; the rock moved; the grass record gone;
+    // and every other record as shipped.
+    #[test]
+    fn a_2070_tree_copy_rock_move_and_grass_delete_save_and_reopen() {
+        let Some(dir) = anno_formats::vfs::install_dir("ANNO2070_DIR") else {
+            eprintln!("skip: ANNO2070_DIR unset");
+            return;
+        };
+        use anno_core::game::Module;
+        use anno_formats::isd::objects::{Object, Section};
+        let module = &anno2070::MODULE;
+        let install = Arc::new(Install::open(dir, module.profile().archive_families).unwrap());
+        let path = "data/levels/islands/normal/n_d11.isd";
+        let read = |bytes: &[u8]| -> Vec<Object> {
+            let doc = anno_formats::isd::Doc::parse(bytes).unwrap();
+            let all = anno_formats::isd::objects::read(&doc, path).unwrap();
+            (all.into_iter())
+                .filter(|o| matches!(o.section, Section::Nature | Section::Grass))
+                .collect()
+        };
+        let shipped = read(&install.read(path).unwrap());
+        let assets = Arc::new(
+            anno_formats::assets::Assets::load(&install, module.database().unwrap()).unwrap(),
+        );
+        let template = |o: &Object| assets.get(o.guid).map(|a| a.template.as_str());
+        // A prop's id is its record's index among these, plus one.
+        let tree = (shipped.iter())
+            .position(|o| template(o) == Some("Tree"))
+            .unwrap();
+        let rock = (shipped.iter())
+            .position(|o| {
+                matches!(
+                    template(o),
+                    Some("NatureMountainObject" | "SimpleStoneObject")
+                )
+            })
+            .unwrap();
+        let grass = (shipped.iter())
+            .position(|o| o.section == Section::Grass)
+            .unwrap();
+
+        let mut editor = IslandEditor::load_with(
+            crate::games::module(crate::games::of(&install)),
+            &install,
+            path,
+            Some((install.clone(), assets.clone())),
+        )
+        .unwrap();
+        assert_eq!(editor.island.doc.props.len(), shipped.len());
+        // A tree n_d11 never had, from the Library.
+        let (cfg, new) = (assets.iter())
+            .filter(|a| a.template == "Tree" && !a.cfgs.is_empty())
+            .map(|a| {
+                (
+                    &a.cfgs[0],
+                    anno2070::objects::prop_kind(&assets, &a.cfgs[0]).unwrap(),
+                )
+            })
+            .find(|(_, (guid, _))| shipped.iter().all(|o| o.guid != *guid))
+            .unwrap();
+        editor.choose_prop(cfg);
+        assert_eq!(editor.tool, Tool::Place);
+        editor.place_at([40., 0.75, 40.]);
+        editor.selection = [Item::Prop(tree as u64 + 1)].into();
+        editor.duplicate_selected();
+        editor.selection = [Item::Prop(rock as u64 + 1)].into();
+        editor.set_field(super::Field::Position(0), shipped[rock].position[0] + 4.);
+        editor.selection = [Item::Prop(grass as u64 + 1)].into();
+        editor.delete_selected();
+        let (_config, project) = staged(&install, &mut editor);
+        assert!(!editor.dirty(), "the save is the document's");
+
+        let back = read(&project.files[path]);
+        assert_eq!(back.len(), shipped.len() + 1);
+        let near = |a: [f32; 3], b: [f32; 3]| (0..3).all(|k| (a[k] - b[k]).abs() <= 0.5 / 4096.);
+        let largest = shipped.iter().map(|o| o.id).max().unwrap();
+        let added: Vec<&Object> = back.iter().filter(|o| o.id > largest).collect();
+        assert_eq!(added.len(), 2);
+        let placed = added.iter().find(|o| o.guid == new.0).unwrap();
+        assert_eq!((placed.section, placed.variation), (Section::Nature, new.1));
+        assert_eq!(placed.position, [40., 0.75, 40.]);
+        let (copy, was) = (
+            *added.iter().find(|o| o.guid != new.0).unwrap(),
+            &shipped[tree],
+        );
+        assert_eq!(
+            (copy.section, copy.guid, copy.variation),
+            (was.section, was.guid, was.variation)
+        );
+        // Through the prop's matrix: the same turn and scale, to float noise.
+        let dot: f32 = (0..4).map(|k| copy.rotation[k] * was.rotation[k]).sum();
+        assert!(dot.abs() > 1. - 1e-6, "{:?}", copy.rotation);
+        assert!((copy.scale - was.scale).abs() < 1e-5);
+        let [x, y, z] = was.position;
+        assert!(near(copy.position, [x + 4., y, z]), "{:?}", copy.position);
+        assert!(back.iter().all(|o| o.id != shipped[grass].id));
+        for o in shipped.iter().filter(|o| o.id != shipped[grass].id) {
+            let b = back.iter().find(|b| b.id == o.id).unwrap();
+            assert_eq!(
+                (b.guid, b.variation, b.rotation),
+                (o.guid, o.variation, o.rotation)
+            );
+            if o.id == shipped[rock].id {
+                let [x, y, z] = o.position;
+                assert!(near(b.position, [x + 4., y, z]), "{:?}", b.position);
+            } else {
+                assert_eq!(b.position, o.position);
+            }
+        }
+    }
+
+    // Needs Anno 2070: the browser's "Place on an island" and the Place
+    // tool put the Ecos bakery's model on n_m02 as a bakery object, by its
+    // asset's GUID; one click places it, undo takes it back,
+    // a second click places it again, and the staged file reopens with it
+    // there, its GUID and transform as placed.
+    #[test]
+    fn a_2070_building_places_saves_and_reopens() {
+        let Some(dir) = anno_formats::vfs::install_dir("ANNO2070_DIR") else {
+            eprintln!("skip: ANNO2070_DIR unset");
+            return;
+        };
+        use anno_core::game::Module;
+        let module = &anno2070::MODULE;
+        let install = Arc::new(Install::open(dir, module.profile().archive_families).unwrap());
+        let assets = Arc::new(
+            anno_formats::assets::Assets::load(&install, module.database().unwrap()).unwrap(),
+        );
+        let path = "data/levels/islands/normal/n_m02.isd";
+        let mut editor = IslandEditor::load_with(
+            crate::games::module(crate::games::of(&install)),
+            &install,
+            path,
+            Some((install.clone(), assets.clone())),
+        )
+        .unwrap();
+        let cfg = "data/graphics/buildings/ecos/production/bakery_ecos/bakery_ecos.cfg";
+        let guid = (assets.iter())
+            .find(|a| {
+                a.cfgs
+                    .iter()
+                    .any(|c| c.replace('\\', "/").eq_ignore_ascii_case(cfg))
+            })
+            .unwrap()
+            .guid;
+        let count = editor.island.doc.objects.len();
+        editor.choose_prop(cfg);
+        assert_eq!(editor.tool, Tool::Place);
+        assert_eq!(
+            editor.place_object.as_ref().map(|(t, _)| t.object.guid),
+            Some(guid)
+        );
+        let at = [96.5, 0.75, 52.25];
+        editor.place_at(at);
+        assert_eq!(editor.island.doc.objects.len(), count + 1);
+        assert!(editor.undo(false));
+        assert_eq!(editor.island.doc.objects.len(), count);
+        editor.place_at(at);
+        let placed = editor.island.doc.objects.last().unwrap().clone();
+        assert_eq!((placed.guid, placed.position), (guid, at));
+        assert_eq!(editor.selection, [Item::Object(placed.id)].into());
+
+        let (_config, project) = staged(&install, &mut editor);
+        let registry = anno2070::island::registry(&install).unwrap();
+        let saved: Arc<[u8]> = project.files[path].clone().into();
+        let back = anno2070::island::from_bytes(saved, path, registry, None).unwrap();
+        assert_eq!(back.doc.objects.len(), count + 1);
+        let b = back.doc.objects.iter().find(|o| o.guid == guid).unwrap();
+        assert_eq!(b.position, at);
+        assert!(
+            (0..4).all(|k| (b.rotation[k] - placed.rotation[k]).abs() < 1e-6),
+            "{:?} for {:?}",
+            b.rotation,
+            placed.rotation
+        );
+        assert_eq!(b.variation, placed.variation);
+    }
+
+    // Needs Anno 2070: on n_m02 the Ecos bakery, which ships only on quarter
+    // turns, places on one wherever the Place tool's spread of turns falls,
+    // and saves a `m_Direction` of whole quarter turns; a tree placed
+    // between them keeps its free turn. The rotate gizmo snaps a turn about
+    // the vertical to quarters for a selection holding the bakery, and
+    // leaves a tree's, a mine's and a tilt free.
+    #[test]
+    fn a_2070_building_places_and_turns_by_quarter_turns_and_a_tree_freely() {
+        use super::whole_turns;
+        use gpui_editor_kit::gizmo::Delta;
+        use std::f32::consts::FRAC_PI_2;
+        let Some(dir) = anno_formats::vfs::install_dir("ANNO2070_DIR") else {
+            eprintln!("skip: ANNO2070_DIR unset");
+            return;
+        };
+        use anno_core::game::Module;
+        let module = &anno2070::MODULE;
+        let install = Arc::new(Install::open(dir, module.profile().archive_families).unwrap());
+        let assets = Arc::new(
+            anno_formats::assets::Assets::load(&install, module.database().unwrap()).unwrap(),
+        );
+        let path = "data/levels/islands/normal/n_m02.isd";
+        let mut editor = IslandEditor::load_with(
+            crate::games::module(crate::games::of(&install)),
+            &install,
+            path,
+            Some((install.clone(), assets.clone())),
+        )
+        .unwrap();
+        let bakery = "data/graphics/buildings/ecos/production/bakery_ecos/bakery_ecos.cfg";
+        let tree = (assets.iter())
+            .find(|a| a.template == "Tree" && !a.cfgs.is_empty())
+            .unwrap();
+        let (tree_guid, tree) = (tree.guid, tree.cfgs[0].replace('\\', "/"));
+        let mine = (assets.iter())
+            .find(|a| a.name == "coal_mine")
+            .unwrap()
+            .guid;
+        // The index this test reads, built here rather than polled for.
+        anno2070::objects::Shipped::of(&install).unwrap();
+        assert_eq!(
+            editor.turn_step(mine),
+            Some(0.),
+            "mines turn to their deposit"
+        );
+        assert_eq!(editor.turn_step(tree_guid), Some(0.));
+
+        let quarter = |yaw: f32| {
+            let q = yaw / FRAC_PI_2;
+            (q - q.round()).abs() < 1e-4
+        };
+        let mut placed = Vec::new();
+        for k in 0..4 {
+            editor.choose_prop(bakery);
+            editor.place_at([90. + 12. * k as f32, 0.75, 52.]);
+            let o = editor.island.doc.objects.last().unwrap().clone();
+            assert!(quarter(o.direction), "{}", o.direction);
+            assert!(editor.turn_step(o.guid) == Some(FRAC_PI_2));
+            placed.push(o.id);
+            // A tree between them: the spread moves on, freely.
+            editor.choose_prop(&tree);
+            editor.place_at([90. + 12. * k as f32, 0.75, 70.]);
+            let p = editor.island.doc.props.last().unwrap();
+            let yaw = 2. * p.source.rotation[1].atan2(p.source.rotation[3]);
+            let spread = ((p.id as f32) * 2.399_963).rem_euclid(std::f32::consts::TAU);
+            assert!((yaw.rem_euclid(std::f32::consts::TAU) - spread).abs() < 1e-4);
+        }
+        let turns: std::collections::BTreeSet<i64> = (editor.island.doc.objects.iter())
+            .filter(|o| placed.contains(&o.id))
+            .map(|o| (o.direction / FRAC_PI_2).round() as i64)
+            .collect();
+        assert!(
+            turns.len() > 1,
+            "the spread lands on several quarters: {turns:?}"
+        );
+
+        let (_config, project) = staged(&install, &mut editor);
+        let doc = anno_formats::isd::Doc::parse(&project.files[path]).unwrap();
+        let back = anno_formats::isd::objects::read(&doc, path).unwrap();
+        let guid = editor.island.doc.objects.last().unwrap().guid;
+        let saved: Vec<i64> = (back.iter())
+            .filter(|o| o.guid == guid)
+            .map(|o| o.direction)
+            .collect();
+        assert_eq!(saved.len(), placed.len());
+        assert!(saved.iter().all(|d| d % 368_640 == 0), "{saved:?}");
+
+        editor.selection = [Item::Object(placed[0])].into();
+        assert_eq!(editor.selection_turn(), Some(FRAC_PI_2));
+        let up = [0., 1., 0.];
+        let snapped = |d: Delta, turn: f32| match whole_turns(d, turn) {
+            Delta::Rotate(_, a) => a,
+            _ => unreachable!(),
+        };
+        let turn = editor.selection_turn().unwrap();
+        assert_eq!(snapped(Delta::Rotate(up, 0.9), turn), FRAC_PI_2);
+        assert_eq!(snapped(Delta::Rotate(up, -2.5), turn), -2. * FRAC_PI_2);
+        assert_eq!(snapped(Delta::Rotate(up, 0.3), turn), 0.);
+        assert_eq!(
+            snapped(Delta::Rotate([1., 0., 0.], 0.3), turn),
+            0.3,
+            "a tilt"
+        );
+        let tree_id = editor.island.doc.props.last().unwrap().id;
+        editor.selection = [Item::Prop(tree_id)].into();
+        let turn = editor.selection_turn().unwrap();
+        assert_eq!(turn, 0.);
+        assert_eq!(snapped(Delta::Rotate(up, 0.3), turn), 0.3);
+    }
+
+    // Needs Anno 2070: the buildings of mission 4's n_m02_tilda, owned by
+    // players 1 and 2 (2,806 records), are dyed by their owner. Once its placements are drawn, each owned building's
+    // rows carry the owner's profile colour as their instance word, the
+    // first player's the colour View settings picks and the next players'
+    // the colours after it; trees and unowned rows stay 0. Picking another
+    // colour moves every owner's.
+    #[test]
+    fn a_2070_island_dyes_each_building_by_its_owner() {
+        let Some(dir) = anno_formats::vfs::install_dir("ANNO2070_DIR") else {
+            eprintln!("skip: ANNO2070_DIR unset");
+            return;
+        };
+        use anno_core::game::Module;
+        let module = &anno2070::MODULE;
+        let install = Arc::new(Install::open(dir, module.profile().archive_families).unwrap());
+        let path = "addondata/levels/islands/scenarios/mission04/n_m02_tilda.isd";
+        let mut editor = IslandEditor::load_with(
+            crate::games::module(anno_core::game::Game::Anno2070),
+            &install,
+            path,
+            Some((
+                install.clone(),
+                crate::island::test_support::assets(&install),
+            )),
+        )
+        .unwrap();
+        super::gpu_bench::settle(&mut editor, &install);
+        let word = |owner: u32, player: usize| {
+            let rgb = module.model_look().player_colors
+                [(player + owner as usize - 1) % module.model_look().player_colors.len()]
+            .rgb;
+            anno_render::a2070_buildings::owner_word(rgb)
+        };
+        let check = |editor: &IslandEditor, player: usize| {
+            let owner = |id: u64| {
+                (editor.island.doc.objects.iter())
+                    .find(|o| o.id == id)
+                    .unwrap()
+                    .owner
+            };
+            let words = editor
+                .owner_words()
+                .expect("the island has owned buildings");
+            assert_eq!(words.len(), editor.placements.item.len());
+            let mut dyed = 0;
+            for (item, &w) in editor.placements.item.iter().zip(&words) {
+                match item {
+                    Some(Item::Object(id)) if (1..15).contains(&owner(*id)) => {
+                        assert_eq!(w, word(owner(*id), player), "object {id}");
+                        dyed += 1;
+                    }
+                    _ => assert_eq!(w, 0, "{item:?}"),
+                }
+            }
+            assert!(dyed > 0, "no owned building drawn");
+            words
+        };
+        let first = check(&editor, 0);
+        editor.layers.player = 4;
+        editor.scene_stale = true;
+        super::gpu_bench::settle(&mut editor, &install);
+        let then = check(&editor, 4);
+        assert_ne!(first, then);
+    }
+
+    // Needs Anno 2070: the rotate gizmo's turn never waits on the UI thread.
+    // Opened from an install folder no index was built for (a link to the
+    // install, which keys a fresh one), a selected building's turn is
+    // unknown at once, in well under a frame, where it took 1.2 s (release)
+    // on the first drag; once the index lands off the thread it is a quarter
+    // turn.
+    // Unix only: it links the install folder, which Windows allows only
+    // with developer mode or admin rights.
+    #[cfg(unix)]
+    #[test]
+    fn a_2070_building_turn_answers_at_once_and_snaps_once_read() {
+        let Some(dir) = anno_formats::vfs::install_dir("ANNO2070_DIR") else {
+            eprintln!("skip: ANNO2070_DIR unset");
+            return;
+        };
+        use anno_core::game::Module;
+        let link = tempfile::tempdir().unwrap();
+        let fresh = link.path().join("anno2070");
+        std::os::unix::fs::symlink(&dir, &fresh).unwrap();
+        let module = &anno2070::MODULE;
+        let install = Arc::new(Install::open(&fresh, module.profile().archive_families).unwrap());
+        let path = "data/levels/islands/normal/n_m02.isd";
+        let mut editor = IslandEditor::load_with(
+            crate::games::module(anno_core::game::Game::Anno2070),
+            &install,
+            path,
+            Some((
+                install.clone(),
+                crate::island::test_support::assets(&install),
+            )),
+        )
+        .unwrap();
+        // n_m02's objects that stand on quarter turns: its buildings among
+        // them.
+        let quarters = std::f32::consts::FRAC_PI_2;
+        editor.selection = (editor.island.doc.objects.iter())
+            .filter(|o| (o.direction / quarters - (o.direction / quarters).round()).abs() < 1e-3)
+            .map(|o| Item::Object(o.id))
+            .collect();
+        assert!(!editor.selection.is_empty());
+        let asked = std::time::Instant::now();
+        let first = editor.selection_turn();
+        let took = asked.elapsed();
+        assert!(took < std::time::Duration::from_millis(16), "{took:?}");
+        let started = std::time::Instant::now();
+        let turn = loop {
+            if let Some(turn) = editor.selection_turn() {
+                break turn;
+            }
+            assert!(started.elapsed().as_secs() < 120, "the index never landed");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        assert_eq!(turn, std::f32::consts::FRAC_PI_2, "first answer {first:?}");
+    }
+
+    // Needs Anno 2070: on n_m02 the Harbour tool lays a harbour along the
+    // best shore it finds: 1 m tiles of the harbour asset copied from a
+    // shipped one, on cell middles, a sea edge facing the water, ground
+    // behind and a land edge at the back. One undo step takes them all
+    // back, after which the island saves as shipped; redone, it saves and
+    // reopens to the same tiles: variation, place and turn.
+    #[test]
+    fn a_2070_harbour_lays_along_the_shore_with_undo_and_reopens() {
+        let Some(dir) = anno_formats::vfs::install_dir("ANNO2070_DIR") else {
+            eprintln!("skip: ANNO2070_DIR unset");
+            return;
+        };
+        use anno_core::game::Module;
+        use anno2070::harbour::{HARBOUR, kind};
+        let module = &anno2070::MODULE;
+        let install = Arc::new(Install::open(dir, module.profile().archive_families).unwrap());
+        let assets = Arc::new(
+            anno_formats::assets::Assets::load(&install, module.database().unwrap()).unwrap(),
+        );
+        let path = "data/levels/islands/normal/n_m02.isd";
+        let shipped = install.read(path).unwrap();
+        let mut editor = IslandEditor::load_with(
+            crate::games::module(crate::games::of(&install)),
+            &install,
+            path,
+            Some((install.clone(), assets.clone())),
+        )
+        .unwrap();
+        let count = editor.island.doc.objects.len();
+        editor.tool = Tool::Harbour;
+        assert!(!editor.needs_harbour_library(), "2070 lays its own");
+        let side = editor.island.doc.field.grid.width as f32;
+        let region = super::harbour::Region::spanning([0., 0.], [side, side]);
+        let curve = super::harbour::auto_harbours(&editor.island.doc.field, &region, &[], 1)
+            .pop()
+            .unwrap();
+        let before = editor.island.doc.clone();
+        assert!(editor.push_harbour(curve));
+        editor.history.checkpoint_owned(before);
+
+        let tiles: Vec<anno_core::island::objects::Object> =
+            editor.island.doc.objects[count..].to_vec();
+        assert!(tiles.len() > 8, "{} tiles", tiles.len());
+        let mut kinds = std::collections::BTreeMap::new();
+        for t in &tiles {
+            assert_eq!(t.guid, HARBOUR);
+            assert_eq!(t.position[0].fract(), 0.5);
+            assert_eq!(t.position[2].fract(), 0.5);
+            let q = t.direction / std::f32::consts::FRAC_PI_2;
+            assert!((q - q.round()).abs() < 1e-4, "{}", t.direction);
+            *kinds.entry(kind(t.variation)).or_insert(0) += 1;
+            if kind(t.variation) == "sea edge" {
+                // Ahead along local +z, the sea side, the ground falls more
+                // than a quarter metre below the tile within 4 m.
+                let a = t.direction;
+                let ahead = |k: f32| [t.position[0] - k * a.sin(), t.position[2] + k * a.cos()];
+                let f = &editor.island.doc.field;
+                let low = (1..=4)
+                    .map(|k| f.height(ahead(k as f32)))
+                    .fold(f32::MAX, f32::min);
+                assert!(low < t.position[1] - 0.25, "{:?}: {low}", t.position);
+            }
+        }
+        eprintln!("{kinds:?}");
+        for k in ["sea edge", "ground", "land edge"] {
+            assert!(kinds.contains_key(k), "{k}: {kinds:?}");
+        }
+        let laid = |objects: &[anno_core::island::objects::Object]| {
+            let mut v: Vec<(u32, [i32; 3], i64)> = (objects.iter())
+                .filter(|o| o.guid == HARBOUR)
+                .map(|o| {
+                    let p = o.position.map(|v| (v * 4096.).round() as i32);
+                    let q = (o.direction / std::f32::consts::FRAC_PI_2).round() as i64;
+                    (o.variation, p, q.rem_euclid(4))
+                })
+                .collect();
+            v.sort_unstable();
+            v
+        };
+        let want = laid(&tiles);
+
+        assert!(editor.undo(false));
+        assert_eq!(editor.island.doc.objects.len(), count);
+        let (_config, project) = staged(&install, &mut editor);
+        assert!(
+            project.files[path] == shipped,
+            "undone, it saves as shipped"
+        );
+        assert!(editor.undo(true));
+        let (_config, mut project) = staged(&install, &mut editor);
+        let back = reopen(&install, &mut project, path);
+        assert_eq!(back.island.doc.objects.len(), count + tiles.len());
+        assert_eq!(laid(&back.island.doc.objects), want);
+    }
+
+    // Needs Anno 2070 and a Vulkan device: 2070 islands with their objects,
+    // shot from the island's own camera and from closer in, into the folder
+    // SHOTS_2070 names. SHOTS_2070_ISLANDS: a comma list of island paths
+    // instead of n_m02 and the add-on's settled mission-4 island.
+    // `ANNO2070_DIR=… SHOTS_2070=… cargo test island_shots_2070 -- --ignored`
+    #[test]
+    #[ignore]
+    fn island_shots_2070() {
+        use anno_core::game::Module;
+        let (Some(dir), Some(out)) = (
+            anno_formats::vfs::install_dir("ANNO2070_DIR"),
+            std::env::var_os("SHOTS_2070"),
+        ) else {
+            eprintln!("skip: ANNO2070_DIR or SHOTS_2070 unset");
+            return;
+        };
+        let module = &anno2070::MODULE;
+        let install = Arc::new(Install::open(dir, module.profile().archive_families).unwrap());
+        let islands = std::env::var("SHOTS_2070_ISLANDS").unwrap_or_else(|_| {
+            "data/levels/islands/normal/n_m02.isd,addondata/levels/islands/scenarios/mission04/n_m02_tilda.isd".into()
+        });
+        let (w, h) = (1600u32, 900u32);
+        let mut target = gpui_editor_kit::gpu::Offscreen::new(w, h).unwrap();
+        let assets = assets(&install);
+        for path in islands.split(',') {
+            // As island_shots opens an island: with the asset database, which
+            // names the models the island's buildings draw, then every
+            // background job run to the end. Without the database the
+            // objects never resolve and the shot shows bare ground.
+            let mut editor = IslandEditor::load_with(
+                crate::games::module(crate::games::of(&install)),
+                &install,
+                path,
+                Some((install.clone(), assets.clone())),
+            )
+            .unwrap();
+            super::gpu_bench::settle(&mut editor, &install);
+            let renderer = editor.renderer.clone();
+            let extent = editor.extent();
+            let stem = path.rsplit('/').next().unwrap().trim_end_matches(".isd");
+            // The island's own camera, then 60 m up looking 0.6 down.
+            for (name, height, pitch) in [("fit", 0., 0.), ("close", 60., 0.6f32)] {
+                let mut camera = editor.views[0].camera;
+                if height > 0. {
+                    camera.tilt = std::f32::consts::FRAC_PI_2 - pitch;
+                    let at = camera.distance(extent).expect("perspective");
+                    camera.zoom *= at / (height / pitch.sin());
+                }
+                // Pipelines, model textures and ground pages come up over
+                // the first frames; draw until the pages are baked and the
+                // count of drawn models holds still, at most 10 s.
+                let mut shot = target.render(&renderer, camera, extent).unwrap();
+                let mut last = usize::MAX;
+                for _ in 0..64 {
+                    std::thread::sleep(std::time::Duration::from_millis(150));
+                    shot = target.frame(&renderer).unwrap();
+                    let drawn = renderer.drawn();
+                    let placed = drawn.instances + drawn.placed.iter().sum::<usize>();
+                    if drawn.pages.baked >= drawn.pages.wanted && placed == last && placed > 0 {
+                        break;
+                    }
+                    last = placed;
+                }
+                let file = std::path::Path::new(&out).join(format!("{stem}_{name}.png"));
+                image::RgbaImage::from_raw(w, h, shot)
+                    .unwrap()
+                    .save(&file)
+                    .unwrap();
+                eprintln!("{}", file.display());
+            }
+        }
+    }
+
+    // Needs Anno 2070: a Deep Ocean island opens in the game's view from
+    // under the water and a surface island in the plain one; the under-water
+    // view draws the whole frame otherwise (its light, its water, no sea or
+    // sky), and turning it off and on again in View settings gives back the
+    // view from the air. Frames drift a little with the sky's clouds, so the
+    // way back is held to what still moves, not to the byte (the 2070 crate's
+    // test holds the mode switch itself to the byte).
+    #[test]
+    fn deep_ocean_islands_open_under_water_and_switch_back_to_the_air() {
+        let Some(dir) = anno_formats::vfs::install_dir("ANNO2070_DIR") else {
+            eprintln!("skip: ANNO2070_DIR unset");
+            return;
+        };
+        let families = crate::games::profile(anno_core::game::Game::Anno2070).archive_families;
+        let install = Arc::new(Install::open(dir, families).unwrap());
+        let module = crate::games::module(crate::games::of(&install));
+        let surface =
+            IslandEditor::load(module, &install, "data/levels/islands/normal/n_m02.isd").unwrap();
+        assert!(
+            surface.view.is_none(),
+            "a surface island opened in a view of its own"
+        );
+        let mut editor =
+            IslandEditor::load(module, &install, "data/levels/islands/underwater/u_m02.isd")
+                .unwrap();
+        let view = editor
+            .view
+            .as_ref()
+            .expect("a Deep Ocean island opens under water");
+        assert_eq!(view.mode, anno2070::underwater::MODE);
+        assert!(view.host_texture.is_some(), "the caustics");
+        assert!(editor.layers.under_water);
+        editor.layers.waves = false;
+        let (w, h) = (320u32, 180u32);
+        let mut target = gpui_editor_kit::gpu::Offscreen::new(w, h).unwrap();
+        let mut frame = |editor: &mut IslandEditor, under: bool| {
+            editor.layers.under_water = under;
+            editor.scene_stale = true;
+            editor.refresh_scene();
+            let (camera, extent) = (editor.views[0].camera, editor.extent());
+            let mut shot = Vec::new();
+            for _ in 0..4 {
+                shot = target.render(&editor.renderer, camera, extent).unwrap();
+            }
+            shot
+        };
+        // Share of pixels more than 8 levels apart.
+        let apart = |a: &[u8], b: &[u8]| {
+            let n = (a.chunks(4).zip(b.chunks(4)))
+                .filter(|(p, q)| (0..3).any(|c| p[c].abs_diff(q[c]) > 8))
+                .count();
+            n as f64 / f64::from(w * h)
+        };
+        let air = frame(&mut editor, false);
+        let under = frame(&mut editor, true);
+        let back = frame(&mut editor, false);
+        let (changed, restored) = (apart(&air, &under), apart(&air, &back));
+        eprintln!("under water moved {changed:.3} of the frame; back {restored:.4}");
+        assert!(
+            changed > 0.3,
+            "the under-water view moved {changed:.3} of the frame"
+        );
+        assert!(
+            restored < 0.005,
+            "the view from the air came back {restored:.4} apart"
+        );
+    }
+
+    // Needs the games: an open island drawn on a device that is then lost,
+    // as a driver reset loses one, draws the same frame on a new device
+    // once its frames settle. The kit's renderer, the island's ground and
+    // the game's passes (sky, sea, the under-water view's backdrop and
+    // plankton) make their GPU state again from what the editor holds.
+    #[test]
+    fn an_open_island_draws_the_same_after_its_device_is_lost() {
+        use anno_core::game::Game;
+        use gpui_editor_kit::gpu::{HELD_CLOCK, Offscreen, Renderer};
+        let islands = [
+            (Game::Anno117, "ANNO117_DIR", PIRATE),
+            (Game::Anno1800, "ANNO1800_DIR", MODERATE_M_01),
+            (
+                Game::Anno2070,
+                "ANNO2070_DIR",
+                "data/levels/islands/normal/n_m02.isd",
+            ),
+            (
+                Game::Anno2070,
+                "ANNO2070_DIR",
+                "data/levels/islands/underwater/u_m02.isd",
+            ),
+        ];
+        let (w, h) = (480, 270);
+        // Held at 4 s, as the other island tests hold it, and not let go:
+        // the clock is the process's, and letting it run under a parallel
+        // test moved that test's held waves.
+        HELD_CLOCK.store(4f32.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        for (game, var, path) in islands {
+            let Some(dir) = anno_formats::vfs::install_dir(var) else {
+                eprintln!("skip {path}: {var} unset");
+                continue;
+            };
+            let families = crate::games::profile(game).archive_families;
+            let install = Arc::new(Install::open(dir, families).unwrap());
+            let mut editor = IslandEditor::load_with(
+                crate::games::module(crate::games::of(&install)),
+                &install,
+                path,
+                Some((install.clone(), assets(&install))),
+            )
+            .unwrap();
+            editor.layers.waves = false;
+            super::gpu_bench::settle(&mut editor, &install);
+            super::water_shots::show_water_at(&editor, 4.);
+            let (camera, extent) = (editor.views[0].camera, editor.extent());
+            let renderer = editor.renderer.clone();
+            let sky = editor.sky_pass.clone();
+            // As each_graphics_option_changes_the_view_and_high_draws_it_back
+            // settles a view: until nothing is left to bring in or let go,
+            // the ground pages baked and the clouds marched, then a pause
+            // for the exposure. A few frames first: until a frame comes on
+            // the new device the renderer reports the lost one's state.
+            let draw = |target: &mut Offscreen, renderer: &Renderer| {
+                target.render(renderer, camera, extent).unwrap();
+                let started = std::time::Instant::now();
+                for k in 0.. {
+                    let pages = renderer.drawn().pages;
+                    let still = renderer.settled() && sky.as_ref().is_none_or(|s| s.settled());
+                    if k >= 3 && still && pages.baked >= pages.wanted {
+                        break;
+                    }
+                    assert!(
+                        started.elapsed().as_secs() < 90,
+                        "{path}: still settling after 90 s: {:?}, pages {pages:?}",
+                        renderer.waiting_on()
+                    );
+                    target.frame(renderer).unwrap();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                target.frame(renderer).unwrap()
+            };
+            let mut target = Offscreen::on_new_device(w, h).unwrap();
+            let before = draw(&mut target, &renderer);
+            target.lose();
+            drop(target);
+            let mut target = Offscreen::on_new_device(w, h).unwrap();
+            let after = draw(&mut target, &renderer);
+            // An island, not a blank or a backdrop alone.
+            let colours = (before.chunks(4))
+                .map(|p| u32::from_le_bytes([p[0], p[1], p[2], p[3]]))
+                .collect::<std::collections::HashSet<_>>()
+                .len();
+            assert!(colours > 2000, "{path}: drew {colours} colours");
+            let off = before.iter().zip(&after).filter(|(a, b)| a != b).count();
+            let most = before.iter().zip(&after).map(|(a, b)| a.abs_diff(*b)).max();
+            assert!(
+                off == 0,
+                "{path}: {off} of {} bytes off after the loss, by at most {most:?}",
+                before.len()
+            );
+        }
+    }
+
+    // Needs Anno 2070: an island painted with the developers' magenta
+    // stand-in layers says so on opening and again on saving, naming the
+    // layers and the ground they cover; the Paint pane marks them, and they
+    // still paint. One without them says nothing.
+    #[test]
+    fn a_2070_island_with_placeholder_layers_warns_on_open_and_save() {
+        let Some(dir) = anno_formats::vfs::install_dir("ANNO2070_DIR") else {
+            eprintln!("skip: ANNO2070_DIR unset");
+            return;
+        };
+        let families = crate::games::profile(anno_core::game::Game::Anno2070).archive_families;
+        let install = Install::open(dir, families).unwrap();
+        let open = |path: &str| {
+            IslandEditor::load(
+                crate::games::module(crate::games::of(&install)),
+                &install,
+                path,
+            )
+            .unwrap()
+        };
+        let mut editor = open("data/levels/testworlds/merged_press/tycooncity_n_l21.isd");
+        let (said, warning) = editor.message.take().expect("a warning on opening");
+        assert!(warning, "{said}");
+        assert!(said.contains("draw magenta in game"), "{said}");
+        // Ids 9 and 88 are the two it paints, each with some ground.
+        assert!(said.contains("9 >>> test >>> n_earth_01 ("), "{said}");
+        assert!(said.contains("88 wiki_dummy ("), "{said}");
+        assert!(!said.contains(" 11 ") && !said.contains(" 35 "), "{said}");
+        assert!(editor.placeholder_layer(9) && editor.placeholder_layer(88));
+        assert!(!editor.placeholder_layer(52), "gras_01");
+        let (_config, _project) = staged(&install, &mut editor);
+        let (said, _) = editor.message.take().expect("a warning on saving");
+        assert!(said.contains("draw magenta in game"), "{said}");
+
+        let mut plain = open("data/levels/islands/normal/n_m02.isd");
+        let said = plain.message.take().map(|m| m.0).unwrap_or_default();
+        assert!(!said.contains("magenta"), "{said}");
+        // Painting with one works, and the save then warns about it.
+        let side = plain.island.doc.field.grid.width as f32;
+        let at = [side / 2., side / 2.];
+        plain.brush = Brush {
+            radius: 4.,
+            strength: 1.,
+            ..Brush::default()
+        };
+        plain.tool = Tool::Paint;
+        plain.paint = 9;
+        let ground = [at[0], plain.island.doc.field.height(at), at[1]];
+        assert!(plain.dab(ground, 0., false, None));
+        let (_config, _project) = staged(&install, &mut plain);
+        let (said, _) = plain.message.take().expect("a warning on saving");
+        assert!(said.contains("9 >>> test >>> n_earth_01 ("), "{said}");
+    }
+
+    // Needs Anno 2070: every scatter layer n_m02 paints (grass, bushes or
+    // kelp objects, with no diffuse texture) gets a Paint pane thumbnail of
+    // the texture its objects wear: a picture with visible, coloured pixels.
+    #[test]
+    fn every_scatter_layer_on_a_2070_island_has_a_thumbnail() {
+        use anno_core::island::Paint;
+        let Some(dir) = anno_formats::vfs::install_dir("ANNO2070_DIR") else {
+            eprintln!("skip: ANNO2070_DIR unset");
+            return;
+        };
+        let families = crate::games::profile(anno_core::game::Game::Anno2070).archive_families;
+        let install = Install::open(dir, families).unwrap();
+        let path = "data/levels/islands/normal/n_m02.isd";
+        let editor = IslandEditor::load(
+            crate::games::module(crate::games::of(&install)),
+            &install,
+            path,
+        )
+        .unwrap();
+        let Some(Paint::Layers(layers)) = editor.island.doc.materials.as_ref().map(|m| &m.paint)
+        else {
+            panic!("2070 paint");
+        };
+        let [w, h] = layers.chunks();
+        let scatter: std::collections::BTreeSet<u8> = (0..w * h)
+            .flat_map(|k| layers.ids(k).iter().copied())
+            .filter(|&id| layers.registry().scatter(id))
+            .collect();
+        eprintln!("scatter layers on n_m02: {scatter:?}");
+        assert!(!scatter.is_empty());
+        for id in scatter {
+            let (_, image) = (editor.thumbs.iter())
+                .find(|t| t.0 == id)
+                .unwrap_or_else(|| panic!("no thumbnail for scatter layer {id}"));
+            let size = image.size(0);
+            assert!(size.width.0 >= 16 && size.height.0 >= 16, "{id}: {size:?}");
+            let pixels = image.as_bytes(0).unwrap();
+            let shown = (pixels.chunks(4))
+                .filter(|p| p[3] > 0 && p[..3].iter().any(|&c| c > 16))
+                .count();
+            assert!(shown * 10 > pixels.len() / 4, "{id}: {shown} pixels show");
+        }
+    }
+
+    // Needs Anno 2070: a Raise dab on n_m02's buildable plateau lifts ground
+    // over the band's top edge (gameplay height 768/1024 m). Every 1 m cell
+    // it lifts from the band to above it is blocked in the document's path
+    // blockers at once, all four 0.5 m bits, and no other bit of either
+    // layer changes. The save writes the same blockers, since 2070's codec
+    // blocks lifted ground by the same rule; one undo clears them with the
+    // heights.
+    #[test]
+    fn a_2070_sculpt_blocks_the_ground_it_lifts_at_once_and_undo_clears_it() {
+        use anno_core::island::PathLayer;
+        let Some(dir) = anno_formats::vfs::install_dir("ANNO2070_DIR") else {
+            eprintln!("skip: ANNO2070_DIR unset");
+            return;
+        };
+        let families = crate::games::profile(anno_core::game::Game::Anno2070).archive_families;
+        let install = Install::open(dir, families).unwrap();
+        let path = "data/levels/islands/normal/n_m02.isd";
+        let mut editor = IslandEditor::load(
+            crate::games::module(crate::games::of(&install)),
+            &install,
+            path,
+        )
+        .unwrap();
+        let loaded = editor.island.doc.clone();
+        let paths = |d: &super::Doc, layer, x, z| d.blockers().unwrap().get(layer, x, z);
+        // The shipped rule, worked out here: the mean of a cell's corners
+        // in 1/1024 m, truncated.
+        let gameplay = |f: &gpui_editor_kit::heightfield::Heightfield, x: usize, z: usize| {
+            let sum = f.at(x, z) as f64 + f.at(x + 1, z) as f64;
+            ((sum + f.at(x, z + 1) as f64 + f.at(x + 1, z + 1) as f64) / 4. * 1024.).trunc()
+        };
+        let open = |x: usize, z: usize| {
+            (0..4).all(|q| !paths(&loaded, PathLayer::Blocked, 2 * x + q % 2, 2 * z + q / 2))
+        };
+        let band = |x: usize, z: usize| (676. ..=768.).contains(&gameplay(&loaded.field, x, z));
+        // A cell of open buildable land with 5 m of it all round.
+        let cols = loaded.field.grid.width - 1;
+        let (x, z) = (6..cols - 6)
+            .flat_map(|z| (6..cols - 6).map(move |x| (x, z)))
+            .find(|&(x, z)| {
+                (x - 5..=x + 5).all(|i| (z - 5..=z + 5).all(|j| band(i, j) && open(i, j)))
+            })
+            .unwrap();
+        editor.brush = Brush {
+            radius: 3.,
+            strength: 1.,
+            ..Brush::default()
+        };
+        editor.tool = Tool::Raise;
+        let at = [x as f32 + 0.5, loaded.field.at(x, z), z as f32 + 0.5];
+        let before = editor.island.doc.clone();
+        assert!(editor.dab(at, 0., false, None));
+        editor.history.checkpoint_owned(before);
+
+        let now = editor.island.doc.clone();
+        let mut lifted = 0;
+        for j in z - 8..=z + 8 {
+            for i in x - 8..=x + 8 {
+                let lifts =
+                    gameplay(&loaded.field, i, j) <= 768. && gameplay(&now.field, i, j) > 768.;
+                lifted += usize::from(lifts);
+                for q in 0..4 {
+                    let (a, b) = (2 * i + q % 2, 2 * j + q / 2);
+                    let was = paths(&loaded, PathLayer::Blocked, a, b);
+                    assert_eq!(
+                        paths(&now, PathLayer::Blocked, a, b),
+                        was || lifts,
+                        "{i},{j}"
+                    );
+                    let high = PathLayer::HighGround;
+                    assert_eq!(paths(&now, high, a, b), paths(&loaded, high, a, b));
+                }
+            }
+        }
+        assert!(lifted > 4, "{lifted} cells lifted");
+
+        // What the save blocks is what the document showed.
+        let (_config, mut project) = staged(&install, &mut editor);
+        let back = reopen(&install, &mut project, path);
+        let (cols, rows) = now.blockers().unwrap().size();
+        for b in 0..rows {
+            for a in 0..cols {
+                for layer in [PathLayer::Blocked, PathLayer::HighGround] {
+                    assert_eq!(
+                        paths(&back.island.doc, layer, a, b),
+                        paths(&now, layer, a, b),
+                        "{a},{b}"
+                    );
+                }
+            }
+        }
+
+        assert!(editor.undo(false));
+        assert_eq!(editor.island.doc.field.heights, loaded.field.heights);
+        for b in 0..rows {
+            for a in 0..cols {
+                let layer = PathLayer::Blocked;
+                assert_eq!(
+                    paths(&editor.island.doc, layer, a, b),
+                    paths(&loaded, layer, a, b)
+                );
+            }
+        }
+    }
+
+    // A game whose islands, paint and ground are its own (the skeleton's
+    // `.ski`, `Dots` and `Sand`) opens, sculpts, paints, undoes, saves and
+    // reopens through its module alone: its codec reads and writes the
+    // file, its paint takes the brush, and its ground mounts and follows
+    // every dab and undo.
+    #[test]
+    fn a_skeleton_island_of_its_own_format_edits_saves_and_reopens() {
+        use crate::games::fixtures::{Dots, SAND_UPDATES, SKELETON, SKELETON_FILES, install};
+        use std::sync::atomic::Ordering;
+        let path = "content/isles/reef/made/atoll/atoll.ski";
+        let side = 33;
+        let heights: Vec<String> = (0..side * side)
+            .map(|i| {
+                let (x, z) = ((i % side) as f32 - 16., (i / side) as f32 - 16.);
+                format!("{}", 6. - 0.02 * (x * x + z * z))
+            })
+            .collect();
+        let ski = format!(
+            "ski 1\nsize {side} {side}\nh {}\np {}\n",
+            heights.join(" "),
+            vec!["1"; side * side].join(" ")
+        );
+        let mut files = SKELETON_FILES.to_vec();
+        files.push((path, ski.as_bytes()));
+        let dir = tempfile::tempdir().unwrap();
+        let install = install(&dir.path().join("game"), &files);
+        let mut editor = IslandEditor::load(&SKELETON, &install, path).unwrap();
+        assert!(editor.island.saves_through_codec());
+        let ground = editor.own_ground.as_ref().expect("draws its own ground");
+        assert!(matches!(ground.draw(), super::gpu::GroundDraw::Surface(_)));
+        assert_eq!(editor.shading, super::Shading::Ground);
+        let ids: Vec<u8> = editor.thumbs.iter().map(|t| t.0).collect();
+        assert_eq!(ids, [1, 2, 3]);
+        let dots = |d: &super::Doc| match &d.materials.as_ref().unwrap().paint {
+            super::Paint::Own(own) => own.get::<Dots>().unwrap().clone(),
+            _ => panic!("skeleton paint"),
+        };
+        let loaded = editor.island.doc.clone();
+
+        let (x, z) = (16, 16);
+        let height = loaded.field.at(x, z);
+        editor.brush = Brush {
+            radius: 3.,
+            strength: 1.,
+            ..Brush::default()
+        };
+        editor.tool = Tool::Raise;
+        let before = editor.island.doc.clone();
+        assert!(editor.dab([16., height, 16.], 0., false, None));
+        editor.history.checkpoint_owned(before);
+        let raised = editor.island.doc.field.at(x, z);
+        assert!(raised > height + 0.5, "{height} -> {raised}");
+
+        let updates = SAND_UPDATES.load(Ordering::Relaxed);
+        editor.tool = Tool::Paint;
+        editor.paint = 2;
+        let before = editor.island.doc.clone();
+        assert!(editor.dab([16., raised, 16.], 0., false, None));
+        editor.history.checkpoint_owned(before);
+        assert!(
+            SAND_UPDATES.load(Ordering::Relaxed) > updates,
+            "the ground took the dab"
+        );
+        let m = editor.island.doc.materials.as_ref().unwrap();
+        assert_eq!(m.dominant([16., 16.]), 2);
+        assert_eq!(m.dominant([2., 2.]), 1, "away from the dab");
+        let edited = editor.island.doc.clone();
+
+        // Undone, the file saves as it was read.
+        assert!(editor.undo(false) && editor.undo(false));
+        assert_eq!(editor.island.doc.field.heights, loaded.field.heights);
+        assert_eq!(dots(&editor.island.doc).id(x, z), 1);
+        let config = tempfile::tempdir().unwrap();
+        let mut project = Project::load(config.path(), &SKELETON).unwrap();
+        editor.stage(&install, &mut project).unwrap();
+        assert_eq!(
+            project.files[path],
+            ski.as_bytes(),
+            "undone, it saves as read"
+        );
+
+        assert!(editor.undo(true) && editor.undo(true));
+        editor.stage(&install, &mut project).unwrap();
+        project.write().unwrap();
+        (install.mount_mods(
+            &[project.folder().as_path()],
+            anno_core::game::Module::project_roots(&SKELETON),
+        ))
+        .unwrap();
+        let back = IslandEditor::load(&SKELETON, &install, path).unwrap();
+        assert_eq!(back.island.doc.field.heights, edited.field.heights);
+        let (shown, made) = (dots(&back.island.doc), dots(&edited));
+        assert!(
+            (0..side * side).all(|i| shown.id(i % side, i / side) == made.id(i % side, i / side))
+        );
+        assert_eq!(shown.id(x, z), 2);
+        assert!(back.own_ground.is_some());
+    }
+
+    // Needs Anno 2070: n_m02 opens in the island editor through 2070's own
+    // codec, drawing its own ground with a thumbnail per colour layer. A
+    // sculpt and a paint stroke through the shared tools undo exactly; a
+    // save then gives back the shipped file byte for byte. Redone, they
+    // save and reopen with the heights and paint they made, and every chunk
+    // away from them as shipped.
+    // Chunk `k`'s height samples as the file stores them; `None` for an
+    // empty ocean chunk.
+    fn chunk_heights(doc: &anno_formats::isd::Doc, k: usize) -> Option<&[u8]> {
+        let map = doc.child(doc.root("Terrain")?, "ChunkMap")?;
+        let element = (doc.children(map))
+            .filter(|&c| doc.name(c) == b"Element")
+            .nth(k)?;
+        let data = doc.child(doc.child(element, "HeightMap")?, "Data")?;
+        match doc.value(data) {
+            anno_formats::isd::Value::Blob(b) => Some(b),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_2070_island_sculpts_paints_undoes_saves_and_reopens() {
+        use anno_formats::isd::terrain::Terrain;
+        let Some(dir) = anno_formats::vfs::install_dir("ANNO2070_DIR") else {
+            eprintln!("skip: ANNO2070_DIR unset");
+            return;
+        };
+        let families = crate::games::profile(anno_core::game::Game::Anno2070).archive_families;
+        let install = Install::open(dir, families).unwrap();
+        let path = "data/levels/islands/normal/n_m02.isd";
+        let shipped = install.read(path).unwrap();
+        let mut editor = IslandEditor::load(
+            crate::games::module(crate::games::of(&install)),
+            &install,
+            path,
+        )
+        .unwrap();
+        assert!(editor.island.saves_through_codec());
+        assert!(editor.own_ground.is_some(), "draws its own ground");
+        assert_eq!(editor.shading, super::Shading::Ground);
+        assert!(
+            editor.thumbs.len() > 20,
+            "{} thumbnails",
+            editor.thumbs.len()
+        );
+        let loaded = editor.island.doc.clone();
+
+        // The middle of the island, on land, at a metre corner.
+        let side = loaded.field.grid.width;
+        let (x, z) = (side / 2, side / 2);
+        let at = [x as f32, z as f32];
+        let height = loaded.field.at(x, z);
+        assert!(height > 0., "{height}");
+        editor.brush = Brush {
+            radius: 4.,
+            strength: 1.,
+            ..Brush::default()
+        };
+        editor.tool = Tool::Raise;
+        let before = editor.island.doc.clone();
+        assert!(editor.dab([at[0], height, at[1]], 0., false, None));
+        editor.history.checkpoint_owned(before);
+        let raised = editor.island.doc.field.at(x, z);
+        assert!(raised > height + 0.5, "{height} -> {raised}");
+
+        let shown = editor.island.doc.materials.as_ref().unwrap().dominant(at);
+        let paint = (editor.thumbs.iter().map(|t| t.0))
+            .find(|&id| id != shown && id != 0)
+            .unwrap();
+        editor.tool = Tool::Paint;
+        editor.paint = paint;
+        let before = editor.island.doc.clone();
+        assert!(editor.dab([at[0], raised, at[1]], 0., false, None));
+        editor.history.checkpoint_owned(before);
+        let m = editor.island.doc.materials.as_ref().unwrap();
+        assert_eq!(m.dominant(at), paint, "the dab's layer shows at its centre");
+        let edited = editor.island.doc.clone();
+
+        assert!(editor.undo(false) && editor.undo(false));
+        assert!(!editor.undo(false), "two steps");
+        assert_eq!(editor.island.doc.field.heights, loaded.field.heights);
+        let paint_of = |d: &super::Doc| d.materials.as_ref().unwrap().paint.clone();
+        assert!(paint_of(&editor.island.doc) == paint_of(&loaded));
+        let (_config, project) = staged(&install, &mut editor);
+        assert!(
+            project.files[path] == shipped,
+            "undone, it saves as shipped"
+        );
+
+        assert!(editor.undo(true) && editor.undo(true));
+        assert_eq!(editor.island.doc.field.heights, edited.field.heights);
+        assert!(paint_of(&editor.island.doc) == paint_of(&edited));
+        let (_config, mut project) = staged(&install, &mut editor);
+        let saved = project.files[path].clone();
+        assert!(saved != shipped);
+        let back = reopen(&install, &mut project, path);
+        assert_eq!(back.island.doc.field.heights, edited.field.heights);
+        assert!(paint_of(&back.island.doc) == paint_of(&edited));
+        assert_eq!(
+            back.island.doc.materials.as_ref().unwrap().dominant(at),
+            paint
+        );
+
+        // Chunks away from the edits keep their heights and paint as shipped.
+        let (da, db) = (
+            anno_formats::isd::Doc::parse(&shipped).unwrap(),
+            anno_formats::isd::Doc::parse(&saved).unwrap(),
+        );
+        let (a, b) = (
+            Terrain::read(&da, path).unwrap(),
+            Terrain::read(&db, path).unwrap(),
+        );
+        let (w, h) = a.size();
+        let mut kept = 0;
+        for k in 0..w * h {
+            let (cx, cz) = ((k % w * 16) as f32, (k / w * 16) as f32);
+            let near =
+                cx - 6. <= at[0] && at[0] <= cx + 22. && cz - 6. <= at[1] && at[1] <= cz + 22.;
+            if near {
+                continue;
+            }
+            kept += 1;
+            assert_eq!(chunk_heights(&da, k), chunk_heights(&db, k));
+            assert_eq!(a.ids(k), b.ids(k), "chunk {k}");
+            for l in 0..a.ids(k).len() {
+                assert!(a.plane(k, l) == b.plane(k, l), "chunk {k} layer {l}");
+            }
+        }
+        assert!(kept > w * h / 2);
+    }
+
+    // Needs Anno 2070: a Deep Ocean island takes the editor's tools and
+    // reopens with what they did. On u_m02's plateau a Raise dab lifts open
+    // ground off the plateau's buildable band (-27.10 to -26.90 m), and the
+    // cells it lifts past the band are blocked at once, as on land; a paint
+    // dab, a path-blocker stroke and an object moved 2 m east join it. The
+    // staged file reopens with those heights, that paint, those blockers and
+    // that object, still passes 2070's checks, and keeps every chunk away
+    // from the edits as shipped. The game has no harbours under water: no
+    // shipped Deep Ocean island holds a harbour tile, and the Harbour tool
+    // finds no shore on one.
+    #[test]
+    fn a_deep_ocean_island_sculpts_paints_blocks_moves_saves_and_reopens() {
+        use anno_core::game::{Module, Refs, Use};
+        use anno_core::island::PathLayer;
+        use anno_formats::isd::grids::gameplay_height;
+        use anno_formats::isd::terrain::Terrain;
+        use anno2070::island::UNDERWATER_BUILDABLE;
+        let Some(dir) = anno_formats::vfs::install_dir("ANNO2070_DIR") else {
+            eprintln!("skip: ANNO2070_DIR unset");
+            return;
+        };
+        let module = &anno2070::MODULE;
+        let install = Arc::new(Install::open(dir, module.profile().archive_families).unwrap());
+        let assets = Arc::new(
+            anno_formats::assets::Assets::load(&install, module.database().unwrap()).unwrap(),
+        );
+        // No shipped Deep Ocean island has a harbour tile.
+        let deep: Vec<String> = (install.search(".isd", 100_000).into_iter())
+            .map(|id| install.file_path(id).to_owned())
+            .filter(|p| p.contains("underwater/"))
+            .collect();
+        assert!(deep.len() > 30, "{} Deep Ocean islands", deep.len());
+        for p in &deep {
+            let codec = module.islands().unwrap().codec().own().unwrap();
+            let island = codec.read(&install, p, Some(&assets)).unwrap();
+            let tiles = (island.doc.objects.iter())
+                .filter(|o| o.guid == anno2070::harbour::HARBOUR)
+                .count();
+            assert_eq!(tiles, 0, "{p} holds harbour tiles");
+        }
+
+        let path = "data/levels/islands/underwater/u_m02.isd";
+        let shipped = install.read(path).unwrap();
+        let mut editor = IslandEditor::load_with(
+            crate::games::module(crate::games::of(&install)),
+            &install,
+            path,
+            Some((install.clone(), assets.clone())),
+        )
+        .unwrap();
+        let side = editor.island.doc.field.grid.width as f32;
+        let region = super::harbour::Region::spanning([0., 0.], [side, side]);
+        let shores = super::harbour::auto_harbours(&editor.island.doc.field, &region, &[], 1);
+        assert!(shores.is_empty(), "a shore under water");
+
+        let loaded = editor.island.doc.clone();
+        let blocked = |d: &super::Doc, x: usize, z: usize| {
+            (0..4).any(|q| {
+                (d.blockers().unwrap()).get(PathLayer::Blocked, 2 * x + q % 2, 2 * z + q / 2)
+            })
+        };
+        let gameplay = |f: &gpui_editor_kit::heightfield::Heightfield, x: usize, z: usize| {
+            gameplay_height([
+                f.at(x, z),
+                f.at(x + 1, z),
+                f.at(x, z + 1),
+                f.at(x + 1, z + 1),
+            ])
+        };
+        let band =
+            |x: usize, z: usize| UNDERWATER_BUILDABLE.contains(&gameplay(&loaded.field, x, z));
+        // Open plateau with 4 m of it all round.
+        let cols = loaded.field.grid.width - 1;
+        let (x, z) = (6..cols - 6)
+            .flat_map(|z| (6..cols - 6).map(move |x| (x, z)))
+            .find(|&(x, z)| {
+                (x - 4..=x + 4)
+                    .all(|i| (z - 4..=z + 4).all(|j| band(i, j) && !blocked(&loaded, i, j)))
+            })
+            .expect("open plateau");
+        editor.brush = Brush {
+            radius: 3.,
+            strength: 1.,
+            ..Brush::default()
+        };
+        editor.tool = Tool::Raise;
+        let at = [x as f32 + 0.5, loaded.field.at(x, z), z as f32 + 0.5];
+        let before = editor.island.doc.clone();
+        assert!(editor.dab(at, 0., false, None));
+        editor.history.checkpoint_owned(before);
+        let top = *UNDERWATER_BUILDABLE.end();
+        let mut lifted = 0;
+        for j in z - 6..=z + 6 {
+            for i in x - 6..=x + 6 {
+                let lifts = gameplay(&loaded.field, i, j) <= top
+                    && gameplay(&editor.island.doc.field, i, j) > top;
+                lifted += usize::from(lifts);
+                assert_eq!(
+                    blocked(&editor.island.doc, i, j),
+                    blocked(&loaded, i, j) || lifts,
+                    "{i},{j}"
+                );
+            }
+        }
+        assert!(lifted > 4, "{lifted} cells lifted off the plateau");
+
+        // Paint 20 m away, a blocker stroke on open plateau 12 m or more
+        // the other way.
+        let paint_at = [x as f32 + 20., z as f32];
+        let shown = editor
+            .island
+            .doc
+            .materials
+            .as_ref()
+            .unwrap()
+            .dominant(paint_at);
+        let paint = (editor.thumbs.iter().map(|t| t.0))
+            .find(|&id| id != shown && id != 0)
+            .unwrap();
+        editor.tool = Tool::Paint;
+        editor.paint = paint;
+        let before = editor.island.doc.clone();
+        let h = editor.island.doc.field.height(paint_at);
+        assert!(editor.dab([paint_at[0], h, paint_at[1]], 0., false, None));
+        editor.history.checkpoint_owned(before);
+        let before = editor.island.doc.clone();
+        let (sx, sz) = (2..cols - 2)
+            .flat_map(|j| (2..x.saturating_sub(12)).map(move |i| (i, j)))
+            .find(|&(i, j)| band(i, j) && !blocked(&loaded, i, j))
+            .expect("open plateau to block");
+        let stroke = [sx as f32 + 0.5, sz as f32 + 0.5];
+        let set = (editor.island.doc.blockers_mut().unwrap()).brush(
+            PathLayer::Blocked,
+            stroke[0],
+            stroke[1],
+            1.5,
+            true,
+        );
+        assert!(set > 0);
+        editor.history.checkpoint_owned(before);
+        // An object 2 m east.
+        let object = loaded.objects[0].clone();
+        editor.selection = [Item::Object(object.id)].into();
+        editor.set_field(super::Field::Position(0), object.position[0] + 2.);
+        let edited = editor.island.doc.clone();
+
+        let (_config, mut project) = staged(&install, &mut editor);
+        let saved = project.files[path].clone();
+        assert!(saved != shipped);
+        let back = reopen(&install, &mut project, path);
+        let doc = &back.island.doc;
+        assert_eq!(doc.field.heights, edited.field.heights);
+        let paint_of = |d: &super::Doc| d.materials.as_ref().unwrap().paint.clone();
+        assert!(paint_of(doc) == paint_of(&edited));
+        assert_eq!(doc.materials.as_ref().unwrap().dominant(paint_at), paint);
+        let (a, b) = (doc.blockers().unwrap(), edited.blockers().unwrap());
+        let (bc, br) = b.size();
+        for layer in [PathLayer::Blocked, PathLayer::HighGround] {
+            for j in 0..br {
+                for i in 0..bc {
+                    assert_eq!(a.get(layer, i, j), b.get(layer, i, j), "{i},{j}");
+                }
+            }
+        }
+        let moved = doc.objects.iter().find(|o| o.id == object.id).unwrap();
+        assert_eq!(
+            moved.position,
+            [
+                object.position[0] + 2.,
+                object.position[1],
+                object.position[2]
+            ]
+        );
+        let none = |_: &str| false;
+        let refs = Refs {
+            install: &install,
+            project: &none,
+            assets: Some(&assets),
+        };
+        let use_ = Use {
+            region: module.islands().unwrap().rules().island_region(path),
+            start: false,
+            playable: true,
+        };
+        let problems = module
+            .islands()
+            .unwrap()
+            .validate(&back.island, &refs, use_);
+        assert!(
+            problems.is_empty(),
+            "{:?}",
+            problems.iter().map(|p| p.said()).collect::<Vec<_>>()
+        );
+
+        // Chunks away from the edits keep their heights and paint as shipped.
+        let (da, db) = (
+            anno_formats::isd::Doc::parse(&shipped).unwrap(),
+            anno_formats::isd::Doc::parse(&saved).unwrap(),
+        );
+        let (a, b) = (
+            Terrain::read(&da, path).unwrap(),
+            Terrain::read(&db, path).unwrap(),
+        );
+        let (w, h) = a.size();
+        let mut kept = 0;
+        for k in 0..w * h {
+            let (cx, cz) = ((k % w * 16) as f32, (k / w * 16) as f32);
+            let near = |p: [f32; 2]| {
+                cx - 6. <= p[0] && p[0] <= cx + 22. && cz - 6. <= p[1] && p[1] <= cz + 22.
+            };
+            if near([at[0], at[2]]) || near(paint_at) || near(stroke) {
+                continue;
+            }
+            kept += 1;
+            assert_eq!(chunk_heights(&da, k), chunk_heights(&db, k));
+            assert_eq!(a.ids(k), b.ids(k), "chunk {k}");
+        }
+        assert!(kept > w * h / 2);
+    }
+
+    // Needs Anno 2070: the editor's database, read once, serves an island
+    // open: n_m02 opened with it parses no assets again, and its 5,368
+    // records (props and objects) name the models the database lists, as
+    // an open that reads its own does. That one reads the database once.
+    #[test]
+    fn a_2070_island_opens_on_the_editors_database_without_reading_it_again() {
+        let Some(dir) = anno_formats::vfs::install_dir("ANNO2070_DIR") else {
+            eprintln!("skip: ANNO2070_DIR unset");
+            return;
+        };
+        let module = &anno2070::MODULE;
+        let families = crate::games::profile(anno_core::game::Game::Anno2070).archive_families;
+        let install = Arc::new(Install::open(dir, families).unwrap());
+        let path = "data/levels/islands/normal/n_m02.isd";
+        let assets = Arc::new(crate::games::assets(module, &install).unwrap());
+        let game = crate::games::of(&install);
+        let before = anno2070::assets::parses();
+        let shared = Some((install.clone(), assets.clone()));
+        let editor =
+            IslandEditor::load_with(crate::games::module(game), &install, path, shared).unwrap();
+        assert_eq!(
+            anno2070::assets::parses(),
+            before,
+            "the open read no assets"
+        );
+        let alone = IslandEditor::load(crate::games::module(game), &install, path).unwrap();
+        assert_eq!(
+            anno2070::assets::parses(),
+            before + 1,
+            "alone, it reads them once"
+        );
+        let doc = &editor.island.doc;
+        let placed = |e: &IslandEditor| {
+            let d = &e.island.doc;
+            (d.meshes.clone(), d.props.len(), d.objects.len())
+        };
+        assert_eq!(placed(&editor), placed(&alone));
+        // Trees, rocks and grass whose file names a model, not a marker,
+        // and objects whose asset lists one.
+        let props = (doc.props.iter())
+            .filter(|p| doc.meshes[p.source.file as usize] != anno2070::objects::NO_MODEL)
+            .count();
+        let objects = (doc.objects.iter())
+            .filter(|o| assets.get(o.guid).is_some_and(|a| !a.cfgs.is_empty()))
+            .count();
+        // Recorded 2026-11-19 on the Steam install.
+        assert_eq!(assets.iter().count(), 1_359);
+        assert_eq!((props, doc.props.len()), (5_338, 5_338));
+        assert_eq!((objects, doc.objects.len()), (30, 30));
+    }
+
+    // Needs Anno 2070: on n_m02 a Raise dab lifts buildable ground and the
+    // document blocks it; a Grid stroke with Shift then clears the middle of
+    // it. The save writes the cleared cells open, as the editor shows them,
+    // where it used to block them again from the file's heights. Undoing the
+    // clear saves them blocked, undoing the sculpt saves the island as
+    // shipped, and redoing both saves the cleared cells open again.
+    #[test]
+    fn a_2070_cell_a_sculpt_lifts_and_the_grid_brush_clears_saves_open() {
+        use anno_core::island::PathLayer;
+        let Some(dir) = anno_formats::vfs::install_dir("ANNO2070_DIR") else {
+            eprintln!("skip: ANNO2070_DIR unset");
+            return;
+        };
+        let families = crate::games::profile(anno_core::game::Game::Anno2070).archive_families;
+        let install = Install::open(dir, families).unwrap();
+        let path = "data/levels/islands/normal/n_m02.isd";
+        let shipped = install.read(path).unwrap();
+        let mut editor = IslandEditor::load(
+            crate::games::module(crate::games::of(&install)),
+            &install,
+            path,
+        )
+        .unwrap();
+        let loaded = editor.island.doc.clone();
+        let blocked = |d: &super::Doc, x: usize, z: usize| {
+            d.blockers().unwrap().get(PathLayer::Blocked, x, z)
+        };
+        // Open band ground 5 m all round (the shipped rule, worked out here).
+        let gameplay = |f: &gpui_editor_kit::heightfield::Heightfield, x: usize, z: usize| {
+            let sum = f.at(x, z) as f64 + f.at(x + 1, z) as f64;
+            ((sum + f.at(x, z + 1) as f64 + f.at(x + 1, z + 1) as f64) / 4. * 1024.).trunc()
+        };
+        let open =
+            |x: usize, z: usize| (0..4).all(|q| !blocked(&loaded, 2 * x + q % 2, 2 * z + q / 2));
+        let band = |x: usize, z: usize| (676. ..=768.).contains(&gameplay(&loaded.field, x, z));
+        let cols = loaded.field.grid.width - 1;
+        let (x, z) = (6..cols - 6)
+            .flat_map(|z| (6..cols - 6).map(move |x| (x, z)))
+            .find(|&(x, z)| {
+                (x - 5..=x + 5).all(|i| (z - 5..=z + 5).all(|j| band(i, j) && open(i, j)))
+            })
+            .unwrap();
+        let at = [x as f32 + 0.5, z as f32 + 0.5];
+        let ground = |e: &IslandEditor| [at[0], e.island.doc.field.height(at), at[1]];
+
+        editor.brush = Brush {
+            radius: 3.,
+            strength: 1.,
+            ..Brush::default()
+        };
+        editor.tool = Tool::Raise;
+        let before = editor.island.doc.clone();
+        assert!(editor.dab(ground(&editor), 0., false, None));
+        editor.history.checkpoint_owned(before);
+        // The 0.5 m bits of the dab's middle metre.
+        let middle: Vec<(usize, usize)> = (0..4).map(|q| (2 * x + q % 2, 2 * z + q / 2)).collect();
+        assert!(
+            middle
+                .iter()
+                .all(|&(a, b)| blocked(&editor.island.doc, a, b))
+        );
+        let lifted = editor.island.doc.clone();
+
+        editor.tool = Tool::Grid;
+        editor.blocker = grids::BlockerEdit::Paths(PathLayer::Blocked);
+        editor.brush.radius = 1.;
+        let before = editor.island.doc.clone();
+        assert!(editor.dab(ground(&editor), 0., true, None));
+        editor.history.checkpoint_owned(before);
+        assert!(
+            middle
+                .iter()
+                .all(|&(a, b)| !blocked(&editor.island.doc, a, b))
+        );
+        let cleared = editor.island.doc.clone();
+
+        // Saved and reopened, every bit of both layers is the document's.
+        let saves_as = |editor: &mut IslandEditor, want: &super::Doc| {
+            let (_config, mut project) = staged(&install, editor);
+            let back = reopen(&install, &mut project, path);
+            let (a, b) = (
+                back.island.doc.blockers().unwrap(),
+                want.blockers().unwrap(),
+            );
+            let (cols, rows) = a.size();
+            for layer in [PathLayer::Blocked, PathLayer::HighGround] {
+                for j in 0..rows {
+                    for i in 0..cols {
+                        assert_eq!(a.get(layer, i, j), b.get(layer, i, j), "{layer:?} {i},{j}");
+                    }
+                }
+            }
+        };
+        saves_as(&mut editor, &cleared);
+
+        assert!(editor.undo(false));
+        assert!(
+            middle
+                .iter()
+                .all(|&(a, b)| blocked(&editor.island.doc, a, b))
+        );
+        saves_as(&mut editor, &lifted);
+        assert!(editor.undo(false) && !editor.undo(false));
+        let (_config, project) = staged(&install, &mut editor);
+        assert!(
+            project.files[path] == shipped,
+            "undone, it saves as shipped"
+        );
+
+        assert!(editor.undo(true) && editor.undo(true));
+        assert_eq!(editor.island.doc.field.heights, cleared.field.heights);
+        assert!(
+            middle
+                .iter()
+                .all(|&(a, b)| !blocked(&editor.island.doc, a, b))
+        );
+        saves_as(&mut editor, &cleared);
+    }
+
+    // Needs Anno 2070: on every shipped island with open buildable land, the
+    // rule that blocks lifted ground runs in the document, and the save
+    // writes the document's path blockers bit for bit: 2 m of ground raised
+    // there is blocked, the middle metre cleared again saves open, and
+    // reopened, both layers equal the document's.
+    #[test]
+    fn every_2070_island_saves_its_path_blockers_as_the_document_holds_them() {
+        use anno_core::island::PathLayer;
+        let Some(dir) = anno_formats::vfs::install_dir("ANNO2070_DIR") else {
+            eprintln!("skip: ANNO2070_DIR unset");
+            return;
+        };
+        let families = crate::games::profile(anno_core::game::Game::Anno2070).archive_families;
+        let install = Install::open(dir, families).unwrap();
+        let registry = anno2070::island::registry(&install).unwrap();
+        let (mut files, mut lifted_on) = (0, 0);
+        for i in 0..install.file_count() {
+            let id = anno_formats::vfs::FileId(i as u32);
+            let path = install.file_path(id).to_owned();
+            if !path.ends_with(".isd") {
+                continue;
+            }
+            files += 1;
+            let bytes: Arc<[u8]> = install.read_file(id).unwrap().into();
+            let mut island =
+                anno2070::island::from_bytes(bytes.clone(), &path, registry.clone(), None).unwrap();
+            let doc = &island.doc;
+            let blocked = |d: &super::Doc, a: usize, b: usize| {
+                d.blockers().unwrap().get(PathLayer::Blocked, a, b)
+            };
+            let f = &doc.field;
+            let gameplay = |x: usize, z: usize| {
+                anno_formats::isd::grids::gameplay_height([
+                    f.at(x, z),
+                    f.at(x + 1, z),
+                    f.at(x, z + 1),
+                    f.at(x + 1, z + 1),
+                ])
+            };
+            let fits = |x: usize, z: usize| {
+                (x - 1..=x + 2).all(|i| {
+                    (z - 1..=z + 2).all(|j| {
+                        (676..=768).contains(&gameplay(i, j))
+                            && (0..4).all(|q| !blocked(doc, 2 * i + q % 2, 2 * j + q / 2))
+                    })
+                })
+            };
+            let cols = f.grid.width - 1;
+            let Some((x, z)) = (2..cols - 3)
+                .flat_map(|z| (2..cols - 3).map(move |x| (x, z)))
+                .find(|&(x, z)| fits(x, z))
+            else {
+                continue;
+            };
+            lifted_on += 1;
+            // Corners x..=x+2 rise 2 m: cells x-1..=x+2 lift.
+            let was = doc.field.clone();
+            let width = f.grid.width;
+            let field = Arc::make_mut(&mut island.doc.field);
+            for j in z..=z + 2 {
+                for i in x..=x + 2 {
+                    field.heights[j * width + i] += 2.;
+                }
+            }
+            let cells = gpui_editor_kit::heightfield::Rect {
+                x0: x - 1,
+                z0: z - 1,
+                x1: x + 3,
+                z1: z + 3,
+            };
+            assert_eq!(
+                grids::block_lifted(&mut island.doc, |i, j| was.at(i, j), cells),
+                16,
+                "{path}"
+            );
+            let middle = [x as f32 + 1., z as f32 + 1.];
+            let b = island.doc.blockers_mut().unwrap();
+            assert!(b.brush(PathLayer::Blocked, middle[0], middle[1], 0.6, false) > 0);
+            assert!(!blocked(&island.doc, 2 * x + 2, 2 * z + 2), "{path}");
+
+            let saved = anno2070::island::write(&island, &path, None).unwrap();
+            let back =
+                anno2070::island::from_bytes(saved.into(), &path, registry.clone(), None).unwrap();
+            let (a, b) = (back.doc.blockers().unwrap(), island.doc.blockers().unwrap());
+            let (cols, rows) = a.size();
+            for layer in [PathLayer::Blocked, PathLayer::HighGround] {
+                for j in 0..rows {
+                    for i in 0..cols {
+                        assert_eq!(
+                            a.get(layer, i, j),
+                            b.get(layer, i, j),
+                            "{path} {layer:?} {i},{j}"
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(files, 384);
+        eprintln!("{lifted_on} islands with open buildable land");
+        assert!(lifted_on > 200, "{lifted_on}");
+    }
+
+    // Needs Anno 2070: on n_m02 the Grid tool edits 2070's blocker grids.
+    // A stroke on each path layer, a build blocker drawn by clicks, one of
+    // its points dragged and a shipped polygon removed are five undo steps.
+    // A sculpt before them that lifts no ground over the band (a Lower dab)
+    // leaves the grids shared with its step, so it copies none of them.
+    // Undone, the island saves as shipped; redone, it
+    // saves and reopens with the cells and polygons the tools made, and the
+    // ground shows the painted layer.
+    #[test]
+    fn a_2070_island_edits_its_blockers_with_undo() {
+        use anno_core::island::PathLayer;
+        let Some(dir) = anno_formats::vfs::install_dir("ANNO2070_DIR") else {
+            eprintln!("skip: ANNO2070_DIR unset");
+            return;
+        };
+        let families = crate::games::profile(anno_core::game::Game::Anno2070).archive_families;
+        let install = Install::open(dir, families).unwrap();
+        let path = "data/levels/islands/normal/n_m02.isd";
+        let shipped = install.read(path).unwrap();
+        let mut editor = IslandEditor::load(
+            crate::games::module(crate::games::of(&install)),
+            &install,
+            path,
+        )
+        .unwrap();
+        assert!(editor.edits_blockers());
+        let side = editor.island.doc.field.grid.width as f32;
+        let at = [side / 2., side / 2.];
+        let ground = |e: &IslandEditor, p: [f32; 2]| [p[0], e.island.doc.field.height(p), p[1]];
+        editor.brush = Brush {
+            radius: 2.,
+            strength: 1.,
+            ..Brush::default()
+        };
+
+        editor.tool = Tool::Lower;
+        let before = editor.island.doc.clone();
+        assert!(editor.dab(ground(&editor, at), 0., false, None));
+        editor.history.checkpoint_owned(before);
+        let step = editor.history.snapshots().next().unwrap();
+        assert!(
+            std::ptr::eq(
+                step.blockers().unwrap(),
+                editor.island.doc.blockers().unwrap()
+            ),
+            "a sculpt shares the blocker grids with its undo step"
+        );
+        let unblocked = editor.island.doc.clone();
+
+        editor.tool = Tool::Grid;
+        let cell = |p: [f32; 2]| ((p[0] * 2.) as usize, (p[1] * 2.) as usize);
+        let strokes = [
+            (PathLayer::Blocked, [at[0] - 20., at[1]], false),
+            (PathLayer::HighGround, [at[0] + 20., at[1]], false),
+        ];
+        let mut want = Vec::new();
+        for (layer, p, _) in strokes {
+            editor.blocker = grids::BlockerEdit::Paths(layer);
+            let was = editor
+                .island
+                .doc
+                .blockers()
+                .unwrap()
+                .get(layer, cell(p).0, cell(p).1);
+            let before = editor.island.doc.clone();
+            // Blocked where it was open, cleared where it was blocked.
+            assert!(editor.dab(ground(&editor, p), 0., was, None));
+            editor.history.checkpoint_owned(before);
+            want.push((layer, p, !was));
+        }
+        assert_eq!(editor.path_overlay(), Some(PathLayer::HighGround));
+
+        editor.blocker = grids::BlockerEdit::Shapes;
+        let shapes = |e: &IslandEditor| {
+            let s = e.island.doc.blockers().unwrap().shapes.clone().unwrap();
+            (0..s.len())
+                .map(|n| s.points(n).collect::<Vec<_>>())
+                .collect::<Vec<_>>()
+        };
+        let shipped_shapes = shapes(&editor);
+        assert!(shipped_shapes.len() >= 2, "n_m02 lists build blockers");
+        let corners = [[10., 10.], [18., 10.], [18., 18.], [10., 18.]];
+        for c in corners {
+            assert!(editor.shape_press(c, false, false).is_none());
+        }
+        // Clicking the first point again closes it.
+        assert!(editor.shape_press([10.5, 10.], false, false).is_none());
+        assert_eq!(shapes(&editor).len(), shipped_shapes.len() + 1);
+        let added = shipped_shapes.len();
+        let drag = editor.shape_press([18., 18.], false, false);
+        assert!(
+            matches!(drag, Some(super::Drag::ShapePoint { shape, point: 2, .. }) if shape == added)
+        );
+        let before = editor.island.doc.clone();
+        assert!(editor.move_shape_point(added, 2, [20., 21.]));
+        assert!(
+            !editor.move_shape_point(added, 2, [5., 5.]),
+            "a move that turns it inside out is refused"
+        );
+        editor.history.checkpoint_owned(before);
+        // A metre point inside the first shipped polygon and no other.
+        let inside = (0..side as usize * side as usize)
+            .map(|i| [(i % side as usize) as f64, (i / side as usize) as f64])
+            .find(|&p| {
+                (shipped_shapes.iter().enumerate()).all(|(n, s)| grids::inside(s, p) == (n == 0))
+            })
+            .unwrap();
+        assert!(
+            editor
+                .shape_press(inside.map(|v| v as f32), true, false)
+                .is_none()
+        );
+        let edited_shapes = shapes(&editor);
+        assert_eq!(edited_shapes.len(), shipped_shapes.len());
+        assert_eq!(edited_shapes.last().unwrap()[2], [20., 21.]);
+        let edited = editor.island.doc.clone();
+
+        for _ in 0..5 {
+            assert!(editor.undo(false));
+        }
+        assert_eq!(shapes(&editor), shipped_shapes);
+        for (layer, p, on) in &want {
+            let (x, z) = cell(*p);
+            assert_eq!(editor.island.doc.blockers().unwrap().get(*layer, x, z), !on);
+        }
+        assert_eq!(editor.island.doc.field.heights, unblocked.field.heights);
+        assert!(editor.undo(false) && !editor.undo(false));
+        let (_config, project) = staged(&install, &mut editor);
+        assert!(
+            project.files[path] == shipped,
+            "undone, it saves as shipped"
+        );
+
+        for _ in 0..6 {
+            assert!(editor.undo(true));
+        }
+        assert_eq!(shapes(&editor), edited_shapes);
+        let (_config, mut project) = staged(&install, &mut editor);
+        let back = reopen(&install, &mut project, path);
+        assert_eq!(shapes(&back), edited_shapes);
+        let (a, b) = (
+            back.island.doc.blockers().unwrap(),
+            edited.blockers().unwrap(),
+        );
+        let (cols, rows) = a.size();
+        for layer in [PathLayer::Blocked, PathLayer::HighGround] {
+            for z in 0..rows {
+                for x in 0..cols {
+                    assert_eq!(a.get(layer, x, z), b.get(layer, x, z), "{layer:?} {x},{z}");
+                }
+            }
+        }
+        for (layer, p, on) in &want {
+            let (x, z) = cell(*p);
+            assert_eq!(a.get(*layer, x, z), *on, "{layer:?} at {p:?}");
+        }
+    }
 
     /// The editor's ground materials by palette id and file.
     fn material_names(editor: &IslandEditor) -> Vec<(u8, String)> {
@@ -5215,18 +10229,109 @@ mod tests {
             .collect()
     }
 
+    // Needs the game: with the splat drawing the ground and the cliff tops
+    // hidden nothing bakes it; showing the cliff tops bakes it for them.
+    #[test]
+    fn the_ground_bakes_once_cliff_tops_show() {
+        let Some((install, mut editor)) = open(PIRATE) else {
+            return;
+        };
+        let install = Arc::new(install);
+        super::gpu_bench::settle(&mut editor, &install);
+        assert!(editor.splat.is_some() && editor.ground.is_none());
+        editor.layers.shipped = true;
+        editor.refresh_scene();
+        assert!(editor.ground_stale, "a bake is due");
+        super::gpu_bench::settle(&mut editor, &install);
+        assert!(editor.ground.is_some());
+        let ground = editor.texture().map(gpui_editor_kit::texture::Image::from);
+        assert!(ground.is_some(), "the cliff tops take it");
+    }
+
+    // Needs the game: a prop with AdaptTerrainHeight keeps its height above
+    // the ground through a raise stroke and a sideways move, another
+    // stays where it is, and the inspector's toggle sets the flag with undo.
+    #[test]
+    fn props_that_follow_the_terrain_keep_their_height_above_it() {
+        let Some((_, mut editor)) = open(PIRATE) else {
+            return;
+        };
+        let (x, z) = (160., 160.);
+        let grounds = [0., 1.].map(|dx| editor.island.doc.field.height([x + dx, z]));
+        let props = &mut editor.island.doc.props;
+        for (k, follows) in [(0, true), (1, false)] {
+            let p = &mut props[k];
+            p.source.adapt_terrain_height = follows.then_some(1);
+            p.matrix[12] = x + k as f32;
+            p.matrix[13] = grounds[k] + 0.3;
+            p.matrix[14] = z;
+        }
+        let (a, b) = (props[0].id, props[1].id);
+        let y = |e: &IslandEditor, id| e.island.doc.prop(id).unwrap().matrix[13];
+        let above = |e: &IslandEditor, id| {
+            let m = e.island.doc.prop(id).unwrap().matrix;
+            m[13] - e.island.doc.field.height([m[12], m[14]])
+        };
+        editor.tool = Tool::Raise;
+        editor.brush.radius = 6.;
+        editor.brush.strength = 1.;
+        for _ in 0..4 {
+            assert!(editor.dab([x, grounds[0], z], 0., false, None));
+        }
+        assert!(editor.island.doc.field.height([x, z]) > grounds[0] + 0.5);
+        assert!(
+            (above(&editor, a) - 0.3).abs() < 1e-3,
+            "{}",
+            above(&editor, a)
+        );
+        assert_eq!(y(&editor, b), grounds[1] + 0.3);
+
+        // Sideways across the slope the brush left.
+        let from = editor.island.doc.prop(a).unwrap().matrix;
+        let mut to = from;
+        to[12] += 5.;
+        let moved = editor.keep_above_ground(Item::Prop(a), &from, to);
+        let ground = editor.island.doc.field.height([to[12], to[14]]);
+        assert!((moved[13] - ground - 0.3).abs() < 1e-3);
+        assert_eq!(editor.keep_above_ground(Item::Prop(b), &from, to), to);
+
+        editor.selection = [Item::Prop(b)].into();
+        editor.set_follows_terrain(true);
+        assert_eq!(
+            editor
+                .island
+                .doc
+                .prop(b)
+                .unwrap()
+                .source
+                .adapt_terrain_height,
+            Some(1)
+        );
+        assert!(editor.undo(false));
+        assert_eq!(
+            editor
+                .island
+                .doc
+                .prop(b)
+                .unwrap()
+                .source
+                .adapt_terrain_height,
+            None
+        );
+    }
+
     #[test]
     fn sculpted_coast_updates_gameplay_without_erasing_other_grid_edits() {
         let Some(install) = install_1800() else {
             return;
         };
         let mut editor = new_island(&install, "moderate", 192, Start::Sea, "CoastSync");
-        let grids = Arc::make_mut(editor.doc.grids.as_mut().unwrap());
+        let grids = Arc::make_mut(editor.island.doc.grids.as_mut().unwrap());
         grids.layer_mut(Kind::Environment).unwrap().set(0, 0, 7);
         grids.layer_mut(Kind::River).unwrap().set(5, 5, 1);
-        let before = editor.doc.clone();
-        let width = editor.doc.field.grid.width;
-        let heights = &mut Arc::make_mut(&mut editor.doc.field).heights;
+        let before = editor.island.doc.clone();
+        let width = editor.island.doc.field.grid.width;
+        let heights = &mut Arc::make_mut(&mut editor.island.doc.field).heights;
         for z in 144..240 {
             for x in 144..240 {
                 heights[z * width + x] = 4.;
@@ -5234,14 +10339,15 @@ mod tests {
         }
         editor.history.checkpoint_owned(before);
         let (_config, mut project) = staged(&install, &mut editor);
-        let at_centre = |e: &IslandEditor, kind| grids::value_at(layer(&e.doc, kind), 96., 96.);
+        let at_centre =
+            |e: &IslandEditor, kind| grids::value_at(layer(&e.island.doc, kind), 96., 96.);
         assert_eq!(at_centre(&editor, Kind::Water), 1);
         assert_eq!(
             at_centre(&editor, Kind::AreaIds),
             super::harbour::CONSTRUCTION
         );
-        assert_eq!(layer(&editor.doc, Kind::Environment).get(0, 0), 7);
-        assert_eq!(layer(&editor.doc, Kind::River).get(5, 5), 1);
+        assert_eq!(layer(&editor.island.doc, Kind::Environment).get(0, 0), 7);
+        assert_eq!(layer(&editor.island.doc, Kind::River).get(5, 5), 1);
         assert!(editor.undo(false));
         editor.stage(&install, &mut project).unwrap();
         assert_eq!(at_centre(&editor, Kind::Water), 0);
@@ -5253,19 +10359,24 @@ mod tests {
             let Some(install) = install else {
                 continue;
             };
-            let game = install.game();
-            let mut editor = IslandEditor::load(&install, path).unwrap();
-            let before = editor.doc.clone();
+            let game = crate::games::of(&install);
+            let mut editor = IslandEditor::load(
+                crate::games::module(crate::games::of(&install)),
+                &install,
+                path,
+            )
+            .unwrap();
+            let before = editor.island.doc.clone();
             let at = [160., 160.];
-            let width = editor.doc.field.grid.width;
-            let heights = &mut Arc::make_mut(&mut editor.doc.field).heights;
+            let width = editor.island.doc.field.grid.width;
+            let heights = &mut Arc::make_mut(&mut editor.island.doc.field).heights;
             for (i, h) in heights.iter_mut().enumerate() {
                 if (318..323).contains(&(i % width)) && (318..323).contains(&(i / width)) {
                     *h += 1.5;
                 }
             }
-            Arc::make_mut(&mut editor.doc.objects)[0].position[1] += 1.;
-            let active = Arc::make_mut(editor.doc.grids.as_mut().unwrap())
+            Arc::make_mut(&mut editor.island.doc.objects)[0].position[1] += 1.;
+            let active = Arc::make_mut(editor.island.doc.grids.as_mut().unwrap())
                 .layer_mut(Kind::ActiveMap)
                 .unwrap();
             active.set(0, 0, 1 - active.get(0, 0));
@@ -5273,10 +10384,20 @@ mod tests {
             editor.brush.strength = 1.;
             editor.tool = Tool::Paint;
             editor.paint = 31;
-            editor.dab([at[0], editor.doc.field.height(at), at[1]], 0., false, None);
+            editor.dab(
+                [at[0], editor.island.doc.field.height(at), at[1]],
+                0.,
+                false,
+                None,
+            );
             editor.tool = Tool::Tint;
             editor.tint_color = tint::PRESETS[1].1;
-            editor.dab([at[0], editor.doc.field.height(at), at[1]], 0., false, None);
+            editor.dab(
+                [at[0], editor.island.doc.field.height(at), at[1]],
+                0.,
+                false,
+                None,
+            );
             editor.history.checkpoint_owned(before.clone());
             let (_config, mut project) = staged(&install, &mut editor);
             let pages: std::collections::BTreeMap<_, _> = (project.files.iter())
@@ -5299,7 +10420,9 @@ mod tests {
                 .collect();
             project.write().unwrap();
             // Save mounts the mod before the next edit or save.
-            install.mount_mod(&project.folder()).unwrap();
+            install
+                .mount_mods(&[project.folder().as_path()], &["data"])
+                .unwrap();
             editor.stage(&install, &mut project).unwrap();
             for (p, bytes) in &pages {
                 assert!(&project.files[p] == bytes, "{game:?}: repeated save {p}");
@@ -5320,16 +10443,16 @@ mod tests {
             }
             let back = reopen(&install, &mut project, path);
             assert_eq!(
-                back.doc.field.height(at),
+                back.island.doc.field.height(at),
                 before.field.height(at),
                 "{game:?}: height undo"
             );
             assert_eq!(
-                back.doc.objects[0].position, before.objects[0].position,
+                back.island.doc.objects[0].position, before.objects[0].position,
                 "{game:?}: object undo"
             );
             assert_eq!(
-                layer(&back.doc, Kind::ActiveMap).get(0, 0),
+                layer(&back.island.doc, Kind::ActiveMap).get(0, 0),
                 layer(&before, Kind::ActiveMap).get(0, 0),
                 "{game:?}: grid undo"
             );
@@ -5342,7 +10465,12 @@ mod tests {
         let Some(install) = install_1800() else {
             return;
         };
-        let mut editor = IslandEditor::load(&install, MODERATE_M_01).unwrap();
+        let mut editor = IslandEditor::load(
+            crate::games::module(crate::games::of(&install)),
+            &install,
+            MODERATE_M_01,
+        )
+        .unwrap();
         let exports = tempfile::tempdir().unwrap();
         image::ImageBuffer::from_pixel(8, 8, image::Luma([32768u16]))
             .save(exports.path().join("Height.png"))
@@ -5353,31 +10481,38 @@ mod tests {
         image::RgbImage::from_fn(8, 8, |x, _| image::Rgb([80 + x as u8 * 16, 128, 128]))
             .save(exports.path().join("Colormap.png"))
             .unwrap();
-        let channels = default_channels(&material_names(&editor));
+        let channels = default_channels(&editor.rules().ground_names, &material_names(&editor));
         assert!(channels.iter().all(Option::is_some));
         let grass = channels[3].unwrap();
         let mut link = Link::new(exports.path().to_owned());
         link.channels = vec![channels];
         editor.set_listing(|l| l.world_machine = Some(link));
-        let old_height = editor.doc.field.height([160., 160.]);
+        let old_height = editor.island.doc.field.height([160., 160.]);
         let imported = editor.wm_job(true).unwrap()().unwrap();
         assert!(
             imported.heights.is_some() && imported.materials.is_some() && imported.tint.is_some()
         );
         editor.apply_wm(Ok(imported));
-        let height = editor.doc.field.height([160., 160.]);
+        let height = editor.island.doc.field.height([160., 160.]);
         assert!((height - 40.).abs() < 0.01);
-        let dominant = |e: &IslandEditor| e.doc.materials.as_ref().unwrap().dominant([160., 160.]);
+        let dominant = |e: &IslandEditor| {
+            e.island
+                .doc
+                .materials
+                .as_ref()
+                .unwrap()
+                .dominant([160., 160.])
+        };
         assert_eq!(dominant(&editor), grass);
         assert!(editor.undo(false));
-        assert_eq!(editor.doc.field.height([160., 160.]), old_height);
+        assert_eq!(editor.island.doc.field.height([160., 160.]), old_height);
         assert!(editor.undo(true));
         let (_config, mut project) = staged(&install, &mut editor);
         let back = reopen(&install, &mut project, MODERATE_M_01);
-        assert!((back.doc.field.height([160., 160.]) - height).abs() < 1. / 128.);
-        assert_eq!(back.doc.materials.as_ref().unwrap().per_metre, 2.);
+        assert!((back.island.doc.field.height([160., 160.]) - height).abs() < 1. / 128.);
+        assert_eq!(back.island.doc.materials.as_ref().unwrap().per_metre, 2.);
         assert_eq!(dominant(&back), grass);
-        assert!(back.doc.tint.is_some());
+        assert!(back.island.doc.tint.is_some());
         assert!(!project.files.keys().any(|p| p.contains("materialmaps/")));
     }
 
@@ -5386,8 +10521,13 @@ mod tests {
         let Some(install) = install_1800() else {
             return;
         };
-        let mut editor = IslandEditor::load(&install, MODERATE_M_01).unwrap();
-        let layer = Arc::make_mut(editor.doc.grids.as_mut().unwrap())
+        let mut editor = IslandEditor::load(
+            crate::games::module(crate::games::of(&install)),
+            &install,
+            MODERATE_M_01,
+        )
+        .unwrap();
+        let layer = Arc::make_mut(editor.island.doc.grids.as_mut().unwrap())
             .layer_mut(Kind::ActiveMap)
             .unwrap();
         for y in 0..layer.height {
@@ -5409,9 +10549,17 @@ mod tests {
             return;
         };
         let assets = assets(&install);
-        let skeletons = super::skeletons(&install, Some(&assets));
+        let skeletons = super::skeletons(
+            crate::games::module(crate::games::of(&install)),
+            &install,
+            Some(&assets),
+        );
         let mut qa = std::env::var_os("ANNO_EDITOR_QA_EXPORT").map(|dir| {
-            let mut project = Project::load(std::path::Path::new(&dir), install.game());
+            let mut project = Project::load(
+                std::path::Path::new(&dir),
+                crate::games::module(crate::games::of(&install)),
+            )
+            .unwrap();
             project.info.name = "Anno Editor 1800 QA".into();
             project.set_mod_id("anno-editor-1800-qa").unwrap();
             project
@@ -5428,23 +10576,23 @@ mod tests {
                 "{region} textures"
             );
             assert!(
-                (editor.doc.grids.as_ref().unwrap())
+                (editor.island.doc.grids.as_ref().unwrap())
                     .layer(Kind::AreaIds)
                     .is_some(),
                 "{region} areas"
             );
             editor.assets = Some(assets.clone());
             let lib = harbour_library(&install, &assets, &editor);
-            editor.harbour = Some(lib.clone());
+            editor.island.harbour = Some(lib.clone());
             let size = editor.world()[0] as f32;
             let c = size * 0.5;
             editor.harbour_at([c, 0., size * 0.16], false);
             let coast = editor.coast_guids();
             assert!(
-                (editor.doc.objects.iter()).any(|o| coast.contains(&o.guid)),
+                (editor.island.doc.objects.iter()).any(|o| coast.contains(&o.guid)),
                 "{region}: harbour"
             );
-            for (lake, piece) in [(false, harbour::Piece::River), (true, harbour::Piece::Lake)] {
+            for (lake, piece) in [(false, Piece::River), (true, Piece::Lake)] {
                 if lib.guid(piece).is_none() {
                     continue;
                 }
@@ -5464,7 +10612,7 @@ mod tests {
                 }
                 editor.finish_river();
                 assert!(
-                    (editor.doc.objects.iter()).any(|o| Some(o.guid) == lib.guid(piece)),
+                    (editor.island.doc.objects.iter()).any(|o| Some(o.guid) == lib.guid(piece)),
                     "{region}: {piece:?}"
                 );
             }
@@ -5473,25 +10621,31 @@ mod tests {
                 if lib.guid(resource.pieces(false).0).is_none() {
                     continue;
                 }
-                editor.resource = resource;
+                editor.island.resource = resource;
                 let x = c - 18. + i as f32 * 6.;
                 assert!(
-                    editor.push_slot([x, editor.doc.field.height([x, c]), c]),
+                    editor.push_slot([x, editor.island.doc.field.height([x, c]), c]),
                     "{region}: {resource:?}"
                 );
                 let &Item::Object(id) = editor.selection.first().unwrap() else {
                     unreachable!()
                 };
-                let slot = editor.doc.objects.iter().find(|o| o.id == id).unwrap();
+                let slot = editor
+                    .island
+                    .doc
+                    .objects
+                    .iter()
+                    .find(|o| o.id == id)
+                    .unwrap();
                 slots.push((id, slot.guid));
                 if let Some(replacement) =
-                    (assets.slot_replacements(slot.guid, &editor.region())).first()
+                    (assets.slot_replacements(slot.guid, &editor.asset_region())).first()
                 {
                     editor.set_slot_resource(Some(replacement.guid));
                 }
             }
             assert!(!slots.is_empty(), "{region}: resources");
-            let fertilities = fertility::choices(&assets, &editor.region());
+            let fertilities = fertility::choices(&assets, &editor.asset_region());
             if region != "arctic" {
                 assert!(!fertilities.is_empty(), "{region}: fertility sets");
             }
@@ -5504,7 +10658,7 @@ mod tests {
             let (_config, mut project) = staged(&install, &mut editor);
             assert_eq!(project.islands[0].region, editor.region());
             assert_eq!(saved(&project, &editor.path).world_size(), editor.world());
-            let info = anno_formats::a7minfo::A7mInfo::parse(
+            let info = anno_formats::a7m::a7minfo::A7mInfo::parse(
                 &project.files[&format!("{}info", editor.path)],
             )
             .unwrap();
@@ -5528,22 +10682,33 @@ mod tests {
             crate::playtest::apply(plans, &mut project);
             for map in &project.maps {
                 let bytes = &project.files[&map.path.replace(".a7t", ".a7tinfo")];
-                let template = anno_formats::template::MapTemplate::parse(bytes).unwrap();
-                for slot in template.slots.iter().filter(|s| matches!(&s.kind, anno_formats::template::SlotKind::Fixed {path} if *path == editor.path)) {
-                    assert_eq!(slot.fertilities, editor.listing.fertilities.clone().unwrap(), "{region}: fertilities");
+                use anno_formats::a7m::template::{MapTemplate, SlotKind};
+                let template = MapTemplate::parse(bytes).unwrap();
+                for slot in template.slots.iter().filter(
+                    |s| matches!(&s.kind, SlotKind::Fixed { path, .. } if *path == editor.path),
+                ) {
+                    assert_eq!(
+                        slot.fertilities,
+                        editor.listing.fertilities.clone().unwrap(),
+                        "{region}: fertilities"
+                    );
                 }
-                let tree = anno_formats::adf::Adf::decode(bytes).unwrap();
-                let root = tree.node(tree.root(), "MapTemplate").unwrap();
-                for element in tree.children_named(root, "TemplateElement", false) {
+                let tree = anno_formats::adf::Adf::parse(bytes).unwrap();
+                let root = tree.child_node(tree.root(), "MapTemplate").unwrap();
+                // Only the TemplateElements under the root hold an Element.
+                for element in tree.children(root) {
+                    let Some(e) = tree.child_node(element, "Element") else {
+                        continue;
+                    };
                     if !tree
-                        .value(element, "Element/MapFilePath")
+                        .child_value(e, "MapFilePath")
                         .is_some_and(|v| tree.read_utf16(v).unwrap() == editor.path)
                     {
                         continue;
                     }
-                    let random = tree.value(element, "Element/RandomizeFertilities").unwrap();
+                    let random = tree.child_value(e, "RandomizeFertilities").unwrap();
                     assert_eq!(tree.payload(random), &[0]);
-                    let mapping = tree.node(element, "Element/MineSlotMapping").unwrap();
+                    let mapping = tree.child_node(e, "MineSlotMapping").unwrap();
                     let values: Vec<_> = tree.children(mapping).collect();
                     for (&id, &guid) in &editor.listing.slot_resources {
                         assert!(
@@ -5551,7 +10716,7 @@ mod tests {
                                 .as_chunks::<2>()
                                 .0
                                 .iter()
-                                .any(|p| tree.read_u64(p[0]).unwrap() == id
+                                .any(|p| tree.payload(p[0]) == id.to_le_bytes()
                                     && tree.read_u32(p[1]).unwrap() == guid),
                             "{region}: slot assignment"
                         );
@@ -5561,12 +10726,12 @@ mod tests {
             let back = reopen(&install, &mut project, &editor.path);
             for (id, guid) in &slots {
                 assert!(
-                    (back.doc.objects.iter()).any(|o| o.id == *id && o.guid == *guid),
+                    (back.island.doc.objects.iter()).any(|o| o.id == *id && o.guid == *guid),
                     "{region}: slot reload"
                 );
             }
             assert!(
-                (back.doc.objects.iter()).any(|o| coast.contains(&o.guid)),
+                (back.island.doc.objects.iter()).any(|o| coast.contains(&o.guid)),
                 "{region}: harbour reload"
             );
             if let Some(qa) = &mut qa {
@@ -5585,21 +10750,26 @@ mod tests {
         let Some(install) = install_1800() else {
             return;
         };
-        let mut editor = IslandEditor::load(&install, MODERATE_M_01).unwrap();
-        let before = editor.doc.clone();
+        let mut editor = IslandEditor::load(
+            crate::games::module(crate::games::of(&install)),
+            &install,
+            MODERATE_M_01,
+        )
+        .unwrap();
+        let before = editor.island.doc.clone();
         let at = [160., 160.];
-        let old_height = editor.doc.field.height(at);
-        let prop_count = editor.doc.props.len();
+        let old_height = editor.island.doc.field.height(at);
+        let prop_count = editor.island.doc.props.len();
         editor.brush.radius = 4.;
         editor.brush.strength = 1.;
-        let paint = if editor.doc.materials.as_ref().unwrap().dominant(at) == 1 {
+        let paint = if editor.island.doc.materials.as_ref().unwrap().dominant(at) == 1 {
             2
         } else {
             1
         };
         editor.paint = paint;
         editor.grid = Kind::River;
-        editor.place = Some(editor.doc.props[0].source.file);
+        editor.place = Some(editor.island.doc.props[0].source.file);
         editor.tint_color = tint::PRESETS[1].1;
         for tool in [
             Tool::Raise,
@@ -5609,16 +10779,16 @@ mod tests {
             Tool::Tint,
         ] {
             editor.tool = tool;
-            let y = editor.doc.field.height(at);
+            let y = editor.island.doc.field.height(at);
             assert!(editor.dab([at[0], y, at[1]], 0., false, None), "{tool:?}");
         }
         editor.history.checkpoint_owned(before);
-        let new_height = editor.doc.field.height(at);
+        let new_height = editor.island.doc.field.height(at);
         assert!(new_height > old_height);
         assert!(editor.undo(false));
-        assert_eq!(editor.doc.field.height(at), old_height);
+        assert_eq!(editor.island.doc.field.height(at), old_height);
         assert!(editor.undo(true));
-        assert_eq!(editor.doc.field.height(at), new_height);
+        assert_eq!(editor.island.doc.field.height(at), new_height);
         let (_config, mut project) = staged(&install, &mut editor);
         let base = island_data_dir(MODERATE_M_01).unwrap();
         for dir in ["meshes", "normalmaps", "tintmaps/0"] {
@@ -5626,35 +10796,337 @@ mod tests {
             assert!(project.files.keys().any(|p| p.starts_with(&dir)), "{dir}");
         }
         assert!(!project.files.keys().any(|p| p.contains("materialmaps/")));
-        let info =
-            anno_formats::a7minfo::A7mInfo::parse(&project.files[&format!("{MODERATE_M_01}info")])
-                .unwrap();
-        assert!(matches!(info.slots, anno_formats::a7minfo::Slots::Typed(_)));
+        let info = anno_formats::a7m::a7minfo::A7mInfo::parse(
+            &project.files[&format!("{MODERATE_M_01}info")],
+        )
+        .unwrap();
+        assert!(matches!(
+            info.slots,
+            anno_formats::a7m::a7minfo::Slots::Typed(_)
+        ));
         let back = reopen(&install, &mut project, MODERATE_M_01);
-        assert!((back.doc.field.height(at) - new_height).abs() < 1. / 128.);
-        assert!(back.doc.props.len() > prop_count);
-        assert_eq!(back.doc.materials.as_ref().unwrap().dominant(at), paint);
+        assert!((back.island.doc.field.height(at) - new_height).abs() < 1. / 128.);
+        assert!(back.island.doc.props.len() > prop_count);
         assert_eq!(
-            grids::value_at(layer(&back.doc, Kind::River), at[0], at[1]),
+            back.island.doc.materials.as_ref().unwrap().dominant(at),
+            paint
+        );
+        assert_eq!(
+            grids::value_at(layer(&back.island.doc, Kind::River), at[0], at[1]),
             1
         );
     }
 
+    // Needs Anno 1800: a new mine slot gets its mountain and cave work
+    // areas; Road relays a shipped slot's rails; road points can be added,
+    // dragged and removed while the end stays on the slot; the first point
+    // moves the work area; Ctrl-click adds another work area.
+    #[test]
+    fn installed_1800_slot_roads_rebuild_and_edit() {
+        use super::harbour;
+        use anno_core::harbour::Piece;
+        let Some(install) = install_1800() else {
+            return;
+        };
+        let mut editor = IslandEditor::load(
+            crate::games::module(crate::games::of(&install)),
+            &install,
+            MODERATE_M_01,
+        )
+        .unwrap();
+        let assets = assets(&install);
+        let lib = harbour_library(&install, &assets, &editor);
+        editor.island.harbour = Some(lib.clone());
+        editor.assets = Some(assets.clone());
+        let ground = |a: [f32; 3], b: [f32; 3]| (a[0] - b[0]).hypot(a[2] - b[2]);
+        let get = |e: &IslandEditor, id: u64| {
+            (e.island.doc.objects.iter())
+                .find(|o| o.id == id)
+                .cloned()
+                .unwrap()
+        };
+        let served = |e: &IslandEditor, slot: u64| {
+            let mut kinds: Vec<_> = harbour::links(
+                &e.island.doc.objects,
+                |g| harbour::link_end(&assets, g),
+                |id| id == slot,
+            )
+            .into_iter()
+            .filter(|l| l.slot == slot)
+            .map(|l| {
+                (
+                    harbour::piece_of(e.module(), &assets, get(e, l.work).guid),
+                    l.work,
+                )
+            })
+            .collect();
+            kinds.sort_by_key(|k| format!("{:?}", k.0));
+            kinds
+        };
+
+        // A new slot on the hilltop the shipped one stands on.
+        let shipped = harbour::links(
+            &editor.island.doc.objects,
+            |g| harbour::link_end(&assets, g),
+            |_| true,
+        )
+        .into_iter()
+        .find(|l| {
+            harbour::piece_of(editor.module(), &assets, get(&editor, l.work).guid)
+                == Some(Piece::MineWorkArea)
+        })
+        .unwrap();
+        let slot = get(&editor, shipped.slot).position;
+        editor.island.resource = harbour::Resource::Mine;
+        editor.island.fixed_slots = false;
+        assert!(editor.push_slot([
+            slot[0] + 30.,
+            editor.island.doc.field.height([slot[0] + 30., slot[2]]),
+            slot[2]
+        ]));
+        let (new_slot, _) = editor.selected_slot().unwrap();
+        let kinds = served(&editor, new_slot);
+        assert_eq!(
+            kinds.iter().map(|k| k.0).collect::<Vec<_>>(),
+            [Some(Piece::CaveWorkArea), Some(Piece::MineWorkArea)],
+            "a new mine slot gets both work areas"
+        );
+
+        // Road on the shipped slot.
+        editor.selection = [Item::Object(shipped.slot)].into();
+        let count = editor.island.doc.objects.len();
+        editor.rebuild_slot_roads();
+        let kinds = served(&editor, shipped.slot);
+        assert_eq!(kinds.len(), 2, "both kinds, the missing one added");
+        assert!(editor.island.doc.objects.len() <= count + 1);
+        for (kind, work) in &kinds {
+            let w = get(&editor, *work);
+            let span = if *kind == Some(Piece::CaveWorkArea) {
+                5.3
+            } else {
+                11.4
+            };
+            assert!((ground(w.position, slot) - span).abs() < 1e-3, "{kind:?}");
+            assert_eq!(w.path.unwrap().last().unwrap().p, slot);
+        }
+
+        let work = kinds
+            .iter()
+            .find(|k| k.0 == Some(Piece::MineWorkArea))
+            .unwrap()
+            .1;
+        let points = |e: &IslandEditor| e.road_points(work);
+        let n = points(&editor).len();
+
+        // The edit mode opens on the selected work area's path; clicks on
+        // open ground place nothing while it is on.
+        editor.tool = super::Tool::Slot;
+        editor.selection = [Item::Object(work)].into();
+        editor.edit_selected_path();
+        assert_eq!(editor.road_editing().map(|e| e.work), Some(work));
+        editor.road_edit.as_mut().unwrap().picked = [1].into();
+        assert_eq!(editor.road_pivot(), Some(points(&editor)[1]));
+
+        // Add point splits the segment after the picked one and picks it.
+        editor.add_road_points();
+        let p = points(&editor);
+        assert_eq!(p.len(), n + 1);
+        assert_eq!(editor.road_editing().unwrap().picked, [2].into());
+        let mid: [f32; 3] = std::array::from_fn(|k| (p[1][k] + p[3][k]) / 2.);
+        assert_eq!(p[2], mid);
+
+        // The gizmo moves picked points in 3D; heights stay as moved,
+        // handles follow, and the last point stays on the slot.
+        editor.set_road_points(work, |pts| {
+            pts[2][1] += 3.;
+            *pts.last_mut().unwrap() = [0.; 3];
+        });
+        let bent = get(&editor, work).path.unwrap();
+        assert!((bent[2].p[1] - mid[1] - 3.).abs() < 1e-4);
+        assert_eq!(bent.last().unwrap().p, slot, "the end stays on the slot");
+
+        // Delete removes picked points but never the ends.
+        editor.road_edit.as_mut().unwrap().picked = [0, 2].into();
+        editor.remove_road_points();
+        assert_eq!(points(&editor).len(), n, "the first point stays");
+        assert!(editor.undo(false));
+        assert_eq!(points(&editor).len(), n + 1);
+        editor.road_edit = None;
+
+        // Ctrl-click: a third work area for the shipped slot, linked to it.
+        editor.selection = [Item::Object(shipped.slot)].into();
+        editor.add_work_area([slot[0] + 6., 0., slot[2] - 6.]);
+        assert_eq!(served(&editor, shipped.slot).len(), 3);
+        // And deleting the slot takes all of them.
+        editor.selection = [Item::Object(shipped.slot)].into();
+        editor.delete_selected();
+        assert!(served(&editor, shipped.slot).is_empty());
+        assert!(
+            kinds
+                .iter()
+                .all(|(_, w)| !editor.island.doc.objects.iter().any(|o| o.id == *w))
+        );
+    }
+
+    // Needs Anno 1800: the Inspector's path preview offers the buildings
+    // that lay a model on a mine slot's paths; Coal puts the rail on the
+    // cave work area alone, None on neither, Auto on both.
+    #[test]
+    fn installed_1800_path_preview_picks_the_building() {
+        use super::harbour;
+        use anno_core::harbour::Piece;
+        let Some(install) = install_1800() else {
+            return;
+        };
+        let mut editor = IslandEditor::load(
+            crate::games::module(crate::games::of(&install)),
+            &install,
+            MODERATE_M_01,
+        )
+        .unwrap();
+        let assets = assets(&install);
+        editor.assets = Some(assets.clone());
+        let links = harbour::links(
+            &editor.island.doc.objects,
+            |g| harbour::link_end(&assets, g),
+            |_| true,
+        );
+        let kind = |e: &IslandEditor, id: u64| {
+            let o = e.island.doc.objects.iter().find(|o| o.id == id).unwrap();
+            harbour::piece_of(e.module(), &assets, o.guid)
+        };
+        let slot = (links.iter())
+            .find(|l| kind(&editor, l.work) == Some(Piece::CaveWorkArea))
+            .unwrap()
+            .slot;
+        let (cave, mountain): (Vec<u64>, Vec<u64>) = (links.iter())
+            .filter(|l| l.slot == slot)
+            .map(|l| l.work)
+            .partition(|&w| kind(&editor, w) == Some(Piece::CaveWorkArea));
+        assert_eq!((cave.len(), mountain.len()), (1, 1));
+        let railed = |e: &IslandEditor| -> Vec<u64> {
+            let mut r: Vec<u64> = (e.rail_works().into_iter())
+                .filter(|(w, cfg)| {
+                    (cave[0] == *w || mountain[0] == *w) && cfg.contains("mining_rail_01")
+                })
+                .map(|(w, _)| w)
+                .collect();
+            r.sort();
+            r
+        };
+        let mut both = vec![cave[0], mountain[0]];
+        both.sort();
+        assert_eq!(railed(&editor), both, "Auto: both paths");
+
+        editor.selection = [Item::Object(slot)].into();
+        let preview = editor.path_preview().unwrap();
+        assert_eq!((preview.slot, preview.current), (slot, None));
+        let buildings = preview.buildings;
+        let name = |g: u32| {
+            buildings
+                .iter()
+                .find(|(b, _)| *b == g)
+                .map(|(_, n)| n.clone())
+        };
+        assert!(
+            name(1010304).is_some() && name(1010305).is_some(),
+            "{buildings:?}"
+        );
+        assert!(
+            name(1010309).is_none(),
+            "cement lays nothing: {buildings:?}"
+        );
+
+        editor.set_path_preview(slot, Some(1010304)); // Coal Mine
+        assert_eq!(railed(&editor), cave);
+        editor.set_path_preview(slot, Some(0));
+        assert!(railed(&editor).is_empty());
+        // A work area's selection reaches its slot's preview too.
+        editor.selection = [Item::Object(mountain[0])].into();
+        assert_eq!(editor.path_preview().unwrap().current, Some(0));
+        editor.set_path_preview(slot, None);
+        assert_eq!(railed(&editor), both);
+    }
+
+    // Needs the games: a work area's path keeps running from it to its slot
+    // when either end moves (two-point 117 links and winding 1800 roads),
+    // and deleting the slot takes its work area along.
+    #[test]
+    fn work_area_paths_follow_their_slot() {
+        use super::{Field, harbour};
+        let ground = |a: [f32; 3], b: [f32; 3]| (a[0] - b[0]).hypot(a[2] - b[2]);
+        for (install, path) in [(install(), SMALL), (install_1800(), MODERATE_M_01)] {
+            let Some(install) = install else { continue };
+            let mut editor = IslandEditor::load(
+                crate::games::module(crate::games::of(&install)),
+                &install,
+                path,
+            )
+            .unwrap();
+            let assets = assets(&install);
+            editor.assets = Some(assets.clone());
+            let all = harbour::links(
+                &editor.island.doc.objects,
+                |g| harbour::link_end(&assets, g),
+                |_| true,
+            );
+            assert!(!all.is_empty(), "{path}: no work area linked to a slot");
+            let (work, slot) = (all[0].work, all[0].slot);
+            let find = |e: &IslandEditor, id: u64| {
+                (e.island.doc.objects.iter()).find(|o| o.id == id).cloned()
+            };
+            let points = find(&editor, work).unwrap().path.unwrap().len();
+            let start = find(&editor, work).unwrap().path.unwrap()[0].p;
+            let offset = ground(start, find(&editor, work).unwrap().position);
+
+            for moved in [slot, work] {
+                editor.selection = [Item::Object(moved)].into();
+                let x = find(&editor, moved).unwrap().position[0];
+                editor.set_field(Field::Position(0), x + 4.);
+                let (w, s) = (find(&editor, work).unwrap(), find(&editor, slot).unwrap());
+                let curve = w.path.as_deref().unwrap();
+                assert_eq!(curve.len(), points, "{path}: the road keeps its points");
+                assert!(
+                    ground(curve[points - 1].p, s.position) < 1e-3,
+                    "{path}: ends on the slot"
+                );
+                // 1800 roads start ~0.6 m off their work area; that stays.
+                assert!(
+                    (ground(curve[0].p, w.position) - offset).abs() < 1e-3,
+                    "{path}"
+                );
+            }
+
+            editor.selection = [Item::Object(slot)].into();
+            editor.delete_selected();
+            assert!(
+                find(&editor, slot).is_none() && find(&editor, work).is_none(),
+                "{path}"
+            );
+        }
+    }
+
     #[test]
     fn installed_1800_new_island_has_its_own_headers_and_pool_registration() {
-        use super::harbour;
         let Some(install) = install_1800() else {
             return;
         };
         let mut editor = new_island(&install, "moderate", 192, Start::Plateau, "Steamstead");
         let assets = assets(&install);
-        editor.harbour = Some(harbour_library(&install, &assets, &editor));
+        editor.island.harbour = Some(harbour_library(&install, &assets, &editor));
         editor.assets = Some(assets);
         editor.harbour_at([96., 0., 25.], false);
         let coast = editor.coast_guids();
-        assert!(editor.doc.objects.iter().any(|o| coast.contains(&o.guid)));
-        assert!(editor.push_slot([65., editor.doc.field.height([65., 70.]), 70.]));
-        let slot = (editor.doc.objects.iter())
+        assert!(
+            editor
+                .island
+                .doc
+                .objects
+                .iter()
+                .any(|o| coast.contains(&o.guid))
+        );
+        assert!(editor.push_slot([65., editor.island.doc.field.height([65., 70.]), 70.]));
+        let slot = (editor.island.doc.objects.iter())
             .find(|o| editor.is_slot(o.guid))
             .unwrap();
         let slot_id = slot.id;
@@ -5667,8 +11139,8 @@ mod tests {
             .replacements[0];
         editor.selection = std::collections::BTreeSet::from([Item::Object(slot_id)]);
         editor.set_slot_resource(Some(resource));
-        let river_guid = (editor.harbour.as_ref().unwrap())
-            .guid(harbour::Piece::River)
+        let river_guid = (editor.island.harbour.as_ref().unwrap())
+            .guid(Piece::River)
             .unwrap();
         for at in [[72., 110.], [96., 110.], [120., 112.]] {
             editor.river_add(at);
@@ -5679,7 +11151,14 @@ mod tests {
             "{:?}",
             editor.message
         );
-        assert!(editor.doc.objects.iter().any(|o| o.guid == river_guid));
+        assert!(
+            editor
+                .island
+                .doc
+                .objects
+                .iter()
+                .any(|o| o.guid == river_guid)
+        );
         let (_config, mut project) = staged(&install, &mut editor);
         let folder = project.write().unwrap();
         let entry = project.islands[0].clone();
@@ -5689,21 +11168,32 @@ mod tests {
                 .path
                 .starts_with("data/sessions/islands/custom/moderate/")
         );
-        let info =
-            anno_formats::a7minfo::A7mInfo::parse(&project.files[&format!("{}info", entry.path)])
-                .unwrap();
-        assert!(matches!(info.slots, anno_formats::a7minfo::Slots::Typed(_)));
+        let info = anno_formats::a7m::a7minfo::A7mInfo::parse(
+            &project.files[&format!("{}info", entry.path)],
+        )
+        .unwrap();
+        assert!(matches!(
+            info.slots,
+            anno_formats::a7m::a7minfo::Slots::Typed(_)
+        ));
         assert!(info.source_map.contains("steamstead"));
         assert_eq!(info.default_session_guid, None);
         let assets_xml = |folder: &std::path::Path| {
-            let profile = anno_formats::game::Game::Anno1800.profile();
-            std::fs::read_to_string(folder.join(profile.assets_path)).unwrap()
+            let schema = crate::games::module(anno_core::game::Game::Anno1800).database();
+            std::fs::read_to_string(folder.join(schema.unwrap().assets_path)).unwrap()
         };
         let xml = assets_xml(&folder);
         assert!(xml.contains("GUID=\"140363\""));
         assert!(!xml.contains("IslandPlaceholderSize"));
-        install.mount_mod(&folder).unwrap();
-        assert!(IslandEditor::load(&install, &entry.path).is_ok());
+        install.mount_mods(&[folder.as_path()], &["data"]).unwrap();
+        assert!(
+            IslandEditor::load(
+                crate::games::module(crate::games::of(&install)),
+                &install,
+                &entry.path
+            )
+            .is_ok()
+        );
         let plans = crate::playtest::plan(&install, editor.assets.as_deref(), &project).unwrap();
         assert_eq!(plans.len(), 3);
         assert!(plans.iter().all(|p| {
@@ -5717,20 +11207,23 @@ mod tests {
         assert!(xml.contains("Archipelago/ValueName"));
         assert!(!xml.contains("<Template>MapTemplateType</Template>"));
         for map in &project.maps {
-            let info = anno_formats::adf::Adf::decode(
+            let info = anno_formats::adf::Adf::parse(
                 &project.files[&map.path.replace(".a7t", ".a7tinfo")],
             )
             .unwrap();
-            let root = info.node(info.root(), "MapTemplate").unwrap();
+            let root = info.child_node(info.root(), "MapTemplate").unwrap();
+            // Only the TemplateElements under the root hold an Element.
             let fixed = info
-                .children_named(root, "TemplateElement", false)
-                .find(|n| {
-                    info.value(*n, "Element/MapFilePath")
+                .children(root)
+                .find(|&n| {
+                    info.child_node(n, "Element")
+                        .and_then(|e| info.child_value(e, "MapFilePath"))
                         .is_some_and(|v| info.read_utf16(v).unwrap() == entry.path)
                 })
                 .unwrap();
-            assert!(info.node(fixed, "Element/MineSlotMapping").is_some());
-            assert!(info.node(fixed, "Element/MineSlotActivation").is_none());
+            let element = info.child_node(fixed, "Element").unwrap();
+            assert!(info.child_node(element, "MineSlotMapping").is_some());
+            assert!(info.child_node(element, "MineSlotActivation").is_none());
         }
     }
 
@@ -5747,24 +11240,24 @@ mod tests {
         };
         // Land in the middle of the island, away from the coast.
         let at = [160., 160.];
-        let ground = |e: &IslandEditor| [at[0], e.doc.field.height(at), at[1]];
-        let props_before = editor.doc.props.len();
-        let objects_before = editor.doc.objects.len();
+        let ground = |e: &IslandEditor| [at[0], e.island.doc.field.height(at), at[1]];
+        let props_before = editor.island.doc.props.len();
+        let objects_before = editor.island.doc.objects.len();
         assert!(objects_before > 1000, "{objects_before}");
-        let before = editor.doc.clone();
+        let before = editor.island.doc.clone();
         editor.brush.radius = 8.;
         editor.brush.strength = 1.;
         for tool in [Tool::Raise, Tool::Grid, Tool::Scatter, Tool::Tint] {
             editor.tool = tool;
             editor.grid = Kind::River;
-            editor.place = Some(editor.doc.props[0].source.file);
+            editor.place = Some(editor.island.doc.props[0].source.file);
             editor.tint_color = tint::PRESETS[1].1;
             assert!(
                 editor.dab(ground(&editor), 0., false, None),
                 "{tool:?} changed nothing"
             );
         }
-        let m = (editor.doc.materials.as_mut()).expect("pirate_01 ships material maps");
+        let m = (editor.island.doc.materials.as_mut()).expect("pirate_01 ships material maps");
         let brush = Brush {
             radius: 6.,
             strength: 1.,
@@ -5773,16 +11266,16 @@ mod tests {
         };
         assert!(m.paint(at, &brush, 5));
         assert_eq!(m.dominant(at), 5);
-        let item = Item::Object(editor.doc.objects[0].id);
-        let mut m = editor.doc.matrix(item).unwrap();
+        let item = Item::Object(editor.island.doc.objects[0].id);
+        let mut m = editor.island.doc.matrix(item).unwrap();
         m[12] += 3.;
-        editor.doc.set_matrix(item, m);
-        let moved = editor.doc.objects[0].position;
+        editor.island.doc.set_matrix(item, m);
+        let moved = editor.island.doc.objects[0].position;
         editor.history.checkpoint_owned(before);
-        let added = editor.doc.props.len() - props_before;
+        let added = editor.island.doc.props.len() - props_before;
         assert!(added > 0, "scatter added no props");
         let river_at = |g: &Grids| grids::value_at(g.layer(Kind::River).unwrap(), at[0], at[1]);
-        assert_eq!(river_at(editor.doc.grids.as_ref().unwrap()), 1);
+        assert_eq!(river_at(editor.island.doc.grids.as_ref().unwrap()), 1);
 
         let (_config, project) = staged(&install, &mut editor);
         let base = island_data_dir(PIRATE).unwrap();
@@ -5795,7 +11288,7 @@ mod tests {
         for level in 0..4 {
             for name in ["matid", "matalpha"] {
                 let key = format!("{base}/materialmaps/{level}/{name}.dds");
-                island::material_words(&project.files[&key]).unwrap();
+                island::MaterialMap::parse(&project.files[&key]).unwrap();
             }
         }
         let island = saved(&project, PIRATE);
@@ -5813,11 +11306,15 @@ mod tests {
     /// A plateau with a 28 m mesa, scaled to the nearest shipped template
     /// to 256 m. 117's templates at that size give the original 50° sides.
     fn mesa_island(install: &Install, region: &str, name: &str) -> IslandEditor {
-        let skeleton = super::skeletons(install, None)
-            .into_iter()
-            .filter(|s| s.region == region && (128..=384).contains(&s.world[0]))
-            .min_by_key(|s| s.world[0].abs_diff(256))
-            .unwrap();
+        let skeleton = super::skeletons(
+            crate::games::module(crate::games::of(&install)),
+            install,
+            None,
+        )
+        .into_iter()
+        .filter(|s| s.region == region && (128..=384).contains(&s.world[0]))
+        .min_by_key(|s| s.world[0].abs_diff(256))
+        .unwrap();
         let mut editor = create(install, skeleton, Start::Plateau, name);
         let scale = editor.world()[0] as f32 / 256.;
         editor.replace_heights(|f| {
@@ -5851,8 +11348,9 @@ mod tests {
         editor.auto_cliffs(&install);
         let mut project = Project::load(
             &std::path::Path::new(&out).join("anno-editor"),
-            anno_formats::game::Game::Anno117,
-        );
+            &anno117::MODULE,
+        )
+        .unwrap();
         editor.stage(&install, &mut project).unwrap();
         project.write().unwrap();
         println!("{}", editor.path);
@@ -5860,32 +11358,46 @@ mod tests {
 
     #[test]
     fn installed_1800_automatic_tools_save_and_undo_in_each_region() {
-        use super::{blockers, cliffs, harbour, sound};
+        use super::{cliffs, harbour, sound};
         let Some(install) = install_1800() else {
             return;
         };
         let assets = assets(&install);
-        let mut wanted = sound::guids(install.game()).to_vec();
-        wanted.extend([blockers::BLOCKER, 100961]);
-        let records = Arc::new(harbour::find_records(&install, &wanted).unwrap());
+        let mut wanted = sound::guids(crate::games::rules(crate::games::of(&install))).to_vec();
+        wanted.extend([
+            crate::games::rules(crate::games::of(&install)).build_blocker,
+            100961,
+        ]);
+        let records = Arc::new(
+            harbour::find_records(
+                crate::games::rules(crate::games::of(&install)),
+                &install,
+                &wanted,
+            )
+            .unwrap(),
+        );
         for guid in &wanted {
             assert!(records.contains_key(guid), "missing record {guid}");
         }
         let mut export = std::env::var_os("ANNO_EDITOR_QA_EXPORT").map(|dir| {
-            let mut p = Project::load(std::path::Path::new(&dir), install.game());
+            let mut p = Project::load(
+                std::path::Path::new(&dir),
+                crate::games::module(crate::games::of(&install)),
+            )
+            .unwrap();
             p.info.name = "Anno 1800 Automatic Tools QA".into();
             p.set_mod_id("anno-1800-automatic-tools-qa").unwrap();
             p
         });
         let blocker_count = |e: &IslandEditor| {
-            (e.doc.objects.iter())
-                .filter(|o| o.guid == blockers::BLOCKER)
+            (e.island.doc.objects.iter())
+                .filter(|o| o.guid == e.rules().build_blocker)
                 .count()
         };
         for region in ["moderate", "colony01", "arctic", "africa"] {
             let mut editor = mesa_island(&install, region, &format!("auto_tools_{region}"));
             assert_eq!(
-                editor.doc.session.vegetation_prop_set,
+                editor.island.doc.session.vegetation_prop_set,
                 match region {
                     "moderate" => "Moderate",
                     "colony01" => "Colony",
@@ -5896,50 +11408,64 @@ mod tests {
             );
             editor.assets = Some(assets.clone());
             editor.spot_records = Some(records.clone());
-            let kit = cliffs::Kit::load(&install, &editor.region()).unwrap();
+            let kit = cliffs::Kit::load(
+                crate::games::rules(crate::games::of(&install)),
+                &install,
+                &editor.region(),
+            )
+            .unwrap();
             assert!((kit.shapes.iter()).all(|s| s.extent.iter().all(|e| *e > 0. && e.is_finite())));
-            let rock = cliffs::ground_material(install.game(), &material_names(&editor))
-                .expect("regional rock material");
+            let rock = cliffs::ground_material(
+                crate::games::rules(crate::games::of(&install)),
+                &material_names(&editor),
+            )
+            .expect("regional rock material");
             editor.auto_cliffs(&install);
-            let count = editor.doc.props.len();
+            let count = editor.island.doc.props.len();
             assert!(count > 5, "{region}: {count} cliffs");
             assert!(
                 editor.auto_cliff_coverage(&kit) > 0.15,
                 "{region}: cliff coverage"
             );
-            let materials = editor.doc.materials.as_ref().unwrap();
+            let materials = editor.island.doc.materials.as_ref().unwrap();
             assert!(
-                (editor.doc.props.iter())
+                (editor.island.doc.props.iter())
                     .any(|p| materials.dominant([p.matrix[12], p.matrix[14]]) == rock)
             );
             editor.auto_cliffs(&install);
-            assert_eq!(editor.doc.props.len(), count, "{region}: cliffs stacked");
+            assert_eq!(
+                editor.island.doc.props.len(),
+                count,
+                "{region}: cliffs stacked"
+            );
             assert!(editor.undo(false));
-            assert_eq!(editor.doc.props.len(), count);
+            assert_eq!(editor.island.doc.props.len(), count);
 
             // A rock on the flat plateau requires blockers; the automatic
             // cliff pieces lie on unbuildable slopes.
-            let file = editor.mesh_index(&kit.shapes[2].cfg);
+            let file = editor.island.doc.mesh_index(&kit.shapes[2].cfg);
             editor.place = Some(file);
             let scale = editor.world()[0] as f32 / 256.;
             let x = 128. * scale;
             let z = 70. * scale;
-            editor.place_at([x, editor.doc.field.height([x, z]), z]);
+            editor.place_at([x, editor.island.doc.field.height([x, z]), z]);
             editor.choose_object(records[&100961].clone(), None);
             let z = 82. * scale;
-            editor.place_at([x, editor.doc.field.height([x, z]), z]);
-            let before_sound = editor.doc.objects.len();
+            editor.place_at([x, editor.island.doc.field.height([x, z]), z]);
+            let before_sound = editor.island.doc.objects.len();
             editor.auto_sound_spots();
-            let sounds = editor.doc.objects.len() - before_sound;
+            let sounds = editor.island.doc.objects.len() - before_sound;
             assert!(sounds >= 3, "{region}: sound emitters");
-            let placed_sound: Vec<_> = (editor.doc.objects.iter())
-                .filter(|o| sound::guids(install.game()).contains(&o.guid))
+            let placed_sound: Vec<_> = (editor.island.doc.objects.iter())
+                .filter(|o| {
+                    sound::guids(crate::games::rules(crate::games::of(&install))).contains(&o.guid)
+                })
                 .map(|o| (o.guid, o.position))
                 .collect();
             let revision = editor.history.revision();
             editor.auto_sound_spots();
             assert_eq!(
-                editor.doc.objects.len(),
+                editor.island.doc.objects.len(),
                 before_sound + sounds,
                 "{region}: sounds stacked"
             );
@@ -5949,7 +11475,7 @@ mod tests {
                 "{region}: identical sounds added undo"
             );
             assert!(editor.undo(false));
-            assert_eq!(editor.doc.objects.len(), before_sound);
+            assert_eq!(editor.island.doc.objects.len(), before_sound);
             assert!(editor.undo(true));
             editor.auto_blockers(&install);
             let blockers = blocker_count(&editor);
@@ -5970,13 +11496,20 @@ mod tests {
             let mut reopened = reopen(&install, &mut project, &editor.path);
             reopened.adopt(&project.islands[0]);
             assert_eq!(
-                reopened.doc.props.iter().filter(|p| p.auto_cliff).count(),
+                reopened
+                    .island
+                    .doc
+                    .props
+                    .iter()
+                    .filter(|p| p.auto_cliff)
+                    .count(),
                 count
             );
             assert_eq!(blocker_count(&reopened), blockers);
             for (guid, position) in placed_sound {
                 assert!(
-                    (reopened.doc.objects.iter()).any(|o| o.guid == guid && o.position == position),
+                    (reopened.island.doc.objects.iter())
+                        .any(|o| o.guid == guid && o.position == position),
                     "{region}: sound reload"
                 );
             }
@@ -6004,16 +11537,28 @@ mod tests {
         };
         for region in ["roman", "celtic"] {
             let mut editor = mesa_island(&install, region, "Cliff Test");
-            let kit = cliffs::Kit::load(&install, &editor.region()).unwrap();
-            let rock = cliffs::ground_material(editor.game, &material_names(&editor))
+            let kit = cliffs::Kit::load(
+                crate::games::rules(crate::games::of(&install)),
+                &install,
+                &editor.region(),
+            )
+            .unwrap();
+            let rock = cliffs::ground_material(editor.rules(), &material_names(&editor))
                 .expect("no cliff material");
-            let ground =
-                |e: &IslandEditor, p: [f32; 2]| e.doc.materials.as_ref().unwrap().dominant(p);
+            let ground = |e: &IslandEditor, p: [f32; 2]| {
+                e.island.doc.materials.as_ref().unwrap().dominant(p)
+            };
             // Plateau top and the shore below the mesa are flat.
             let flat = [[128., 128.], [128., 60.]];
             let before = flat.map(|p| ground(&editor, p));
             editor.auto_cliffs(&install);
-            let auto: Vec<_> = editor.doc.props.iter().filter(|p| p.auto_cliff).collect();
+            let auto: Vec<_> = editor
+                .island
+                .doc
+                .props
+                .iter()
+                .filter(|p| p.auto_cliff)
+                .collect();
             assert!(auto.len() >= 8, "{region}: {} pieces", auto.len());
             let centers: Vec<[f32; 2]> = (auto.iter())
                 .map(|p| {
@@ -6036,15 +11581,21 @@ mod tests {
             );
             // Paint and pieces are one undo step.
             assert!(editor.undo(false));
-            assert!(!editor.doc.props.iter().any(|p| p.auto_cliff));
+            assert!(!editor.island.doc.props.iter().any(|p| p.auto_cliff));
             let still = on_rock(&editor);
             assert!(
                 still * 10 < centers.len(),
                 "{region}: undo kept {still} rock"
             );
             editor.auto_cliffs(&install);
-            let auto: Vec<_> = editor.doc.props.iter().filter(|p| p.auto_cliff).collect();
-            let field = &editor.doc.field;
+            let auto: Vec<_> = editor
+                .island
+                .doc
+                .props
+                .iter()
+                .filter(|p| p.auto_cliff)
+                .collect();
+            let field = &editor.island.doc.field;
             for p in &auto {
                 let [x, y, z] = super::math::translation(&p.matrix);
                 let h = |dx: f32, dz: f32| field.height([x + dx, z + dz]);
@@ -6055,7 +11606,7 @@ mod tests {
                 assert!(slope > 34., "{region}: piece on {slope:.0}° ground");
                 assert!(h(0., 0.) >= 0.5, "{region}: piece under water");
                 assert!(y < h(0., 0.), "{region}: origin above the ground");
-                let cfg = &editor.doc.meshes[p.source.file as usize];
+                let cfg = &editor.island.doc.meshes[p.source.file as usize];
                 assert!(cfg.contains(&format!("/{region}/")), "{region}: {cfg}");
             }
             let share = editor.auto_cliff_coverage(&kit);
@@ -6065,11 +11616,17 @@ mod tests {
             // Rerun: replacing gives the same set, filling gaps adds little.
             let count = auto.len();
             editor.auto_cliffs(&install);
-            let now = editor.doc.props.iter().filter(|p| p.auto_cliff).count();
+            let now = editor
+                .island
+                .doc
+                .props
+                .iter()
+                .filter(|p| p.auto_cliff)
+                .count();
             assert_eq!(now, count, "{region}: replace changed the count");
             editor.cliffs.replace = false;
             editor.auto_cliffs(&install);
-            let more = editor.doc.props.len() - count;
+            let more = editor.island.doc.props.len() - count;
             assert!(more * 4 <= count, "{region}: {more} stacked on {count}");
             // Nothing to fill makes no undo step.
             if more > 0 {
@@ -6088,21 +11645,27 @@ mod tests {
                 let entry = &project.islands[0];
                 assert_eq!(entry.listing.auto_cliffs.len(), count);
                 // Reopening a project island takes its listing back.
-                for p in Arc::make_mut(&mut editor.doc.props).iter_mut() {
+                for p in editor.island.doc.props.iter_mut() {
                     p.auto_cliff = false;
                 }
                 editor.adopt(entry);
-                let known = editor.doc.props.iter().filter(|p| p.auto_cliff).count();
+                let known = editor
+                    .island
+                    .doc
+                    .props
+                    .iter()
+                    .filter(|p| p.auto_cliff)
+                    .count();
                 assert_eq!(known, count, "listing lost track of auto pieces");
             }
 
             // Undo steps back over the replacing rerun, then takes the
             // pieces away; the mesa stays.
             assert!(editor.undo(false));
-            assert_eq!(editor.doc.props.len(), count);
+            assert_eq!(editor.island.doc.props.len(), count);
             assert!(editor.undo(false));
-            assert!(editor.doc.props.iter().all(|p| !p.auto_cliff));
-            assert!(editor.doc.field.height([128., 128.]) > 27.);
+            assert!(editor.island.doc.props.iter().all(|p| !p.auto_cliff));
+            assert!(editor.island.doc.field.height([128., 128.]) > 27.);
         }
     }
 
@@ -6121,7 +11684,7 @@ mod tests {
             falloff: Falloff::Constant,
             ..Brush::default()
         };
-        let before = editor.doc.clone();
+        let before = editor.island.doc.clone();
         let (a, b) = ([100., 0., 120.], [104., 0., 120.]);
         assert!(
             !editor.dab(a, 0., false, None),
@@ -6130,7 +11693,7 @@ mod tests {
         assert!(editor.dab(b, 0., false, None));
         editor.history.checkpoint_owned(before);
         let flow = |g: &Grids| grids::value_at(g.layer(Kind::WaterFlow).unwrap(), b[0], b[2]);
-        let [x, z] = grids::flow(flow(editor.doc.grids.as_ref().unwrap()));
+        let [x, z] = grids::flow(flow(editor.island.doc.grids.as_ref().unwrap()));
         assert!(x > 15. && z.abs() < 1., "east: {x} {z}");
 
         let (_config, project) = staged(&install, &mut editor);
@@ -6143,7 +11706,7 @@ mod tests {
             "Shift calms without a direction"
         );
         assert_eq!(
-            grids::flow(flow(editor.doc.grids.as_ref().unwrap())),
+            grids::flow(flow(editor.island.doc.grids.as_ref().unwrap())),
             [0., 0.]
         );
     }
@@ -6169,7 +11732,12 @@ mod tests {
             islands.sort();
             for path in islands {
                 let shared = Some((install.clone(), assets.clone()));
-                let mut editor = match IslandEditor::load_with(&install, &path, shared) {
+                let mut editor = match IslandEditor::load_with(
+                    crate::games::module(crate::games::of(&install)),
+                    &install,
+                    &path,
+                    shared,
+                ) {
                     Ok(e) => e,
                     Err(e) => {
                         eprintln!("skip {path}: {e:#}");
@@ -6202,6 +11770,370 @@ mod tests {
         assert!(over.is_empty(), "past 32 bits: {over:#?}");
     }
 
+    // Timing harness, not a pass/fail test: the UI thread's cost of an
+    // island's first scene and of a full rebuild after, fastest of five, so
+    // a loaded machine still compares. ANNO117_DIR and ANNO1800_DIR.
+    #[test]
+    #[ignore]
+    fn scene_build_timing() {
+        use std::time::{Duration, Instant};
+        let islands = [
+            (super::test_support::install(), PIRATE),
+            (
+                super::test_support::install_1800(),
+                "data/dlc01/sessions/islands/pool/moderate_c_01/moderate_c_01.a7m",
+            ),
+        ];
+        for (install, path) in islands {
+            let Some(install) = install.map(Arc::new) else {
+                continue;
+            };
+            let assets = assets(&install);
+            let (mut first, mut again) = (Duration::MAX, Duration::MAX);
+            let (mut off, mut land) = (Duration::MAX, Duration::MAX);
+            for _ in 0..5 {
+                let mut editor = IslandEditor::load_with(
+                    crate::games::module(crate::games::of(&install)),
+                    &install,
+                    path,
+                    Some((install.clone(), assets.clone())),
+                )
+                .unwrap();
+                while let Some(job) = editor.models_job(install.clone()) {
+                    editor.models_loaded(job());
+                }
+                // As the app runs it: rows and river surfaces build off
+                // the UI thread, timed apart.
+                editor.background_scene = true;
+                let jobs = |editor: &mut IslandEditor| {
+                    let t = Instant::now();
+                    while let Some(job) = editor.placement_job() {
+                        editor.placement_built(job());
+                    }
+                    while let Some(job) = editor.inland_job() {
+                        editor.inland_built(job());
+                    }
+                    while let Some(job) = editor.rails_job() {
+                        editor.rails_built(job());
+                    }
+                    let took = t.elapsed();
+                    let t = Instant::now();
+                    editor.refresh_scene();
+                    (took, t.elapsed())
+                };
+                let t = Instant::now();
+                editor.refresh_scene();
+                first = first.min(t.elapsed());
+                let (built, landed) = jobs(&mut editor);
+                (off, land) = (off.min(built), land.min(landed));
+                editor.scene_stale = true;
+                let t = Instant::now();
+                editor.refresh_scene();
+                again = again.min(t.elapsed());
+                jobs(&mut editor);
+            }
+            eprintln!(
+                "{path}: UI thread: first scene {first:?}, full rebuild {again:?}, \
+                 taking the built rows {land:?}; off it: rows, rivers and rails {off:?}"
+            );
+        }
+    }
+
+    // Sky, cloud and haze views to compare with the game, not a pass/fail
+    // test: `ANNO117_DIR=… SKY_SHOTS=DIR cargo test --release sky_shots --
+    // --ignored --nocapture`. Heights and pitch are the game's camera.xml
+    // presets: 60 is the default, 175 the highest before the world map.
+    // SKY_MOTION=1 (or a comma list of its sequences) shoots the camera
+    // moving instead, and the clouds' march time (sky_motion).
+    #[test]
+    #[ignore]
+    fn sky_shots() {
+        let Some(dir) = std::env::var_os("SKY_SHOTS") else {
+            eprintln!("skipping: SKY_SHOTS unset");
+            return;
+        };
+        let install = Arc::new(install().expect("ANNO117_DIR"));
+        // SKY_MOD: a mod folder to mount, for an island a mod ships.
+        if let Some(dir) = std::env::var_os("SKY_MOD") {
+            install
+                .mount_mods(&[std::path::Path::new(&dir)], &["data"])
+                .expect("SKY_MOD");
+        }
+        let path = std::env::var("PROFILE_ISLAND").unwrap_or_else(|_| PIRATE.into());
+        let assets = assets(&install);
+        let mut editor = IslandEditor::load_with(
+            crate::games::module(crate::games::of(&install)),
+            &install,
+            &path,
+            Some((install.clone(), assets)),
+        )
+        .unwrap();
+        while let Some(job) = editor.models_job(install.clone()) {
+            editor.models_loaded(job());
+        }
+        // SKY_RELIEF=0: the ground without its material relief.
+        if std::env::var("SKY_RELIEF").is_ok_and(|v| v == "0") {
+            editor.layers.relief = false;
+        }
+        // SKY_AMBIENT: another preset than the island's own.
+        if let Ok(name) = std::env::var("SKY_AMBIENT") {
+            editor.edit_session(|s| s.global_ambient = name);
+        }
+        eprintln!("ambient {}", editor.island.doc.session.global_ambient);
+        let (w, h) = (1920u32, 1080u32);
+        let mut target = gpui_editor_kit::gpu::Offscreen::new(w, h).unwrap();
+        let renderer = editor.renderer.clone();
+        // SKY_MOTION=1: sequences instead, the camera panning, turning and
+        // zooming in small steps, to see that clouds and haze hold still in
+        // the world (motion_<kind>_<n>.png).
+        if std::env::var_os("SKY_MOTION").is_some() {
+            sky_motion(&mut editor, &mut target, std::path::Path::new(&dir));
+            return;
+        }
+        // SKY_VIEWS: a comma list of the views below to shoot.
+        let only = std::env::var("SKY_VIEWS").unwrap_or_default();
+        // (name, hours, eye height, pitch below the horizon); "fit" keeps
+        // the camera the island opens with.
+        for (name, hours, height, pitch) in [
+            ("fit", 12., 0., 0.),
+            ("noon_60", 12., 60., 0.8),
+            // The game's widest zoom with the pitch lowered to see the
+            // whole island.
+            ("game_max", 12., 150., 0.4),
+            // As retail screenshots frame a large island: the game's lens
+            // (camera.xml's Fov 0.7), 115 up, looking 0.45 down.
+            ("retail", 12., 115., 0.45),
+            ("noon_175", 12., 175., 0.8),
+            ("noon_600", 12., 600., 0.8),
+            ("noon_2000", 12., 2000., 0.8),
+            ("noon_horizon", 12., 40., 0.15),
+            ("evening_horizon", 17.3, 40., 0.15),
+            ("evening_175", 17.3, 175., 0.8),
+            ("night_horizon", 0., 40., 0.15),
+            // Zoomed out over the game's ceiling toward the horizon: under
+            // the clouds' base (190), inside the layer, and above it.
+            ("under_clouds", 12., 185., 0.2),
+            ("in_clouds", 12., 280., 0.2),
+            ("over_clouds", 12., 550., 0.35),
+            // Raised over the island at dusk, the far sea's edge in view.
+            ("dusk_high", 18., 400., 0.3),
+            // SKY_CAMERA's own view, set below.
+            ("camera", 12., 0., 0.),
+        ] {
+            if !only.is_empty() && !only.split(',').any(|k| k == name) {
+                continue;
+            }
+            // SKY_CAMERA="height,pitch,turn,fov[,hours]" (radians; turn is
+            // added to the island's own yaw, fov 0 keeps the editor's): to
+            // line a view up with a game screenshot.
+            let custom: Vec<f32> = std::env::var("SKY_CAMERA")
+                .unwrap_or_default()
+                .split(',')
+                .filter_map(|v| v.trim().parse().ok())
+                .collect();
+            if name == "camera" && custom.len() < 4 {
+                continue;
+            }
+            let (hours, height, pitch) = if name == "camera" {
+                (
+                    custom.get(4).copied().unwrap_or(hours),
+                    custom[0],
+                    custom[1],
+                )
+            } else {
+                (hours, height, pitch)
+            };
+            editor.time_of_day = hours;
+            editor.sky = None;
+            while let Some(job) = editor.sky_job() {
+                editor.sky_baked(job());
+            }
+            editor.scene_stale = true;
+            editor.refresh_scene();
+            // Rivers and lakes, as the view's background work builds them
+            // after the first scene asks.
+            while let Some(job) = editor.inland_job() {
+                editor.inland_built(job());
+                editor.refresh_scene();
+            }
+            let extent = editor.extent();
+            let mut camera = editor.views[0].camera;
+            if name == "retail" {
+                camera.fov = 0.7;
+            }
+            if name == "camera" {
+                camera.yaw += custom[2];
+                if custom[3] > 0. {
+                    camera.fov = custom[3];
+                }
+            }
+            if height > 0. {
+                camera.tilt = std::f32::consts::FRAC_PI_2 - pitch;
+                let at = camera.distance(extent).expect("perspective");
+                camera.zoom *= at / (height / pitch.sin());
+            }
+            // Pipelines and tables come up over the first frames.
+            let mut shot = Vec::new();
+            for _ in 0..8 {
+                shot = target.render(&renderer, camera, extent).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(150));
+            }
+            for _ in 0..10 {
+                target.time_frame(&renderer).unwrap();
+            }
+            let stats = renderer.stats();
+            let passes: Vec<String> = (stats.passes.iter())
+                .filter(|(n, _)| !n.is_empty())
+                .map(|(n, ms)| format!("{n} {ms:.2}"))
+                .collect();
+            eprintln!("{name}: [{}]", passes.join(", "));
+            image::RgbaImage::from_raw(w, h, shot)
+                .unwrap()
+                .save(std::path::Path::new(&dir).join(format!("{name}.png")))
+                .unwrap();
+            // What a moving eye costs: 117 bakes its clouds again for each
+            // new eye. Read back alike, so the difference is the bake.
+            if name == "noon_horizon" {
+                let mut timed = |turn: f32| {
+                    let mut c = camera;
+                    let mut best = std::time::Duration::MAX;
+                    for i in 0..12 {
+                        c.yaw = camera.yaw + turn * i as f32;
+                        let t = std::time::Instant::now();
+                        target.render(&renderer, c, extent).unwrap();
+                        best = best.min(t.elapsed());
+                    }
+                    best
+                };
+                let (still, moving) = (timed(0.), timed(0.05));
+                eprintln!("frame still {still:?}, eye moving {moving:?}");
+            }
+        }
+    }
+
+    /// sky_shots' SKY_MOTION sequences at noon: a pan along x, a turn about
+    /// the pivot and a zoom out, eight frames each.
+    fn sky_motion(
+        editor: &mut IslandEditor,
+        target: &mut gpui_editor_kit::gpu::Offscreen,
+        dir: &std::path::Path,
+    ) {
+        editor.time_of_day = 12.;
+        editor.sky = None;
+        while let Some(job) = editor.sky_job() {
+            editor.sky_baked(job());
+        }
+        editor.scene_stale = true;
+        editor.refresh_scene();
+        let renderer = editor.renderer.clone();
+        let extent = editor.extent();
+        let base = editor.views[0].camera;
+        let pivot = extent.center;
+        // The camera `height` up, `pitch` below the horizon, its pivot moved
+        // `along` x and turned `yaw`.
+        let at = |height: f32, pitch: f32, along: f32, yaw: f32| {
+            let mut c = base;
+            c.center = Some([pivot[0] + along, 0., pivot[2]]);
+            c.pan = [0.; 2];
+            c.tilt = std::f32::consts::FRAC_PI_2 - pitch;
+            c.yaw = base.yaw + yaw;
+            let d = c.distance(extent).expect("perspective");
+            c.zoom *= d / (height / pitch.sin());
+            c
+        };
+        let shot = |target: &mut gpui_editor_kit::gpu::Offscreen, c, name: String| {
+            let mut pixels = Vec::new();
+            for _ in 0..4 {
+                pixels = target.render(&renderer, c, extent).unwrap();
+            }
+            let (w, h) = (1920, 1080);
+            image::RgbaImage::from_raw(w, h, pixels)
+                .unwrap()
+                .save(dir.join(format!("{name}.png")))
+                .unwrap();
+        };
+        // Pipelines and tables come up over the first frames.
+        for _ in 0..8 {
+            target
+                .render(&renderer, at(60., 0.1, 0., 0.), extent)
+                .unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(150));
+        }
+        let steps = |f: &dyn Fn(f32) -> gpui_editor_kit::camera::Camera| -> Vec<_> {
+            (0..8).map(|i| f(i as f32)).collect()
+        };
+        let sequences = [
+            // Low, looking along the sea: the game's own views.
+            ("pan", steps(&|i| at(60., 0.1, i * 12., 0.))),
+            ("yaw", steps(&|i| at(60., 0.1, 0., i * 0.08))),
+            // Zoomed out past the game's camera, as the editor usually is.
+            ("high_pan", steps(&|i| at(600., 0.5, i * 40., 0.))),
+            ("high_yaw", steps(&|i| at(600., 0.5, 0., i * 0.15))),
+            // Zoomed out and tilted up enough to see the sky.
+            ("orbit", steps(&|i| at(400., 0.3, 0., i * 0.2))),
+            (
+                "out",
+                [100., 175., 250., 350., 500., 700., 1000., 1500.]
+                    .map(|h| at(h, 0.25, 0., 0.))
+                    .to_vec(),
+            ),
+            ("tilt", steps(&|i| at(300., 0.2 + i * 0.12, 0., 0.))),
+            (
+                "zoom",
+                [40., 60., 100., 140., 175., 250., 400., 800.]
+                    .map(|h| at(h, 0.35, 0., 0.))
+                    .to_vec(),
+            ),
+        ];
+        let only = std::env::var("SKY_MOTION").unwrap_or_default();
+        for (kind, cameras) in sequences {
+            if !only.is_empty() && only != "1" && !only.split(',').any(|k| k == kind) {
+                continue;
+            }
+            for (i, c) in cameras.into_iter().enumerate() {
+                shot(target, c, format!("motion_{kind}_{i}"));
+            }
+        }
+        // A steady climb through the cloud layer, one frame a step as a
+        // zoom draws it: every eighth frame is shot, to see the clouds hold
+        // smooth while the view moves (glide_<n>.png).
+        if only.is_empty() || only == "1" || only.split(',').any(|k| k == "glide") {
+            for i in 0..64 {
+                let c = at(150. + i as f32 * 5., 0.15, 0., i as f32 * 0.004);
+                let pixels = target.render(&renderer, c, extent).unwrap();
+                if i % 8 == 7 {
+                    image::RgbaImage::from_raw(1920, 1080, pixels)
+                        .unwrap()
+                        .save(dir.join(format!("glide_{}.png", i / 8)))
+                        .unwrap();
+                }
+            }
+        }
+        // What a moving view costs: the clouds march again for each, timed
+        // on the GPU (the "clouds" pass). A turn too small to see still
+        // moves the view.
+        for (name, height, pitch) in [("low", 60., 0.1), ("high", 400., 0.3)] {
+            let mut ms = Vec::new();
+            for i in 0..24 {
+                let c = at(height, pitch, 0., 1e-4 * i as f32);
+                target.render(&renderer, c, extent).unwrap();
+                let stats = renderer.stats();
+                ms.extend(
+                    (stats.passes.iter())
+                        .filter(|(n, _)| *n == "clouds")
+                        .map(|p| p.1),
+                );
+            }
+            ms.sort_by(f32::total_cmp);
+            let median = ms.get(ms.len() / 2).copied().unwrap_or(0.);
+            eprintln!(
+                "{name}: cloud march {median:.3} ms (median of {})",
+                ms.len()
+            );
+        }
+        eprintln!("{:?}", renderer.stats().passes);
+    }
+
     // Timing harness, not a pass/fail test: `ANNO117_DIR=… cargo test --release
     // profile_island -- --ignored --nocapture`.
     #[test]
@@ -6220,8 +12152,13 @@ mod tests {
         let assets = assets(&install);
         eprintln!("assets {:?}", t.elapsed());
         let t = Instant::now();
-        let mut editor =
-            IslandEditor::load_with(&install, path, Some((install.clone(), assets))).unwrap();
+        let mut editor = IslandEditor::load_with(
+            crate::games::module(crate::games::of(&install)),
+            &install,
+            path,
+            Some((install.clone(), assets)),
+        )
+        .unwrap();
         eprintln!("load {:?}", t.elapsed());
         for line in &editor.load_log {
             eprintln!("   {line}");
@@ -6241,6 +12178,18 @@ mod tests {
             t.elapsed(),
             editor.library.models.loaded.len()
         );
+        // The sky, as the editor bakes it in the background.
+        let t = Instant::now();
+        while let Some(job) = editor.sky_job() {
+            editor.sky_baked(job());
+        }
+        eprintln!("sky {:?}", t.elapsed());
+        // Rivers and lakes, as the editor builds them in the background.
+        let t = Instant::now();
+        while let Some(job) = editor.inland_job() {
+            editor.inland_built(job());
+        }
+        eprintln!("rivers and lakes {:?}", t.elapsed());
         let t = Instant::now();
         editor.refresh_scene();
         eprintln!("refresh_scene with models {:?}", t.elapsed());
@@ -6373,12 +12322,13 @@ mod tests {
         {
             editor.sync_land();
             editor.tool = Tool::Raise;
-            let at = [300., editor.doc.field.height([300., 300.]), 300.];
+            let at = [300., editor.island.doc.field.height([300., 300.]), 300.];
             let mut drag = super::Drag::Brush {
                 stroke: super::Stroke::default(),
-                before: Box::new(editor.doc.clone()),
+                before: Box::new(editor.island.doc.clone()),
                 level: at[1],
                 changed: false,
+                hold: None,
             };
             for i in 0..20 {
                 editor.continue_brush(&mut drag, [300. + i as f32, at[1], 300.], false);
@@ -6404,8 +12354,8 @@ mod tests {
             );
         }
         // A gizmo drag: one prop moved 40 times, refreshing like frames do.
-        let item = Item::Prop(editor.doc.props[0].id);
-        let start = editor.doc.matrix(item).unwrap();
+        let item = Item::Prop(editor.island.doc.props[0].id);
+        let start = editor.island.doc.matrix(item).unwrap();
         let (mut moved, mut scene) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
         let renderer = editor.renderer.clone();
         for i in 0..40 {
@@ -6413,7 +12363,7 @@ mod tests {
             let mut m = start;
             m[12] += i as f32 * 0.5;
             // As the gizmo does: the document, then the item's rows.
-            editor.doc.set_matrix(item, m);
+            editor.island.doc.set_matrix(item, m);
             editor.placements.move_items(&mut [(item, m)], &renderer);
             editor.moves += 1;
             editor.markers_stale = true;
@@ -6432,11 +12382,11 @@ mod tests {
         editor.refresh_scene();
         eprintln!("set_ground + refresh {:?}", t.elapsed());
         let t = Instant::now();
-        let snapshot = editor.doc.clone();
+        let snapshot = editor.island.doc.clone();
         eprintln!("doc clone (undo checkpoint) {:?}", t.elapsed());
         drop(snapshot);
         let t = Instant::now();
-        editor.history.checkpoint(&editor.doc.clone());
+        editor.history.checkpoint(&editor.island.doc.clone());
         editor.undo(false);
         editor.refresh_scene();
         eprintln!("undo + refresh {:?}", t.elapsed());
@@ -6450,8 +12400,13 @@ mod tests {
             return;
         };
         let assets = assets(&install);
-        let mut editor =
-            IslandEditor::load_with(&install, PIRATE, Some((install.clone(), assets))).unwrap();
+        let mut editor = IslandEditor::load_with(
+            crate::games::module(crate::games::of(&install)),
+            &install,
+            PIRATE,
+            Some((install.clone(), assets)),
+        )
+        .unwrap();
         editor.refresh_scene();
         assert_eq!(editor.shipped.len(), 0, "not read yet");
         editor.layers.shipped = true;
@@ -6469,14 +12424,56 @@ mod tests {
             return;
         };
         assert_eq!(editor.world(), [64, 64]);
-        assert!(editor.doc.materials.is_some());
+        assert!(editor.island.doc.materials.is_some());
     }
 
     // Needs the game: paint dabs update the GPU splat in place, matching a
     // full rebuild from the same materials, with no bake in between.
+    // Needs the game: a Tint dab shows in the tint the GPU draws, which
+    // reads the working map itself, and the next dab of the stroke paints
+    // that map in place: the GPU's view takes no copy of it.
+    #[test]
+    fn tint_dabs_show_in_the_gpu_tint_without_copying_the_map() {
+        let Some((_, mut editor)) = open(SMALL) else {
+            return;
+        };
+        assert!(editor.ground_tint().is_some(), "a ground tint");
+        let g = editor.island.doc.field.grid;
+        let at = [
+            g.origin[0] + g.size()[0] / 2.,
+            g.origin[1] + g.size()[1] / 2.,
+        ];
+        let at = [at[0], editor.island.doc.field.height(at), at[1]];
+        editor.tool = Tool::Tint;
+        editor.tint_color = tint::PRESETS[1].1;
+        (editor.brush.radius, editor.brush.strength) = (6., 1.);
+        editor.history.checkpoint(&editor.island.doc);
+        assert!(editor.dab(at, 0., false, None));
+        // The first dab after the checkpoint copied the map from the undo
+        // step's; the scene takes the copy.
+        let tint = editor.ground_tint().unwrap();
+        let painted = Arc::as_ptr(editor.island.doc.tint.as_ref().unwrap());
+        assert!(editor.dab(at, 0., false, None));
+        assert!(
+            std::ptr::eq(
+                Arc::as_ptr(editor.island.doc.tint.as_ref().unwrap()),
+                painted
+            ),
+            "the second dab paints the map in place"
+        );
+        let map = editor.island.doc.tint.as_ref().unwrap();
+        let drawn = tint.map.to_vec();
+        assert!(
+            (drawn.as_chunks::<4>().0.iter())
+                .zip(&map.texels)
+                .all(|(d, t)| d[..3] == t[..] && d[3] == 255),
+            "the GPU's tint is the map's"
+        );
+    }
+
     #[test]
     fn painting_updates_the_splat_live() {
-        use gpui_editor_kit::gpu::Splat;
+        use anno_render::a7m::Splat;
         let Some((_, mut editor)) = open(SMALL) else {
             return;
         };
@@ -6496,7 +12493,7 @@ mod tests {
             .keys()
             .last()
             .unwrap();
-        editor.history.checkpoint(&editor.doc);
+        editor.history.checkpoint(&editor.island.doc);
         for i in 0..6 {
             assert!(editor.dab([90. + i as f32 * 4., 0., 100.], 0., false, None));
         }
@@ -6506,24 +12503,33 @@ mod tests {
             "the same splat, edited in place"
         );
         assert_ne!(snapshot(&live), original, "the dabs changed it");
-        let m = editor.doc.materials.as_ref().unwrap();
+        let a = (editor.island.doc.materials.as_ref().unwrap().paint.a7m()).unwrap();
         let rebuilt = (editor.palette.as_ref().unwrap())
-            .splat(&m.ids.grid(), &m.alphas.grid())
-            .unwrap();
+            .splat(
+                editor.a7m_rules().unwrap().ground_bake,
+                &a.ids,
+                &a.alphas,
+                None,
+            )
+            .unwrap()
+            .0;
         assert!(
             snapshot(&live) == snapshot(&rebuilt),
             "live edits match a rebuild"
         );
         // A stroke's bake only redoes the texture.
         editor.ground_stale = true;
-        let (_, splat) = editor.bake_job().unwrap()().unwrap();
+        let splat = editor.bake_job().unwrap()().unwrap().splat;
         assert!(splat.is_none());
-        // Undo brings the old materials back, and the splat with them.
+        // Undo brings the old materials back, and the live splat with them,
+        // in place as a dab writes it; the bake again redoes the texture.
         assert!(editor.undo(false));
         assert!(editor.ground_stale);
-        let (_, splat) = editor.bake_job().unwrap()().unwrap();
-        let splat = splat.expect("undo rebuilds the splat");
-        assert!(snapshot(&splat) == original, "back to the unpainted splat");
+        let splat = editor.bake_job().unwrap()().unwrap().splat;
+        assert!(splat.is_none(), "undo rebuilds no splat");
+        let live = editor.splat.clone().unwrap();
+        assert!(Arc::ptr_eq(&live, &before));
+        assert!(snapshot(&live) == original, "back to the unpainted splat");
     }
 
     // Needs the game: a left-drag in the 3D view with Raise must change the
@@ -6542,7 +12548,7 @@ mod tests {
             return;
         };
         editor.views[0].bounds = Bounds::new(point(px(0.), px(0.)), size(px(1000.), px(700.)));
-        editor.selection = editor.doc.items().map(|(i, _)| i).collect();
+        editor.selection = editor.island.doc.items().map(|(i, _)| i).collect();
         assert!(
             editor.selection.len() > GPU_DRAG,
             "{}",
@@ -6551,7 +12557,7 @@ mod tests {
         editor.tool = Tool::Select;
         editor.refresh_scene();
         let starts: Vec<(Item, Mat4)> = (editor.selection.iter())
-            .map(|&i| (i, editor.doc.matrix(i).unwrap()))
+            .map(|&i| (i, editor.island.doc.matrix(i).unwrap()))
             .collect();
         let pivot = editor.pivot().unwrap();
         let v = &editor.views[0];
@@ -6579,7 +12585,7 @@ mod tests {
         let placed = |e: &IslandEditor, i: &Item| e.selection_unplaced.binary_search(i).is_err();
         for (item, start) in starts.iter().filter(|(i, _)| placed(&editor, i)) {
             assert_eq!(
-                editor.doc.matrix(*item).unwrap(),
+                editor.island.doc.matrix(*item).unwrap(),
                 *start,
                 "{item:?} mid drag"
             );
@@ -6596,7 +12602,7 @@ mod tests {
         assert!(editor.gpu_drag().is_none());
         for (item, start) in &starts {
             let want = math::translation(&math::multiply(&m, start));
-            let got = math::translation(&editor.doc.matrix(*item).unwrap());
+            let got = math::translation(&editor.island.doc.matrix(*item).unwrap());
             assert!(
                 math::length(math::sub(got, want)) < 1e-3,
                 "{item:?} {got:?} {want:?}"
@@ -6613,7 +12619,7 @@ mod tests {
             return;
         };
         use gpui_editor_kit::math;
-        let items: Vec<(Item, [f32; 3])> = editor.doc.items().step_by(3).collect();
+        let items: Vec<(Item, [f32; 3])> = editor.island.doc.items().step_by(3).collect();
         assert!(items.len() >= 64, "{} items", items.len());
         editor.selection = items.iter().map(|(i, _)| *i).collect();
         let sum = items.iter().fold([0.; 3], |s, (_, p)| math::add(s, *p));
@@ -6699,7 +12705,7 @@ mod tests {
         };
         editor.views[0].bounds = Bounds::new(point(px(0.), px(0.)), size(px(1000.), px(700.)));
         editor.tool = Tool::Raise;
-        let before = editor.doc.field.heights.clone();
+        let before = editor.island.doc.field.heights.clone();
         let at = point(px(500.), px(350.));
         let hit = editor.ground(0, at);
         eprintln!("ground under cursor: {hit:?}");
@@ -6725,7 +12731,7 @@ mod tests {
             );
         }
         editor.finish_drag(0);
-        let after = &editor.doc.field.heights;
+        let after = &editor.island.doc.field.heights;
         let changed = before.iter().zip(after).filter(|(a, b)| a != b).count();
         let raised = (before.iter().zip(after))
             .map(|(a, b)| b - a)
@@ -6745,5 +12751,362 @@ mod tests {
         assert_eq!(height_color(500.), 0xd8d6d0);
         assert_eq!(mix(0x000000, 0xffffff, 0.5), 0x808080);
         assert_ne!(material_color(1), material_color(2));
+    }
+
+    #[test]
+    fn painting_marsh_lays_the_ground_shipped_marshes_have() {
+        let Some((_, mut editor)) = super::test_support::open(
+            "data/base/provinces/celtic/islands/pool/celtic_island_large_01/celtic_island_large_01.a7m",
+        ) else {
+            return;
+        };
+        let marsh_at = |e: &IslandEditor, p: [f32; 2]| {
+            grids::value_at(
+                e.island
+                    .doc
+                    .grids
+                    .as_ref()
+                    .unwrap()
+                    .layer(Kind::Marsh)
+                    .unwrap(),
+                p[0],
+                p[1],
+            )
+        };
+        // Dry meadow a few metres up, flat enough to stand a marsh on.
+        let f = &editor.island.doc.field;
+        let size = f.grid.width as f32 * f.grid.spacing;
+        let at = (0..2000)
+            .map(|k| [40. + (k % 40) as f32 * 10., 40. + (k / 40) as f32 * 10.])
+            .filter(|p| p[0] < size - 40. && p[1] < size - 40.)
+            .find(|&p| {
+                let h = f.height(p);
+                (2. ..6.).contains(&h)
+                    && (f.height([p[0] + 6., p[1]]) - h).abs() < 1.
+                    && marsh_at(&editor, p) == 0
+            })
+            .expect("dry meadow");
+        editor.tool = Tool::Grid;
+        editor.grid = Kind::Marsh;
+        editor.grid_value = editor.rules().marsh_tile;
+        editor.brush.radius = 8.;
+        editor.brush.strength = 1.;
+        for _ in 0..12 {
+            editor.dab(
+                [at[0], editor.island.doc.field.height(at), at[1]],
+                0.,
+                false,
+                None,
+            );
+        }
+        assert_eq!(marsh_at(&editor, at), editor.rules().marsh_tile);
+        let height = editor.island.doc.field.height(at);
+        assert!((height - super::MARSH_LEVEL).abs() < 0.1, "height {height}");
+        let env = editor
+            .island
+            .doc
+            .grids
+            .as_ref()
+            .unwrap()
+            .layer(Kind::Environment)
+            .unwrap();
+        assert_eq!(
+            grids::value_at(env, at[0], at[1]),
+            super::harbour::MARSH_ENVIRONMENT
+        );
+        let palette = editor.palette.clone().unwrap();
+        let shown = super::doc::shown(
+            editor.island.doc.materials.as_ref().unwrap(),
+            at,
+            Some(&palette),
+        );
+        let file = &palette.materials[&shown].file;
+        assert!(file.contains("marsh"), "ground {file}");
+
+        // Without shaping only the cells change.
+        editor.marsh_shape = false;
+        let other = [at[0] + 20., at[1]];
+        let before = editor.island.doc.field.height(other);
+        editor.dab([other[0], before, other[1]], 0., false, None);
+        assert_eq!(marsh_at(&editor, other), editor.rules().marsh_tile);
+        assert_eq!(editor.island.doc.field.height(other), before);
+    }
+
+    // Each Graphics option changes what the pirate island draws and what a
+    // still view keeps, and High, the default, draws today's image again
+    // byte for byte.
+    #[test]
+    fn each_graphics_option_changes_the_view_and_high_draws_it_back() {
+        use crate::graphics::{CloudShadows, Foliage, Graphics, Shadows, SmallProps, Waves};
+        use gpui_editor_kit::gpu::{HELD_CLOCK, Offscreen, Reuse};
+        let Some(install) = install() else {
+            eprintln!("skipping: ANNO117_DIR unset");
+            return;
+        };
+        let install = Arc::new(install);
+        let assets = assets(&install);
+        let mut editor = IslandEditor::load_with(
+            crate::games::module(crate::games::of(&install)),
+            &install,
+            PIRATE,
+            Some((install.clone(), assets)),
+        )
+        .unwrap();
+        let hold = |t: f32| HELD_CLOCK.store(t.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        hold(4.);
+        editor.layers.waves = false;
+        editor.layers.vegetation = true;
+        super::gpu_bench::settle(&mut editor, &install);
+        // gpu_bench's pirate view: low over the island, the horizon and
+        // its clouds in view.
+        let mut camera = editor.views[0].camera;
+        camera.zoom *= 1.8;
+        camera.tilt = 1.15;
+        camera.yaw = 0.6;
+        let extent = editor.extent();
+        let renderer = editor.renderer.clone();
+        let mut target = Offscreen::new(480, 300).unwrap();
+        target.render(&renderer, camera, extent).unwrap();
+        super::water_shots::show_water_at(&editor, 4.);
+        // Ground pages bake and the exposure adapts over frames; it takes
+        // what it measures at once after a pause.
+        for _ in 0..48 {
+            target.frame(&renderer).unwrap();
+        }
+        // Frames until the view has nothing left to bring in or let go:
+        // uploads, ground pages (a new render scale bakes them again), the
+        // texture levels its culls ask for, none held past what they ask,
+        // which residency lets go on the wall clock, and the sky's clouds,
+        // marched again on threads at each size. A fixed count of frames
+        // raced those under load. Then a pause: exposure takes what it
+        // measures at once after one.
+        let sky = editor.sky_pass.clone();
+        let settled = |target: &mut Offscreen, renderer: &gpui_editor_kit::gpu::Renderer| {
+            let started = std::time::Instant::now();
+            for k in 0.. {
+                let pages = renderer.drawn().pages;
+                // A few frames first: a change shows in the culls' answers
+                // a frame or two after it is made.
+                let still = renderer.settled() && sky.as_ref().is_none_or(|s| s.settled());
+                if k >= 3 && still && pages.baked >= pages.wanted {
+                    break;
+                }
+                assert!(
+                    started.elapsed().as_secs() < 90,
+                    "still settling after 90 s: {:?}, pages {pages:?}",
+                    renderer.waiting_on()
+                );
+                target.frame(renderer).unwrap();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            target.frame(renderer).unwrap()
+        };
+        // How two frames differ, for a failure to say.
+        let diff = |a: &[u8], b: &[u8]| {
+            let off = a.iter().zip(b).filter(|(x, y)| x != y).count();
+            let most = a.iter().zip(b).map(|(x, y)| x.abs_diff(*y)).max();
+            format!("{off} of {} bytes off, by at most {most:?}", a.len())
+        };
+        let mut draw = |editor: &mut IslandEditor, g: Graphics| {
+            editor.set_graphics(g);
+            editor.refresh_scene();
+            super::water_shots::show_water_at(editor, 4.);
+            let first = target.frame(&renderer).unwrap();
+            let kept = renderer.drawn().reuse;
+            (first, kept, settled(&mut target, &renderer))
+        };
+        // Twice: the first settles what the views' first frames bring up.
+        draw(&mut editor, Graphics::default());
+        let high = draw(&mut editor, Graphics::default()).2;
+        assert_eq!(renderer.drawn().reuse, Reuse::Whole, "a still view rests");
+        let d = Graphics::default();
+        for (name, g) in [
+            ("clouds", Graphics { clouds: false, ..d }),
+            ("haze", Graphics { haze: false, ..d }),
+            (
+                "reflections",
+                Graphics {
+                    reflections: false,
+                    ..d
+                },
+            ),
+            (
+                "waves",
+                Graphics {
+                    waves: Waves::Reduced,
+                    ..d
+                },
+            ),
+            (
+                "shadows",
+                Graphics {
+                    shadows: Shadows::Medium,
+                    ..d
+                },
+            ),
+            (
+                "no shadows",
+                Graphics {
+                    shadows: Shadows::Off,
+                    ..d
+                },
+            ),
+            (
+                "shadow distance",
+                Graphics {
+                    shadow_distance: 150.,
+                    ..d
+                },
+            ),
+            (
+                "occlusion",
+                Graphics {
+                    occlusion: false,
+                    ..d
+                },
+            ),
+            (
+                "cloud shadows",
+                Graphics {
+                    cloud_shadows: CloudShadows::Off,
+                    ..d
+                },
+            ),
+            (
+                "small props",
+                Graphics {
+                    small_props: SmallProps::Off,
+                    ..d
+                },
+            ),
+            (
+                "render scale",
+                Graphics {
+                    render_scale: 0.5,
+                    ..d
+                },
+            ),
+            (
+                "animation",
+                Graphics {
+                    animation: false,
+                    ..d
+                },
+            ),
+        ] {
+            let (_, kept, image) = draw(&mut editor, g);
+            assert_ne!(kept, Reuse::Whole, "{name}: the still view drew again");
+            assert!(image != high, "{name}: the view changed");
+            let (_, kept, back) = draw(&mut editor, d);
+            assert_ne!(kept, Reuse::Whole, "{name}: back to High drew again");
+            // The clouds' map is made again at each size and settles a few
+            // levels apart in the sky (264 of 576 000 bytes, at most 3).
+            let close = back.iter().zip(&high).all(|(a, b)| a.abs_diff(*b) <= 3);
+            if name == "render scale" {
+                assert!(
+                    close,
+                    "{name}: High draws today's image ({})",
+                    diff(&back, &high)
+                );
+            } else {
+                assert!(
+                    back == high,
+                    "{name}: High draws today's image ({})",
+                    diff(&back, &high)
+                );
+            }
+        }
+        // Foliage stops where the game's View Distance stops it, 575 m and
+        // nearer, past what the view above reaches: from three times as far
+        // each level draws the island's far trees otherwise.
+        let mut far = camera;
+        far.zoom /= 3.;
+        target.aim(&renderer, far, extent);
+        let mut shot = |editor: &mut IslandEditor, g: Graphics| {
+            editor.set_graphics(g);
+            editor.refresh_scene();
+            super::water_shots::show_water_at(editor, 4.);
+            settled(&mut target, &renderer)
+        };
+        shot(&mut editor, d);
+        let reached = shot(&mut editor, d);
+        let others = [Foliage::Off, Foliage::Near, Foliage::Game, Foliage::Far];
+        for foliage in others.into_iter().filter(|&f| f != d.foliage) {
+            let image = shot(&mut editor, Graphics { foliage, ..d });
+            assert!(image != reached, "{foliage:?}: the view changed");
+            let back = shot(&mut editor, d);
+            assert!(
+                back == reached,
+                "{foliage:?}: High draws it back ({})",
+                diff(&back, &reached)
+            );
+        }
+        hold(f32::NAN);
+    }
+
+    // Video memory goes with the island that held it: a small island
+    // opened after the largest one holds what it holds opened alone, not
+    // the large one's as well, nor pools grown to its size. Offscreen
+    // frames, so this covers what
+    // the renderer owns and frees (arena, atlases, pages, texture pools),
+    // not the window's present chain (editor::tests::
+    // opening_another_island_drops_the_last_ones_renderer covers that).
+    #[test]
+    fn switching_islands_frees_the_last_ones_video_memory() {
+        use gpui_editor_kit::gpu::Offscreen;
+        let Some(install) = install() else {
+            eprintln!("skipping: ANNO117_DIR unset");
+            return;
+        };
+        let install = Arc::new(install);
+        let game = (install.clone(), assets(&install));
+        let mut target = Offscreen::alone(1280, 720).unwrap();
+        let mib = |target: &Offscreen| {
+            let report = target.device().generate_allocator_report()?;
+            Some(report.total_allocated_bytes as f64 / f64::from(1u32 << 20))
+        };
+        let Some(empty) = mib(&target) else {
+            eprintln!("skipping: no allocator report on this backend");
+            return;
+        };
+        // Freed resources go once the device sees their frames finish.
+        let closed = |target: &Offscreen, island: IslandEditor| {
+            drop(island);
+            gpui_editor_kit::gpu::wait_for_freed();
+            let wait = wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: Some(std::time::Duration::from_secs(10)),
+            };
+            target.device().poll(wait).unwrap();
+            mib(target).unwrap()
+        };
+        let held = |target: &mut Offscreen, path: &str| {
+            let island = super::gpu_bench::open_and_draw(target, &game, path, 0.);
+            let used = mib(target).unwrap() - empty;
+            (island, used)
+        };
+        let (small, alone) = held(&mut target, SMALL);
+        let after = closed(&target, small);
+        assert!(
+            after - empty < 8.,
+            "{after:.1} MiB held with no island open"
+        );
+        let (large, big) = held(&mut target, super::gpu_bench::CONTINENTAL_01);
+        let after = closed(&target, large);
+        assert!(
+            after - empty < 8.,
+            "{after:.1} MiB held with no island open"
+        );
+        let (_small, again) = held(&mut target, SMALL);
+        eprintln!("small island {alone:.1} MiB, continental {big:.1}, small after it {again:.1}");
+        let margin = alone * 0.25 + 32.;
+        assert!(
+            big - alone > margin,
+            "the islands must differ by more than the margin"
+        );
+        assert!(
+            again < alone + margin,
+            "the small island holds {again:.1} MiB after the continental one ({big:.1}), {alone:.1} alone"
+        );
     }
 }

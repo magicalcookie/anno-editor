@@ -27,9 +27,9 @@
 // `Probability` as percent of candidates; how the game rolls it was not
 // traced.
 use super::doc::{Materials, trs};
-use crate::terrain::tag;
-use anno_formats::game::Ambients;
+use anno_core::game::IslandRules;
 use anno_formats::vfs::Install;
+use anno_formats::xml::tag;
 use anyhow::Result;
 use gpui_editor_kit::{heightfield::Heightfield, math::Mat4};
 use std::collections::BTreeMap;
@@ -115,8 +115,8 @@ pub struct PropSets {
 }
 
 impl PropSets {
-    pub fn load(install: &Install) -> Result<Self> {
-        let bytes = install.read(install.game().profile().prop_sets_path)?;
+    pub fn load(rules: &IslandRules, install: &Install) -> Result<Self> {
+        let bytes = install.read(rules.prop_sets_path)?;
         Ok(Self::parse(&String::from_utf8_lossy(&bytes)))
     }
 
@@ -193,17 +193,11 @@ impl PropSets {
         self.sets.iter().find(|s| s.name == name)
     }
 
-    /// The region's shipped family, plus the engine's default and no props.
-    pub fn choices(&self, region: &str) -> Vec<&str> {
-        let family = match region {
-            "Celtic" => "ls_wetlands",
-            "Egypt" => "ls_egypt",
-            "Roman" => "ls_heartlands",
-            "Moderate" => "Moderate",
-            "Colony01" => "Colony",
-            "Arctic" => "Arctic",
-            "Africa" => "Colony02",
-            _ => return Vec::new(),
+    /// The region's shipped family in `rules`, plus the engine's default
+    /// and no props.
+    pub fn choices(&self, rules: &IslandRules, region: &str) -> Vec<&str> {
+        let Some(family) = rules.prop_sets(region) else {
+            return Vec::new();
         };
         self.sets
             .iter()
@@ -248,15 +242,11 @@ impl Ground<'_> {
     /// visible opacity, compositing from the end of the set (nearest texel;
     /// the game blends the four around it).
     pub fn ground_type(&self, p: [f32; 2]) -> Option<&str> {
-        let (ids, weights) = self.materials.slots(p);
+        let cover = self.materials.cover(p);
         let mut opacity = 1.;
         let mut best: Option<(&str, f32)> = None;
         for (id, ground_type) in self.layers.iter().rev() {
-            let coverage: f32 = (0..6)
-                .filter(|&k| ids[k] == *id)
-                .map(|k| f32::from(weights[k]) / 31.)
-                .sum::<f32>()
-                .min(1.);
+            let coverage = (cover.iter().find(|c| c.0 == *id)).map_or(0., |c| c.1.min(1.));
             if coverage == 0. {
                 continue;
             }
@@ -516,141 +506,28 @@ fn hash(tier: u64, x: u64, z: u64) -> u64 {
     v ^ (v >> 31)
 }
 
-/// Ambient presets an island of `region` can pick: the install's
-/// `ambientsettings/amb_<region>_*` and `amb_default_*`, without benchmark,
-/// interior and test scenes. Shipped islands use `amb_roman_01`,
-/// `amb_celtic_01`/`_03` and a few one-offs.
-pub fn ambients(install: &Install, region: &str) -> Vec<String> {
-    let kind = install.game().profile().ambients;
-    let prefix = match kind {
-        Ambients::Files => format!("amb_{}_", region.to_ascii_lowercase()),
-        Ambients::Named => match region {
-            "Colony01" => "south_america_caribic_".into(),
-            "Arctic" => "dlc03_".into(),
-            "Africa" => "colony_02".into(),
-            _ => "moderate_".into(),
-        },
-    };
-    let mut out: Vec<String> = install
-        .search("config/engine/ambientsettings/", 2000)
-        .into_iter()
-        .filter_map(|id| {
-            let name = install.file_name(id).strip_suffix(".xml")?.to_owned();
-            let skip = [
-                "benchmark",
-                "_int_",
-                "test",
-                "ign_",
-                "senate",
-                "_bw",
-                "sepia",
-            ];
-            if !(name.starts_with(&prefix) || name.starts_with("amb_default_"))
-                || skip.iter().any(|s| name.contains(s))
-            {
-                return None;
-            }
-            match kind {
-                Ambients::Files => Some(name),
-                Ambients::Named => {
-                    if !install.file_path(id).contains("/ambientsettings/local/")
-                        || ["_old", "_movie", "_gc_", "_ls_"]
-                            .iter()
-                            .any(|s| name.contains(s))
-                    {
-                        return None;
-                    }
-                    let bytes = install.read_file(id).ok()?;
-                    tag(&String::from_utf8_lossy(&bytes), "Name").map(str::to_owned)
-                }
-            }
-        })
-        .collect();
-    out.sort();
-    out.dedup();
-    out
-}
+/// 117's `NoRTAmbientFactor` (config/engine/globals.xml): without ray-traced
+/// lighting the game scales the sky's diffuse light by this, on top of the
+/// preset's `AmbientLightFactor`.
+pub const NO_RT_AMBIENT: f32 = 0.7;
 
-/// How an ambient preset lights the island, in the game's linear units:
-/// `LightColor` is the sun's radiance, `GroundColorAmbient` the light from
-/// below, `Exposure` scales before tone mapping, `SunAO` is how much
-/// occlusion maps shade the sun, and `MaxSunElevation` (radians) is how high
-/// the sun stands. The sky's own light and look come from the game's
-/// atmosphere model, which this does not run; `sky` (its light) and
-/// `zenith`/`horizon` (how it looks) are fixed stand-ins, the horizon a
-/// pale haze as in game.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Ambient {
-    pub sun: [f32; 3],
-    pub sky: [f32; 3],
-    pub zenith: [f32; 3],
-    pub horizon: [f32; 3],
-    pub ground: [f32; 3],
-    pub exposure: f32,
-    pub sun_occlusion: f32,
-    pub elevation: f32,
-}
+#[cfg(test)]
+mod skeleton_tests {
+    use super::PropSets;
 
-impl Default for Ambient {
-    /// `amb_roman_01` and `amb_celtic_01`, which differ only in `SunAO`.
-    fn default() -> Self {
-        Self {
-            sun: [4.197, 3.597, 3.198],
-            sky: [1.0, 1.12, 1.3],
-            zenith: [0.32, 0.58, 1.15],
-            horizon: [1.05, 1.2, 1.4],
-            ground: [0.2; 3],
-            exposure: 0.55,
-            sun_occlusion: 0.16,
-            elevation: 0.65,
-        }
-    }
-}
-
-impl Ambient {
-    /// The 117 presets among `names` that have a file, with defaults for
-    /// what each leaves out. Empty for 1800, whose presets light by time of
-    /// day curves this does not read.
-    pub fn read_all<'a>(
-        install: &Install,
-        names: impl IntoIterator<Item = &'a String>,
-    ) -> Vec<(String, Ambient)> {
-        if install.game().profile().ambients != Ambients::Files {
-            return Vec::new();
-        }
-        let files = install.search("config/engine/ambientsettings/", 2000);
-        (names.into_iter())
-            .filter_map(|name| {
-                let file = format!("{name}.xml");
-                let id = (files.iter())
-                    .find(|&&id| install.file_name(id).eq_ignore_ascii_case(&file))?;
-                Some((name.clone(), Self::read(install, *id)?))
-            })
-            .collect()
-    }
-
-    fn read(install: &Install, id: anno_formats::vfs::FileId) -> Option<Ambient> {
-        let xml = String::from_utf8_lossy(&install.read_file(id).ok()?).into_owned();
-        let number = |name: &str| tag(&xml, name)?.parse::<f32>().ok();
-        // `<LightColor><x>4.197</><y>…</><z>…</></>`
-        let color = |name: &str| -> Option<[f32; 3]> {
-            let open = format!("<{name}>");
-            let rest = &xml[xml.find(&open)? + open.len()..];
-            let mut out = [0.; 3];
-            for (v, axis) in out.iter_mut().zip(["x", "y", "z"]) {
-                *v = tag(rest, axis)?.parse().ok()?;
-            }
-            Some(out)
-        };
-        let d = Ambient::default();
-        Some(Ambient {
-            sun: color("LightColor").unwrap_or(d.sun),
-            ground: color("GroundColorAmbient").unwrap_or(d.ground),
-            exposure: number("Exposure").unwrap_or(d.exposure),
-            sun_occlusion: number("SunAO").unwrap_or(d.sun_occlusion),
-            elevation: number("MaxSunElevation").unwrap_or(d.elevation),
-            ..d
-        })
+    // A region offers its own game's prop set family: through 117's rules
+    // the skeleton's reef would offer nothing, and a Roman island the
+    // heartlands.
+    #[test]
+    fn a_skeleton_region_offers_its_own_prop_sets() {
+        let rules = &crate::games::fixtures::SKELETON_RULES;
+        let sets = PropSets::parse(
+            "<PropSets><PropSet><Name>reefgrass_01</Name></PropSet>\
+             <PropSet><Name>ls_heartlands_01</Name></PropSet>\
+             <PropSet><Name>None</Name></PropSet></PropSets>",
+        );
+        assert_eq!(sets.choices(rules, "Reef"), ["reefgrass_01", "None"]);
+        assert!(sets.choices(rules, "Roman").is_empty());
     }
 }
 
@@ -658,42 +535,122 @@ impl Ambient {
 mod tests {
     use super::{Ground, MAX_INSTANCES, PropSets, scatter};
     use crate::island::doc::{Doc, Materials};
-    use crate::terrain::tag;
-    use anno_formats::{island::Island, rda, session::SessionSettings, vfs::Install};
+    use anno_formats::xml::tag;
+    use anno_formats::{
+        a7m::{island::Island, session::SessionSettings},
+        rda,
+        vfs::Install,
+    };
+
+    // Scatter lays a texel's paint over itself in set order from the end,
+    // plain alpha: the stack's rank and sharpness don't apply.
+    #[test]
+    fn ground_types_composite_in_set_order_from_the_end() {
+        use crate::island::doc::{A7m, Layer, Paint};
+        use anno_formats::a7m::island::{self, pack_slots};
+        use gpui_editor_kit::heightfield::{Grid, Heightfield};
+        let texel = |ids: [u8; 6], weights: [u8; 6]| {
+            let grid = |w, word| island::Grid {
+                width: w,
+                height: w,
+                data: vec![word; w * w],
+            };
+            let paint = Paint::A7m(A7m {
+                ids: Layer::new(&grid(1, pack_slots(ids))),
+                alphas: Layer::new(&grid(2, pack_slots(weights))),
+            });
+            Materials::from_paint(paint, 1.)
+        };
+        let field = Heightfield::new(
+            Grid {
+                width: 3,
+                depth: 3,
+                spacing: 1.,
+                origin: [0.; 2],
+            },
+            vec![0.; 9],
+        );
+        let names = |order: [u8; 3]| -> Vec<(u8, String)> {
+            let name = |id| ["", "Grass", "Soil", "Rock"][usize::from(id)].to_owned();
+            order.iter().map(|&id| (id, name(id))).collect()
+        };
+        let shown = |m: &Materials, layers: &[(u8, String)]| {
+            let ground = Ground {
+                field: &field,
+                materials: m,
+                layers,
+                statics: &[],
+            };
+            ground.ground_type([0.5, 0.5]).map(str::to_owned)
+        };
+        let half_rock = texel([1, 2, 3, 0, 0, 0], [31, 31, 16, 0, 0, 0]);
+        // Rock, last in the set, shows 16/31 over full soil.
+        assert_eq!(
+            shown(&half_rock, &names([1, 2, 3])).as_deref(),
+            Some("Rock")
+        );
+        // Grass last covers everything.
+        assert_eq!(
+            shown(&half_rock, &names([3, 2, 1])).as_deref(),
+            Some("Grass")
+        );
+        // A repeated id's slots add up: 10 + 10 of rock beats what is left.
+        let repeated = texel([2, 3, 3, 0, 0, 0], [31, 10, 10, 0, 0, 0]);
+        assert_eq!(shown(&repeated, &names([1, 2, 3])).as_deref(), Some("Rock"));
+        assert_eq!(shown(&texel([0; 6], [0; 6]), &names([1, 2, 3])), None);
+    }
 
     #[test]
     fn installed_1800_regional_vegetation_previews_and_saves() {
         use crate::island::IslandEditor;
-        let Some(dir) = std::env::var_os("ANNO1800_DIR") else {
+        let Some(dir) = anno_formats::vfs::install_dir("ANNO1800_DIR") else {
             return;
         };
-        let install = Install::open(dir).unwrap();
-        let sets = PropSets::load(&install).unwrap();
+        let families = crate::games::profile(anno_core::game::Game::Anno1800).archive_families;
+        let install = Install::open(dir, families).unwrap();
+        let sets =
+            PropSets::load(crate::games::rules(crate::games::of(&install)), &install).unwrap();
         for (region, name, ambient) in [
             ("Moderate", "Moderate", "Moderate_01"),
             ("Colony01", "Colony", "south_america_caribic_01"),
             ("Arctic", "Arctic", "DLC03_01"),
             ("Africa", "Colony02", "Colony_02"),
         ] {
-            assert!(sets.choices(region).contains(&name));
-            assert!(sets.choices(region).contains(&"None"));
             assert!(
-                super::ambients(&install, region).contains(&ambient.to_owned()),
+                sets.choices(crate::games::rules(crate::games::of(&install)), region)
+                    .contains(&name)
+            );
+            assert!(
+                sets.choices(crate::games::rules(crate::games::of(&install)), region)
+                    .contains(&"None")
+            );
+            assert!(
+                (crate::games::module(crate::games::of(&install))
+                    .scene()
+                    .unwrap())
+                .ambient_names(&install, region)
+                .contains(&ambient.to_owned()),
                 "{region}: ambient"
             );
             if region == "Colony01" {
-                assert!(!sets.choices(region).contains(&"Colony02"));
+                assert!(
+                    !sets
+                        .choices(crate::games::rules(crate::games::of(&install)), region)
+                        .contains(&"Colony02")
+                );
             }
             let path = install
                 .search(".a7m", 100_000)
                 .into_iter()
                 .find_map(|id| {
                     let path = install.file_path(id);
-                    if !path.ends_with(".a7m") || install.game().island_region(path) != region {
+                    if !path.ends_with(".a7m")
+                        || crate::games::rules(crate::games::of(&install)).island_region(&path)
+                            != region
+                    {
                         return None;
                     }
-                    let archive =
-                        rda::Archive::from_bytes(install.read_file(id).ok()?, path).ok()?;
+                    let archive = rda::Archive::parse(install.read_file(id).ok()?, &path).ok()?;
                     let island = Island::parse(
                         &archive.read_path("gamedata.data").ok()?,
                         &archive.read_path("rd3d.data").ok()?,
@@ -707,7 +664,12 @@ mod tests {
                         .then(|| path.to_owned())
                 })
                 .unwrap();
-            let mut editor = IslandEditor::load(&install, &path).unwrap();
+            let mut editor = IslandEditor::load(
+                crate::games::module(crate::games::of(&install)),
+                &install,
+                &path,
+            )
+            .unwrap();
             editor.layers.vegetation = true;
             let preview = editor.vegetation_preview().unwrap();
             assert!(
@@ -724,9 +686,14 @@ mod tests {
             }
             editor.edit_session(|s| s.vegetation_prop_set = "None".into());
             assert_eq!(editor.vegetation_preview().unwrap().len(), 0);
-            let mut source = editor.source.clone();
-            editor.doc.write_into(&mut source).unwrap();
-            let (gd, rd) = source.to_members().unwrap();
+            let mut source = editor.island.a7m().unwrap().clone();
+            source.unpark().unwrap();
+            editor
+                .island
+                .doc
+                .write_into(&mut source, Some(&install))
+                .unwrap();
+            let (gd, rd) = source.encode().unwrap();
             let saved = Island::parse(&gd, &rd).unwrap();
             assert_eq!(
                 SessionSettings::read(saved.gamedata())
@@ -778,17 +745,26 @@ mod tests {
     // bound holds. The chosen set survives a save.
     #[test]
     fn preview_follows_ground_types_and_set_survives_save() {
-        let Some(dir) = std::env::var_os("ANNO117_DIR") else {
+        let Some(dir) = anno_formats::vfs::install_dir("ANNO117_DIR") else {
             eprintln!("skip: ANNO117_DIR unset");
             return;
         };
-        let install = Install::open(dir).unwrap();
-        let sets = PropSets::load(&install).unwrap();
+        let families = crate::games::profile(anno_core::game::Game::Anno117).archive_families;
+        let install = Install::open(dir, families).unwrap();
+        let sets =
+            PropSets::load(crate::games::rules(crate::games::of(&install)), &install).unwrap();
         for name in ["ls_heartlands_01", "ls_wetlands_01", "None"] {
             assert!(sets.get(name).is_some(), "{name}");
         }
-        assert!(sets.choices("Roman").contains(&"ls_heartlands_01_arid"));
-        assert!(!sets.choices("Roman").contains(&"ls_wetlands_01"));
+        assert!(
+            sets.choices(crate::games::rules(crate::games::of(&install)), "Roman")
+                .contains(&"ls_heartlands_01_arid")
+        );
+        assert!(
+            !sets
+                .choices(crate::games::rules(crate::games::of(&install)), "Roman")
+                .contains(&"ls_wetlands_01")
+        );
 
         let path = install
             .search("roman_island_medium_01.a7m", 4)
@@ -796,18 +772,27 @@ mod tests {
             .map(|id| install.file_path(id).to_owned())
             .find(|p| p.ends_with(".a7m"))
             .unwrap();
-        let archive =
-            rda::Archive::from_bytes(install.read(&path).unwrap(), path.as_str()).unwrap();
+        let archive = rda::Archive::parse(install.read(&path).unwrap(), path.as_str()).unwrap();
         let member = |n: &str| archive.read_path(n).unwrap();
         let mut island = Island::parse(&member("gamedata.data"), &member("rd3d.data")).unwrap();
-        let materials = Materials::load_level0(&install, &path, &island).unwrap().0;
+        let materials = Materials::load_level0(
+            crate::games::a7m_rules(crate::games::of(&install)).material_files,
+            &install,
+            &path,
+            &island,
+        )
+        .unwrap();
         let mut doc = Doc::from_island(&island, Some(materials)).unwrap();
         let set = sets.get(&doc.session.vegetation_prop_set).unwrap();
 
         // Ground types straight from the material set xml, so the test
         // does not depend on textures decoding.
-        let xml = String::from_utf8_lossy(&install.read(island.material_set_file_name()).unwrap())
-            .into_owned();
+        let xml = String::from_utf8_lossy(
+            &install
+                .read(island.material_set_file_name().unwrap())
+                .unwrap(),
+        )
+        .into_owned();
         let layers: Vec<(u8, String)> = xml
             .split("<Material>")
             .skip(1)
@@ -849,8 +834,8 @@ mod tests {
         );
 
         doc.session.vegetation_prop_set = "ls_heartlands_01_volcanic".into();
-        doc.write_into(&mut island).unwrap();
-        let (gd, rd) = island.to_members().unwrap();
+        doc.write_into(&mut island, Some(&install)).unwrap();
+        let (gd, rd) = island.encode().unwrap();
         let reread = Island::parse(&gd, &rd).unwrap();
         assert_eq!(
             SessionSettings::read(reread.gamedata())
@@ -863,24 +848,31 @@ mod tests {
 
 #[cfg(test)]
 mod ambient_tests {
-    use super::Ambient;
     use anno_formats::vfs::Install;
 
-    // Needs the game: the presets differ in exposure and sun occlusion.
+    // Needs the game: a Roman island offers every region's presets and the
+    // generic ones, its own first, but no portrait, UI or test lighting.
     #[test]
-    fn ambient_presets_read_their_light() {
-        let Some(dir) = std::env::var_os("ANNO117_DIR") else {
+    fn a_region_lists_its_own_presets_first_then_every_other() {
+        let Some(dir) = anno_formats::vfs::install_dir("ANNO117_DIR") else {
             eprintln!("skipping: ANNO117_DIR unset");
             return;
         };
-        let install = Install::open(dir).unwrap();
-        let names = ["amb_celtic_03", "amb_roman_01", "no_such_preset"].map(String::from);
-        let read = Ambient::read_all(&install, &names);
-        let get = |name: &str| read.iter().find(|(n, _)| n == name).map(|(_, a)| *a);
-        let celtic = get("amb_celtic_03").unwrap();
-        assert_eq!((celtic.exposure, celtic.sun_occlusion), (0.65, 0.198));
-        assert!((celtic.sun[0] - 4.197).abs() < 1e-3 && celtic.ground == [0.2; 3]);
-        assert!((get("amb_roman_01").unwrap().elevation - 0.644444).abs() < 1e-5);
-        assert!(get("no_such_preset").is_none());
+        let families = crate::games::profile(anno_core::game::Game::Anno117).archive_families;
+        let install = Install::open(dir, families).unwrap();
+        let names = (crate::games::module(crate::games::of(&install))
+            .scene()
+            .unwrap())
+        .ambient_names(&install, "Roman");
+        let at = |n: &str| names.iter().position(|x| x == n);
+        assert_eq!(names.first().map(String::as_str), Some("amb_roman_01"));
+        let own = at("amb_roman_dlc01_volcwinter_01").unwrap();
+        assert!(own < at("amb_default_01").unwrap());
+        assert!(at("amb_default_01").unwrap() < at("amb_celtic_01").unwrap());
+        assert!(at("amb_egypt_01").is_some() && at("amb_roman_dlc01_bloom_int_01").is_some());
+        assert!(at("pbr_default_day_night_overcast_01").unwrap() > at("amb_egypt_04").unwrap());
+        assert!(names.iter().all(|n| {
+            !n.starts_with("portrait_") && !n.starts_with("ui_") && !n.contains("test")
+        }));
     }
 }

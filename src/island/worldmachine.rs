@@ -3,8 +3,9 @@
 // The work runs off the UI thread and lands as one undo step.
 pub mod template;
 
-use anno_formats::island::{self, Grid};
-use anno_formats::tint::TintMap;
+use anno_core::game::GroundNames;
+use anno_formats::a7m::island::{self, Grid};
+use anno_formats::a7m::tint::TintMap;
 use anyhow::{Context as _, Result, ensure};
 use gpui_editor_kit::heightfield::Grid as FieldGrid;
 use serde::{Deserialize, Serialize};
@@ -114,46 +115,15 @@ pub fn scan(folder: &Path) -> Exports {
     }
 }
 
-fn material_name(file: &str) -> &str {
-    let file = file.rsplit('/').next().unwrap_or(file);
-    file.split_once('_')
-        .filter(|(prefix, _)| prefix.len() == 1 || matches!(*prefix, "tropical" | "colony02"))
-        .map_or(file, |(_, name)| name)
-}
+/// World Machine's default export's splatmap channels, R to A, by the
+/// role each paints (`GroundNames::channels`).
+pub const DEFAULT_CHANNELS: [&str; 4] = ["eroded ridges", "flat rock", "scree", "base cover"];
 
-/// Default channel materials for a WM default splatmap (R eroded ridges, G
-/// flat rock, B scree, A the base cover), picked from the island's palette
-/// by file name.
-pub fn default_channels(materials: &[(u8, String)]) -> [Option<u8>; 4] {
-    // Names must start with the word: "grass_01" must not pick
-    // "underwatergrass_01".
-    let find = |words: &[&str]| {
-        words.iter().find_map(|w| {
-            materials
-                .iter()
-                .find(|(_, file)| material_name(file).starts_with(w))
-                .map(|(id, _)| *id)
-        })
-    };
-    [
-        find(&[
-            "cliff_limestone",
-            "cliff_blocky",
-            "cliff_sharp",
-            "cliff",
-            "mountain",
-        ]),
-        find(&["layeredstone", "granite", "rocks_sharp", "rock", "stone"]),
-        find(&["gravel", "gravle", "beach"]),
-        find(&[
-            "grass_01_dummy",
-            "grass_01.",
-            "grass_01",
-            "grass",
-            "gras",
-            "snow",
-        ]),
-    ]
+/// Channel materials for a WM default splatmap, picked from the island's
+/// palette by the game's names for `DEFAULT_CHANNELS`.
+pub fn default_channels(names: &GroundNames, materials: &[(u8, String)]) -> [Option<u8>; 4] {
+    let files = materials.iter().map(|(id, f)| (*id, f.as_str()));
+    DEFAULT_CHANNELS.map(|role| names.pick(names.channel(role), files.clone()))
 }
 
 /// The Anno template an export came from, by its file name (templates are
@@ -449,12 +419,13 @@ impl IslandEditor {
             return None;
         }
         let target = Target {
-            field: self.doc.field.grid,
+            field: self.island.doc.field.grid,
             alphas: self
+                .island
                 .doc
                 .materials
                 .as_ref()
-                .map_or([0, 0], |m| m.alphas.size()),
+                .map_or([0, 0], |m| m.paint.size()),
             world: self.world(),
         };
         self.wm_busy = true;
@@ -470,31 +441,35 @@ impl IslandEditor {
             Err(e) => return self.say(format!("World Machine import failed: {e:#}"), true),
         };
         self.wm_stamp = imported.stamp;
-        let before = self.doc.clone();
+        let before = self.island.doc.clone();
         let mut done = Vec::new();
         if let Some(heights) = imported.heights {
-            let [lo, hi] = self.doc.field.limits;
-            let field = Arc::make_mut(&mut self.doc.field);
+            let [lo, hi] = self.island.doc.field.limits;
+            let field = Arc::make_mut(&mut self.island.doc.field);
             for (to, from) in field.heights.iter_mut().zip(heights) {
                 *to = from.clamp(lo, hi);
             }
+            self.block_lifted_from(&before.field);
             done.push("heights");
         }
-        if let (Some((ids, alphas)), Some(m)) = (imported.materials, &mut self.doc.materials) {
-            m.ids = super::doc::Layer::new(&ids);
-            m.alphas = super::doc::Layer::new(&alphas);
+        if let (Some((ids, alphas)), Some(m)) = (imported.materials, &mut self.island.doc.materials)
+        {
+            m.paint = super::doc::Paint::A7m(super::doc::A7m {
+                ids: super::doc::Layer::new(&ids),
+                alphas: super::doc::Layer::new(&alphas),
+            });
             self.ground_stale = true;
             self.splat_stale = true;
             done.push("materials");
         }
         if let Some(tint) = imported.tint {
-            self.doc.tint = Some(Arc::new(tint));
+            self.island.doc.tint = Some(Arc::new(tint));
             self.layers.tint = true;
             done.push("tint");
         }
-        if self.is_new && self.doc.grids.is_some() {
+        if self.is_new && self.island.doc.grids.is_some() {
             let environment = self.land_environment();
-            super::new::derive_land(&mut self.doc, environment);
+            super::new::derive_land(&mut self.island.doc, environment);
             self.derive_areas_from_slope();
             done.push("land and buildable areas");
         }
@@ -608,13 +583,27 @@ impl Editor {
                 .enumerate()
                 .map(|(i, _)| {
                     if i == 0 {
-                        default_channels(&materials)
+                        default_channels(&island.rules().ground_names, &materials)
                     } else {
                         [None; 4]
                     }
                 })
                 .collect();
+            let unset: Vec<&str> = (link.channels.first().into_iter())
+                .flat_map(|c| DEFAULT_CHANNELS.iter().zip(c))
+                .filter(|(_, m)| m.is_none())
+                .map(|(role, _)| *role)
+                .collect();
             island.set_listing(|l| l.world_machine = Some(link));
+            if !unset.is_empty() {
+                self.message(
+                    format!(
+                        "No palette material named for {}: pick them for the splatmap",
+                        unset.join(", ")
+                    ),
+                    false,
+                );
+            }
         }
         self.wm_dialog = true;
         self.refresh_wm_previews();
@@ -693,7 +682,7 @@ impl Editor {
                     .collect()
             })
             .unwrap_or_default();
-        let channels = template::channel_materials(self.game, &materials);
+        let channels = template::channel_materials(&island.rules().ground_names, &materials);
         let set = channels.iter().flatten().filter(|c| c.is_some()).count();
         island.edit_wm_link(|l| {
             l.sea = template::SEA;
@@ -1015,7 +1004,7 @@ impl Editor {
                                 .text_size(px(11.))
                                 .child(
                                     match template.and_then(|_| template::CHANNELS.get(s * 4 + c)) {
-                                        Some((role, _)) => {
+                                        Some(role) => {
                                             format!("{} {role}", ["R", "G", "B", "A"][c])
                                         }
                                         None => ["R", "G", "B", "A"][c].to_owned(),
@@ -1301,8 +1290,9 @@ mod tests {
         .into_iter()
         .map(|(i, f)| (i, f.to_owned()))
         .collect();
+        let names = &crate::games::rules(anno_core::game::Game::Anno117).ground_names;
         assert_eq!(
-            default_channels(&set),
+            default_channels(names, &set),
             [Some(14), Some(10), Some(8), Some(12)]
         );
     }
@@ -1330,8 +1320,9 @@ mod tests {
                 .enumerate()
                 .map(|(id, file)| (id as u8, format!("terrain/{file}.xml")))
                 .collect();
+            let names = &crate::games::rules(anno_core::game::Game::Anno1800).ground_names;
             assert_eq!(
-                default_channels(&materials),
+                default_channels(names, &materials),
                 [Some(0), Some(1), Some(2), Some(3)],
                 "{files:?}"
             );

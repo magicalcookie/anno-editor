@@ -5,7 +5,9 @@ use crate::{
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 use objc2_core_foundation::CFRetained;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
-use objc2_core_video::{CVPixelBuffer, CVPixelBufferGetHeight, CVPixelBufferGetWidth};
+use objc2_core_video::CVPixelBuffer;
+#[cfg(target_os = "ios")]
+use objc2_core_video::{CVPixelBufferGetHeight, CVPixelBufferGetWidth};
 use refineable::Refineable;
 
 /// A source of a surface's content.
@@ -103,7 +105,7 @@ impl Element for Surface {
         _: &mut App,
     ) {
         match &self.source {
-            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            #[cfg(target_os = "ios")]
             SurfaceSource::Surface(surface) => {
                 let size = crate::size(
                     CVPixelBufferGetWidth(surface).into(),
@@ -112,6 +114,13 @@ impl Element for Surface {
                 let new_bounds = self.object_fit.get_bounds(bounds, size);
                 // TODO: Add support for corner_radii
                 window.paint_surface(new_bounds, surface.clone());
+            }
+            // macOS windows draw through wgpu, which draws a surface's
+            // texture (`TextureHandoff`), so a video surface paints nothing
+            // there.
+            #[cfg(target_os = "macos")]
+            SurfaceSource::Surface(_) => {
+                let _ = (bounds, window);
             }
             #[allow(unreachable_patterns)]
             _ => {}

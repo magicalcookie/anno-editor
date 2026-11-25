@@ -1,8 +1,12 @@
 // Owns the window: workspaces and their dock layouts, menus, the status bar,
 // keyboard routing, and the open install and mod project shared by every
 // workspace.
-use crate::{browser::Browser, island::IslandEditor, project::Project, ui::UiEditor};
-use anno_formats::game::Game;
+use crate::games::GameExt;
+use crate::{
+    browser::Browser, island::IslandEditor, map::MapEditor, model::ModelEditor, project::Project,
+    ui::UiEditor,
+};
+use anno_core::game::{Game, Module};
 use anno_formats::vfs::Install;
 use gpui_editor_kit::{
     dock::{self, Axis, Dock, DockHost, Layout},
@@ -31,9 +35,14 @@ pub enum Pane {
     IslandTop,
     IslandHierarchy,
     IslandLayers,
+    IslandGraphics,
     IslandInspector,
     IslandMaterials,
     IslandLibrary,
+    MapView,
+    MapSlots,
+    MapInspector,
+    MapIslands,
     UiTree,
     UiCanvas,
     UiInspector,
@@ -41,10 +50,15 @@ pub enum Pane {
     UiTimeline,
     UiBindings,
     UiLibrary,
+    ModelView,
+    ModelList,
+    ModelHierarchy,
+    ModelInspector,
+    ModelTimeline,
 }
 
 impl Pane {
-    const ALL: [Self; 20] = [
+    const ALL: [Self; 30] = [
         Self::ProjectOverview,
         Self::ProjectModels,
         Self::ProjectMods,
@@ -55,9 +69,14 @@ impl Pane {
         Self::IslandTop,
         Self::IslandHierarchy,
         Self::IslandLayers,
+        Self::IslandGraphics,
         Self::IslandInspector,
         Self::IslandMaterials,
         Self::IslandLibrary,
+        Self::MapView,
+        Self::MapSlots,
+        Self::MapInspector,
+        Self::MapIslands,
         Self::UiTree,
         Self::UiCanvas,
         Self::UiInspector,
@@ -65,6 +84,11 @@ impl Pane {
         Self::UiTimeline,
         Self::UiBindings,
         Self::UiLibrary,
+        Self::ModelView,
+        Self::ModelList,
+        Self::ModelHierarchy,
+        Self::ModelInspector,
+        Self::ModelTimeline,
     ];
 }
 
@@ -73,18 +97,29 @@ pub enum Workspace {
     Project,
     Assets,
     Island,
+    Map,
     Ui,
+    Model,
 }
 
 impl Workspace {
-    const ALL: [Self; 4] = [Self::Project, Self::Assets, Self::Island, Self::Ui];
+    const ALL: [Self; 6] = [
+        Self::Project,
+        Self::Assets,
+        Self::Island,
+        Self::Map,
+        Self::Ui,
+        Self::Model,
+    ];
 
     fn label(self) -> &'static str {
         match self {
             Self::Project => "Project",
             Self::Assets => "Assets",
             Self::Island => "Island",
+            Self::Map => "Map",
             Self::Ui => "UI (experimental)",
+            Self::Model => "Model",
         }
     }
 
@@ -95,7 +130,9 @@ impl Workspace {
             Self::Project => "project",
             Self::Assets => "assets",
             Self::Island => "island",
+            Self::Map => "map",
             Self::Ui => "ui",
+            Self::Model => "model",
         }
     }
 
@@ -126,7 +163,12 @@ impl Workspace {
                 Axis::Horizontal,
                 0.19,
                 Layout::tabs(
-                    vec![Pane::IslandList, Pane::IslandHierarchy, Pane::IslandLayers],
+                    vec![
+                        Pane::IslandList,
+                        Pane::IslandHierarchy,
+                        Pane::IslandLayers,
+                        Pane::IslandGraphics,
+                    ],
                     Pane::IslandList,
                 ),
                 Layout::split(
@@ -147,6 +189,46 @@ impl Workspace {
                         ),
                     ),
                     Layout::tabs(vec![Pane::IslandInspector], Pane::IslandInspector),
+                ),
+            ),
+            // The slot list narrow on the left, the map the rest but the
+            // Inspector, whose island dropdown and Islands tab want the
+            // width of an island name and its size.
+            Self::Map => Layout::split(
+                Axis::Horizontal,
+                0.17,
+                Layout::tabs(vec![Pane::MapSlots], Pane::MapSlots),
+                Layout::split(
+                    Axis::Horizontal,
+                    0.76,
+                    Layout::tabs(vec![Pane::MapView], Pane::MapView),
+                    Layout::tabs(
+                        vec![Pane::MapInspector, Pane::MapIslands],
+                        Pane::MapInspector,
+                    ),
+                ),
+            ),
+            // The Models list and the hierarchy narrow on the left, as the
+            // Islands list and the island's hierarchy are; the inspector on
+            // the right wide enough for a material's field names, the
+            // timeline under the view.
+            Self::Model => Layout::split(
+                Axis::Horizontal,
+                0.18,
+                Layout::tabs(
+                    vec![Pane::ModelList, Pane::ModelHierarchy, Pane::Browser],
+                    Pane::ModelList,
+                ),
+                Layout::split(
+                    Axis::Horizontal,
+                    0.72,
+                    Layout::split(
+                        Axis::Vertical,
+                        0.74,
+                        Layout::tabs(vec![Pane::ModelView], Pane::ModelView),
+                        Layout::tabs(vec![Pane::ModelTimeline], Pane::ModelTimeline),
+                    ),
+                    Layout::tabs(vec![Pane::ModelInspector], Pane::ModelInspector),
                 ),
             ),
             Self::Ui => Layout::split(
@@ -178,6 +260,11 @@ impl Workspace {
 enum Menu {
     File,
     Island,
+    /// The Map workspace's own: new, open and the variant actions.
+    Map,
+    /// The Model workspace's own: open, add, the selection, the gizmo,
+    /// playback and what the view shows.
+    Model,
     Edit,
     View,
     /// The project switcher under the project's name.
@@ -193,11 +280,104 @@ pub enum Leave {
     NewIsland,
     /// Another island, by virtual path.
     Island(String),
+    /// Another map layout, by virtual path.
+    Map(String),
+    /// The New map layout dialog.
+    NewMap,
+    /// Map → Close: the Map workspace left empty.
+    CloseMap,
+    /// Another UI screen, by virtual path.
+    Screen(String),
+    /// Another model in the Model workspace, by virtual path.
+    Model(String),
     /// Ctrl Q, File → Quit, or the window's close button.
     Quit,
 }
 
+/// One of the open documents, each workspace's own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Doc {
+    Island,
+    Map,
+    Ui,
+    Model,
+}
+
+impl Leave {
+    /// The one document going there replaces; None when it leaves them
+    /// all: another game or project, or quitting.
+    pub fn replaces(&self) -> Option<Doc> {
+        match self {
+            Leave::NewIsland | Leave::Island(_) => Some(Doc::Island),
+            Leave::Map(_) | Leave::NewMap | Leave::CloseMap => Some(Doc::Map),
+            Leave::Screen(_) => Some(Doc::Ui),
+            Leave::Model(_) => Some(Doc::Model),
+            Leave::Game | Leave::Project(_) | Leave::Quit => None,
+        }
+    }
+
+    /// The ask's title, what is about to happen ("Save them before …"),
+    /// and the save button's words.
+    pub(crate) fn words(&self) -> (&'static str, &'static str, &'static str) {
+        match self {
+            Leave::Game => ("Switch game?", "switching game", "Save and switch"),
+            Leave::Project(_) => ("Switch project?", "switching project", "Save and switch"),
+            Leave::NewIsland => (
+                "Start a new island?",
+                "starting a new island",
+                "Save and go on",
+            ),
+            Leave::Island(_) => (
+                "Open another island?",
+                "opening another island",
+                "Save and open",
+            ),
+            Leave::Map(_) => ("Open another map?", "opening another map", "Save and open"),
+            Leave::NewMap => (
+                "Start a new map layout?",
+                "starting a new layout",
+                "Save and go on",
+            ),
+            Leave::CloseMap => ("Close the map?", "closing it", "Save and close"),
+            Leave::Screen(_) => (
+                "Open another screen?",
+                "opening another screen",
+                "Save and open",
+            ),
+            Leave::Model(_) => (
+                "Open another model?",
+                "opening another model",
+                "Save and open",
+            ),
+            Leave::Quit => ("Quit?", "quitting", "Save and quit"),
+        }
+    }
+}
+
+/// The ask's buttons.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Answer {
+    Cancel,
+    Discard,
+    Save,
+}
+
+/// What a save did, for whatever waits on it (Save and quit, Save and
+/// open).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Saved {
+    /// Every edited document is in the mod folder; a warning may say what
+    /// the game can't use yet.
+    Written,
+    /// A shipped map waits for the answer to how it saves; the rest is
+    /// written.
+    Waiting,
+    /// Something wasn't written; the status bar says what.
+    Failed,
+}
+
 pub struct Editor {
+    pub module: &'static dyn Module,
     pub game: Game,
     pub config: PathBuf,
     pub install: Option<Arc<Install>>,
@@ -205,7 +385,7 @@ pub struct Editor {
     pub assets: Option<Arc<anno_formats::assets::Assets>>,
     pub project: Project,
     /// Every installed mod but the project's own copy (`scan_mods`).
-    pub mods: Vec<anno_formats::modinfo::Installed>,
+    pub mods: Vec<anno_core::modinfo::Installed>,
     /// Ids of the dependencies mounted under the project, by mod layer.
     pub mounted: Vec<String>,
     /// What the last save found the open island using from mods the
@@ -213,7 +393,33 @@ pub struct Editor {
     pub undeclared: Vec<crate::project::Undeclared>,
     pub browser: Browser,
     pub island: Option<IslandEditor>,
+    /// The last frame each island view drew before the island closed for
+    /// another one, shown while that one loads and under it until its own
+    /// first frame: the empty state flashed between them otherwise.
+    pub island_stills: [Option<gpui_editor_kit::gpu::Still>; 2],
+    /// The map layout open in the Map workspace.
+    pub map: Option<MapEditor>,
+    /// The Map workspace's dialog, while one is open.
+    pub map_dialog: Option<crate::map::panels::Dialog>,
+    /// The game's shipped layouts, listed once for Open and New map.
+    pub shipped_maps: Option<Arc<Vec<anno_core::map::ShippedMap>>>,
+    pub shipped_maps_loading: bool,
     pub ui: Option<UiEditor>,
+    /// The cfg open in the Model workspace.
+    pub model: Option<ModelEditor>,
+    /// Where the Model timeline's ruler was last laid out, for scrubbing.
+    pub model_ruler: std::rc::Rc<std::cell::Cell<Bounds<Pixels>>>,
+    /// The timeline clip being dragged.
+    pub model_clip_drag: Option<crate::model::timeline::ClipDrag>,
+    /// The Model workspace's asset picker, while open.
+    pub model_picker: Option<crate::model::picker::Picker>,
+    /// The sounds models' sequences play, across models.
+    pub model_sound: crate::model::sound::Sound,
+    /// Models opened this session, newest first: Open model lists them
+    /// first and Back goes to the one before. Not kept across sessions.
+    pub model_recent: Vec<String>,
+    /// The Model workspace's Models list.
+    pub model_list: crate::model::list::List,
     /// The UI files pane: index of every compiled UI asset and its search.
     pub ui_find: crate::ui::files::Find,
     /// The screen that last failed to open, named on the empty canvas
@@ -224,7 +430,7 @@ pub struct Editor {
     /// The animation player's frame loop is running.
     pub ui_ticking: bool,
     pub workspace: Workspace,
-    pub(crate) docks: [Dock<Pane>; 4],
+    pub(crate) docks: [Dock<Pane>; 6],
     /// Each pane's view, made on first render; see `PaneView`.
     pane_views: Vec<(Pane, Entity<PaneView>)>,
     /// Read by every render, so notifying it redraws the window while
@@ -237,6 +443,8 @@ pub struct Editor {
     title: String,
     /// `ANNO_EDITOR_BENCH=SECONDS`: orbit the first view once the island
     /// has loaded, print frame times every second, then quit.
+    /// `ANNO_EDITOR_UI_BENCH=SECONDS`: pan the UI canvas a pixel each frame
+    /// instead, once a UI file is open.
     bench: Option<Bench>,
     /// When the viewport readouts last redrew during camera moves, and
     /// whether a redraw is scheduled (see `refresh_readouts`).
@@ -290,6 +498,8 @@ pub struct Editor {
     pub wm_previews: Option<crate::island::WmPreviews>,
     pub focus: FocusHandle,
     pub pending_save: bool,
+    /// An install is copying into the game (`install_project`).
+    installing: bool,
     status: String,
     error: bool,
     /// The workspace the status message is about; others show none.
@@ -304,6 +514,9 @@ pub struct Editor {
     pub(crate) place_pending: Option<String>,
     /// View → Statistics: load timings and frame times over the viewport.
     pub stats: bool,
+    /// View → GPU pass times: each timed render pass under the frame times.
+    /// Only drawn with `stats`; turning it on turns that on too.
+    pub pass_times: bool,
     /// Asked to switch game or project with unsaved edits.
     pub leaving: Option<Leave>,
     /// Project workspace state: the field being edited, the selected model
@@ -319,13 +532,15 @@ impl Editor {
     /// indexes in `config` (`platform::config_dir`; window tests pass a
     /// folder of their own).
     pub fn new(
-        game: Game,
+        project: Project,
         config: PathBuf,
         install: Option<PathBuf>,
         open: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let module = project.module;
+        let game = module.game();
         let mut errors = Vec::new();
         let docks = Workspace::ALL.map(|w| {
             let path = config.join(format!("layout-{}.json", w.key()));
@@ -344,17 +559,30 @@ impl Editor {
         let focus = cx.focus_handle();
         focus.focus(window, cx);
         let mut editor = Self {
+            module,
             game,
             config: config.clone(),
             install: None,
             assets: None,
-            project: Project::load(&config, game),
+            project,
             mods: Vec::new(),
             mounted: Vec::new(),
             undeclared: Vec::new(),
             browser: Browser::default(),
             island: None,
+            island_stills: [None, None],
+            map: None,
+            map_dialog: None,
+            shipped_maps: None,
+            shipped_maps_loading: false,
             ui: None,
+            model: None,
+            model_ruler: Default::default(),
+            model_clip_drag: None,
+            model_picker: None,
+            model_sound: Default::default(),
+            model_recent: Vec::new(),
+            model_list: Default::default(),
             ui_find: Default::default(),
             ui_failed: None,
             ui_clipboard: None,
@@ -367,10 +595,16 @@ impl Editor {
             title: String::new(),
             readouts_at: None,
             readouts_due: false,
-            bench: std::env::var("ANNO_EDITOR_BENCH")
-                .ok()
+            bench: (std::env::var("ANNO_EDITOR_BENCH").ok())
                 .and_then(|s| s.parse().ok())
-                .map(Bench::new),
+                .map(Bench::new)
+                .or_else(|| {
+                    let seconds = std::env::var("ANNO_EDITOR_UI_BENCH").ok()?.parse().ok()?;
+                    Some(Bench {
+                        ui: true,
+                        ..Bench::new(seconds)
+                    })
+                }),
             menu: None,
             wizard: None,
             import: None,
@@ -403,7 +637,9 @@ impl Editor {
             status_tool: None,
             place_pending: None,
             stats: false,
+            pass_times: false,
             pending_save: false,
+            installing: false,
             leaving: None,
             project_ui: Default::default(),
         };
@@ -440,7 +676,13 @@ impl Editor {
         let this = cx.entity().downgrade();
         window.on_window_should_close(cx, move |_, cx| {
             this.update(cx, |this, cx| {
-                this.end_typing();
+                // A value its field refuses keeps the window open, the
+                // field still taking keys: closing would drop it.
+                if let Err(e) = this.end_typing() {
+                    this.message(e, true);
+                    cx.notify();
+                    return false;
+                }
                 if this.unsaved() {
                     this.leaving = Some(Leave::Quit);
                     cx.notify();
@@ -460,6 +702,8 @@ impl Editor {
             || self.wm_dialog
             || self.leaving.is_some()
             || self.project_ui.new_project.is_some()
+            || self.map_dialog.is_some()
+            || self.model_picker.is_some()
     }
 
     /// Runs `then` once the pointer has rested on the row `key` for a
@@ -497,7 +741,7 @@ impl Editor {
 
     /// The status bar's message and whether it is an error. A message about
     /// another workspace would read as this one's, so it shows only there.
-    fn status_line(&self) -> (String, bool) {
+    pub(crate) fn status_line(&self) -> (String, bool) {
         if self.status_in != self.workspace {
             return (String::new(), false);
         }
@@ -537,8 +781,8 @@ impl Editor {
         }
     }
 
-    /// Indexes the install off the UI thread; 31 archive headers take a
-    /// moment on a cold cache.
+    /// Indexes the install off the UI thread: every archive's header
+    /// tables, a few hundredths of a second warm, longer from a cold disk.
     fn open_install(&mut self, dir: Option<PathBuf>, open: Option<String>, cx: &mut Context<Self>) {
         let game = self.game;
         let Some(dir) = dir.or_else(|| game.locate()) else {
@@ -553,11 +797,12 @@ impl Editor {
             return;
         };
         self.message(format!("Indexing {}…", dir.display()), false);
+        let families = game.profile().archive_families;
         cx.spawn(async move |this, cx| {
             let started = std::time::Instant::now();
             let result = cx
                 .background_executor()
-                .spawn(async move { Install::open_game(game, &dir) })
+                .spawn(async move { Install::open(&dir, families) })
                 .await;
             this.update(cx, |this, cx| {
                 match result {
@@ -579,7 +824,20 @@ impl Editor {
                             },
                             false,
                         );
-                        this.browser.attach(&install);
+                        this.browser.attach(&install, this.module);
+                        // The island view's pipelines and the game's water
+                        // and sky passes' build as soon as there is a
+                        // window device, not when the first island opens.
+                        let (module, warm) = (this.module, install.clone());
+                        gpui_editor_kit::gpu::warm_passes(Arc::new(
+                            move |gpu: &gpui_editor_kit::gpu::Warm<'_>| {
+                                anno_render::a7m::warm(gpu);
+                                if let Some(scene) = module.scene() {
+                                    scene.warm(&warm, gpu)
+                                }
+                            },
+                        ));
+                        this.order_names(cx);
                         this.load_assets(install.clone(), cx);
                         this.install = Some(install);
                         this.scan_mods();
@@ -609,10 +867,15 @@ impl Editor {
     }
 
     fn load_assets(&mut self, install: Arc<Install>, cx: &mut Context<Self>) {
+        let module = self.module;
+        // Only the editing workspaces name objects by their assets.
+        if self.module.database().is_none() {
+            return;
+        }
         cx.spawn(async move |this, cx| {
             let loaded = cx
                 .background_executor()
-                .spawn(async move { anno_formats::assets::Assets::load(&install) })
+                .spawn(async move { crate::games::assets(module, &install) })
                 .await;
             this.update(cx, |this, cx| {
                 match loaded {
@@ -632,20 +895,67 @@ impl Editor {
     /// Opens a virtual path in the workspace that edits it, or previews it.
     pub fn open_path(&mut self, path: &str, cx: &mut Context<Self>) {
         let lower = path.to_ascii_lowercase();
-        if lower.ends_with(".a7m") || lower.ends_with(".a7t") {
-            self.open_island(path, cx);
-        } else if lower.contains("/ui/studio/generated/") {
-            self.open_ui_asset(path, cx);
-        } else {
-            self.browser.select_path(path);
-            if let Some(file) = self.browser.selected {
-                self.select_file(file, cx);
+        // The file's kind names its editor; a game without that capability
+        // (2070 has no UI screens) shows the file in the browser.
+        match crate::browser::editor_for(self.module, &lower) {
+            Some(Workspace::Island) => self.open_island(path, cx),
+            Some(Workspace::Map) => self.open_map(path, cx),
+            Some(Workspace::Ui) => self.open_ui_asset(path, cx),
+            // A model has no file kind of its own: its cfg or prp opens in
+            // the Model workspace, as Edit model does.
+            _ if crate::browser::is_model(&lower) && self.supports(Workspace::Model) => {
+                self.open_model(path, cx)
             }
-            self.switch(Workspace::Assets);
+            _ => {
+                self.browser.select_path(path);
+                if let Some(file) = self.browser.selected {
+                    self.select_file(file, cx);
+                }
+                self.switch(Workspace::Assets);
+            }
         }
     }
 
+    pub(crate) fn supports(&self, workspace: Workspace) -> bool {
+        match workspace {
+            // A game with screens and no islands still saves projects.
+            Workspace::Project => !self.module.project_roots().is_empty(),
+            Workspace::Island => self.module.islands().is_some(),
+            Workspace::Map => self.module.islands().and_then(|i| i.maps()).is_some(),
+            Workspace::Ui => self.module.ui().is_some(),
+            // Every game's cfgs edit; a project holds the result.
+            Workspace::Model => !self.module.project_roots().is_empty(),
+            Workspace::Assets => true,
+        }
+    }
+
+    pub(crate) fn require_workspace(&mut self, workspace: Workspace) -> bool {
+        if self.supports(workspace) {
+            return true;
+        }
+        let title = self.module.profile().title;
+        let reason = if self.module.islands().is_none() && self.module.ui().is_none() {
+            format!(
+                "{title} is browse only: the Assets workspace lists, previews and extracts its files"
+            )
+        } else {
+            format!("{title} has no {} workspace", workspace.label())
+        };
+        self.message(reason, false);
+        false
+    }
+
+    fn workspaces(&self) -> Vec<Workspace> {
+        Workspace::ALL
+            .into_iter()
+            .filter(|&w| self.supports(w))
+            .collect()
+    }
+
     pub fn switch(&mut self, workspace: Workspace) {
+        if !self.require_workspace(workspace) {
+            return;
+        }
         self.workspace = workspace;
         self.menu = None;
         if let Some(ui) = &mut self.ui {
@@ -714,9 +1024,25 @@ impl Editor {
         })
     }
 
-    /// The import command's one label, wherever it is offered.
-    pub fn import_label(&self) -> &'static str {
-        crate::game_text::of(self.game).import_label
+    /// The games Import island reads from, the island rules' order.
+    pub fn import_sources(&self) -> Vec<&'static dyn Module> {
+        let from = self
+            .module
+            .islands()
+            .map_or(&[][..], |i| i.rules().import_from);
+        (from.iter())
+            .map(|&g| crate::games::module(g))
+            .filter(|m| m.islands().is_some())
+            .collect()
+    }
+
+    /// Import's label where one button stands for every source: the game
+    /// when there is one, else the picker in the dialog chooses.
+    pub fn import_label(&self) -> String {
+        match self.import_sources()[..] {
+            [only] => format!("Import island from {}…", only.profile().title),
+            _ => "Import island…".to_owned(),
+        }
     }
 
     /// Switches to the workspace holding `pane`, brings it to the front and
@@ -744,9 +1070,14 @@ impl Editor {
     fn undo(&mut self, redo: bool) {
         let done = match self.workspace {
             Workspace::Island => self.island.as_mut().is_some_and(|i| i.undo(redo)),
+            Workspace::Map => self.map.as_mut().is_some_and(|m| m.undo(redo)),
             Workspace::Ui => self.ui.as_mut().is_some_and(|u| u.undo(redo)),
+            Workspace::Model => self.model.as_mut().is_some_and(|m| m.undo(redo)),
             Workspace::Assets | Workspace::Project => false,
         };
+        if done && self.workspace == Workspace::Map {
+            self.check_map();
+        }
         if !done {
             self.message(
                 if redo {
@@ -760,17 +1091,13 @@ impl Editor {
     }
 
     /// Stages the open documents into the mod project and writes its archive.
-    pub(crate) fn save(&mut self) {
+    pub(crate) fn save(&mut self) -> Saved {
         // A half-typed value is applied first: it is what the field shows
         // (round 11 saved while Position X read 07, and Enter then made the
         // file dirty again). One the field refuses waits, as typed.
-        self.ui_find.stop_typing();
-        self.browser.stop_typing();
-        if let Some(ui) = &mut self.ui
-            && let Err(e) = ui.apply_typing()
-        {
-            ui.message = Some((format!("Not saved: {e}"), true));
-            return;
+        if let Err(e) = self.end_typing() {
+            self.message(format!("Not saved: {e}"), true);
+            return Saved::Failed;
         }
         // Staging marks documents clean before disk I/O. A failed project
         // write must still count as unsaved when returning to the picker.
@@ -790,22 +1117,59 @@ impl Editor {
         {
             match island.stage(install, &mut self.project) {
                 Ok(()) => staged += 1,
-                Err(e) => return self.message(format!("Island not saved: {e:#}"), true),
+                Err(e) => {
+                    self.message(format!("Island not saved: {e:#}"), true);
+                    return Saved::Failed;
+                }
             }
         }
+        match self.stage_map() {
+            Ok(true) => staged += 1,
+            Ok(false) => {}
+            Err(e) => {
+                self.message(format!("Map not saved: {e:#}"), true);
+                return Saved::Failed;
+            }
+        }
+        let waiting = matches!(
+            self.map_dialog,
+            Some(crate::map::panels::Dialog::SaveShipped(_))
+        );
+        // A shipped map waits for the dialog's answer; the rest saves now.
+        let map_warning = self
+            .map
+            .as_mut()
+            .and_then(|m| m.message.take())
+            .filter(|m| m.1)
+            .map(|m| m.0);
         // Staging warns about islands the game cannot use yet.
         let warning = self
             .island
             .as_mut()
             .and_then(|i| i.message.take())
             .filter(|(_, error)| *error)
-            .map(|(text, _)| text);
+            .map(|(text, _)| text)
+            .or(map_warning);
+        if let Some(m) = &mut self.model
+            && m.dirty()
+        {
+            match m.stage(&mut self.project) {
+                Ok(()) => staged += 1,
+                Err(e) => {
+                    self.message(format!("Model not saved: {e:#}"), true);
+                    return Saved::Failed;
+                }
+            }
+        }
         if let Some(ui) = &mut self.ui
             && ui.dirty()
         {
             match ui.stage(&mut self.project) {
                 Ok(n) => staged += n,
-                Err(e) => return self.message(format!("UI asset not saved: {e:#}"), true),
+                Err(e) => {
+                    self.message(format!("UI asset not saved: {e:#}"), true);
+                    return Saved::Failed;
+                }
             }
         }
         let written = self.project.write();
@@ -824,40 +1188,119 @@ impl Editor {
                 u.id
             ))
         });
+        // One message for the save. A warning says what the game can't use
+        // yet; the save itself went through, so it isn't shown as an error.
         match written {
-            Ok(_) if let Some(warning) = warning => {
-                self.message(format!("Saved. {warning}"), true)
-            }
-            Ok(path) => self.message(
-                format!(
-                    "Saved {} to {}; {} in the mod. Update game copy (top right) puts it in the game",
+            // Nothing else was edited: the shipped-map question is the news.
+            Ok(_) if waiting && staged == 0 => {}
+            Ok(path) => {
+                let saved = format!(
+                    "Saved {} to {}",
                     crate::project::plural(staged, "document", "documents"),
                     crate::project::short_path(&path),
-                    crate::project::plural(self.project.files.len(), "file", "files"),
-                ),
-                false,
-            ),
-            Err(e) => self.message(format!("Mod not written: {e:#}"), true),
+                );
+                match warning {
+                    Some(warning) => self.message(format!("{saved}. {warning}"), false),
+                    None => self.message(
+                        format!(
+                            "{saved}; {} in the mod. Update game copy (top right) puts it in the game",
+                            crate::project::plural(self.project.file_count(), "file", "files"),
+                        ),
+                        false,
+                    ),
+                }
+            }
+            Err(e) => {
+                self.message(format!("Mod not written: {e:#}"), true);
+                return Saved::Failed;
+            }
+        }
+        if waiting {
+            Saved::Waiting
+        } else {
+            Saved::Written
         }
     }
 
-    pub(crate) fn install_mod(&mut self) {
-        let Some(install) = &self.install else {
-            return self.message("No install is open", true);
-        };
-        let installed = self.project.install(install.dir());
-        self.mount_project();
-        self.refresh_installed();
-        match installed {
-            Ok(path) => self.message(
+    pub(crate) fn install_mod(&mut self, cx: &mut Context<Self>) {
+        self.install_project(
+            |path| {
                 format!(
                     "Installed as {}. The game’s mod loader activates it on the next start",
                     path.display()
-                ),
-                false,
-            ),
-            Err(e) => self.message(format!("Install failed: {e:#}"), true),
+                )
+            },
+            cx,
+        );
+    }
+
+    /// The islands and map layouts that can't leave the editor (level 5)
+    /// and why, as one line: the project's islands as their last save
+    /// found them, and the open island as it stands, since Install copies what was saved but a
+    /// dirty island is about to be. None when nothing blocks.
+    pub(crate) fn broken_islands(&self) -> Option<String> {
+        let open = (self.island.as_ref().zip(self.install.as_deref())).map(|(island, install)| {
+            (island.path.clone(), island.validate(install, &self.project))
+        });
+        let open_path = open.as_ref().map(|(path, _)| path.clone());
+        let stored = (self.project.islands.iter())
+            .filter(|i| open_path.as_ref() != Some(&i.path))
+            .map(|i| (i.path.clone(), i.listing.broken.clone()));
+        let named: Vec<String> = (open.into_iter().chain(stored))
+            .filter(|(_, problems)| !problems.is_empty())
+            .map(|(path, problems)| {
+                format!(
+                    "{}: {}",
+                    crate::project::island_name(&path),
+                    crate::island::said(&problems)
+                )
+            })
+            .chain(self.broken_maps())
+            .collect();
+        (!named.is_empty()).then(|| named.join(". "))
+    }
+
+    /// Writes the project and copies it into the game off the UI thread:
+    /// a first install of an 1800 project copies gigabytes across drives.
+    /// `done` words the message once the copy has landed.
+    pub(crate) fn install_project(
+        &mut self,
+        done: impl FnOnce(&std::path::Path) -> String + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        if self.module.packaging().is_none() {
+            return self.message("This game has no project installer", false);
         }
+        if self.installing {
+            return self.message("Still installing; try again once it is done", false);
+        }
+        if let Some(why) = self.broken_islands() {
+            return self.message(format!("Not installed, fix first: {why}"), true);
+        }
+        let Some(install) = &self.install else {
+            return self.message("No install is open", true);
+        };
+        let job = match self.project.prepare_install(install.dir()) {
+            Ok(job) => job,
+            Err(e) => return self.message(format!("Install failed: {e:#}"), true),
+        };
+        self.installing = true;
+        self.message("Installing into the game…", false);
+        cx.spawn(async move |this, cx| {
+            let installed = cx.background_spawn(async move { job.run() }).await;
+            this.update(cx, |this, cx| {
+                this.installing = false;
+                this.mount_project();
+                this.refresh_installed();
+                match installed {
+                    Ok(path) => this.message(done(&path), false),
+                    Err(e) => this.message(format!("Install failed: {e:#}"), true),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Keys from the window. While a field is being typed into, keys that
@@ -904,8 +1347,21 @@ impl Editor {
                 .as_mut()
                 .map(|e| e as &mut dyn InputBuffer);
         }
+        if self.model_list.filter_edit.is_some() {
+            return (self.model_list.filter_edit.as_mut()).map(|e| e as &mut dyn InputBuffer);
+        }
+        match &mut self.map_dialog {
+            Some(crate::map::panels::Dialog::New(d)) => return Some(&mut d.name),
+            Some(crate::map::panels::Dialog::SaveShipped(d)) => return Some(&mut d.name),
+            Some(crate::map::panels::Dialog::Open(d)) => return Some(&mut d.filter),
+            None => {}
+        }
+        if let Some(p) = &mut self.model_picker {
+            return Some(p.typing());
+        }
         match self.workspace {
             Workspace::Island => self.island.as_mut().and_then(|i| i.typing()),
+            Workspace::Map => self.map.as_mut().and_then(|m| m.typing_buffer()),
             Workspace::Ui => {
                 if self.ui_find.typing().is_some() {
                     return self.ui_find.typing();
@@ -921,6 +1377,7 @@ impl Editor {
                 }
                 self.ui.as_mut().and_then(|u| u.typing())
             }
+            Workspace::Model => self.model.as_mut().and_then(|m| m.typing_buffer()),
             Workspace::Assets => self.browser.typing(),
             Workspace::Project => None,
         }
@@ -956,6 +1413,13 @@ impl Editor {
             cx.notify();
             return;
         }
+        if self.map_dialog.is_some() {
+            return self.map_dialog_key(event, cx);
+        }
+        if self.model_picker.is_some() {
+            self.model_picker_key(event, cx);
+            return;
+        }
         if self.playtest.is_some() {
             if event.keystroke.key == "escape" {
                 self.playtest = None;
@@ -979,6 +1443,25 @@ impl Editor {
                 EditEvent::Ignored => false,
             };
             if used {
+                cx.notify();
+                return;
+            }
+        }
+        if let Some(edit) = &mut self.model_list.filter_edit {
+            use gpui_editor_kit::field::EditEvent;
+            let used = match edit.key_down_in(event, cx) {
+                EditEvent::Commit | EditEvent::Cancel => {
+                    self.model_list.filter_edit = None;
+                    true
+                }
+                EditEvent::Changed => {
+                    self.model_list.filter = edit.text.clone();
+                    true
+                }
+                EditEvent::Ignored => false,
+            };
+            if used {
+                self.notify_pane(Pane::ModelList, cx);
                 cx.notify();
                 return;
             }
@@ -1035,6 +1518,24 @@ impl Editor {
                 }
                 consumed
             }
+            Workspace::Map => self.map_typing_key(event, cx) || self.map_key(event, cx),
+            // The hierarchy first while it has the keys (last clicked, or its
+            // search typed into): its arrows and Home move the selection,
+            // which elsewhere turn and reset the view.
+            // Alt Left goes back a model before the hierarchy takes Left.
+            Workspace::Model if event.keystroke.modifiers.alt && event.keystroke.key == "left" => {
+                self.model_back(cx);
+                true
+            }
+            Workspace::Model => {
+                let searching = (self.model.as_ref())
+                    .and_then(|m| m.typing.as_ref())
+                    .is_some_and(|t| t.field == crate::model::Field::HierarchyFilter);
+                let hierarchy = self.docks[self.dock_index()].focused == Pane::ModelHierarchy;
+                ((hierarchy || searching) && self.model_hierarchy_key(event, cx))
+                    || self.model_typing_key(event, cx)
+                    || self.model_key(event, cx)
+            }
             Workspace::Assets => self.browser_key(event, cx),
             Workspace::Project => false,
         };
@@ -1045,7 +1546,12 @@ impl Editor {
         }
         let mods = event.keystroke.modifiers;
         let ctrl = mods.control || mods.platform;
-        match event.keystroke.key.as_str() {
+        let key = event.keystroke.key.as_str();
+        // Project, island and UI commands, which a game only browsed lacks.
+        let project_key =
+            ctrl && (matches!(key, "s" | "n" | "o") || mods.shift && key == "u") || key == "f5";
+        match key {
+            _ if project_key && !self.require_workspace(Workspace::Project) => {}
             "z" if ctrl => self.undo(mods.shift),
             "y" if ctrl => self.undo(true),
             // On the Island workspace the viewport pill promises Ctrl S
@@ -1058,17 +1564,22 @@ impl Editor {
                 {
                     i.want_in_mod();
                 }
-                self.save()
+                self.save();
             }
             "0" if ctrl => self.switch(Workspace::Project),
             "q" if ctrl => self.leave(Leave::Quit, cx),
             "n" if ctrl => self.open_new_project(cx),
-            "u" if ctrl && event.keystroke.modifiers.shift => self.install_mod(),
+            "u" if ctrl && event.keystroke.modifiers.shift => self.install_mod(cx),
             "f5" => self.open_playtest(),
             "o" if ctrl => self.pick_project_folder(cx),
             "1" if ctrl => self.switch(Workspace::Assets),
             "2" if ctrl => self.switch(Workspace::Island),
-            "3" if ctrl => self.switch(Workspace::Ui),
+            "3" if ctrl => self.switch(Workspace::Map),
+            "4" if ctrl => self.switch(Workspace::Ui),
+            "5" if ctrl => self.switch(Workspace::Model),
+            "p" if ctrl && self.workspace == Workspace::Model => {
+                self.open_model_picker(crate::model::picker::Want::Open, cx)
+            }
             "escape" => self.menu = None,
             _ => return,
         }
@@ -1082,7 +1593,9 @@ impl Editor {
             .island
             .as_mut()
             .and_then(|i| i.message.take())
+            .or_else(|| self.map.as_mut().and_then(|m| m.message.take()))
             .or_else(|| self.ui.as_mut().and_then(|u| u.message.take()))
+            .or_else(|| self.model.as_mut().and_then(|m| m.message.take()))
             .or_else(|| self.browser.message.take());
         if let Some((text, error)) = message {
             self.message(text, error);
@@ -1115,7 +1628,7 @@ impl Editor {
             _ => widgets::menu_popup(match menu {
                 Menu::File => 4.,
                 Menu::Edit => 40.,
-                Menu::Island => 125.,
+                Menu::Island | Menu::Map | Menu::Model => 125.,
                 _ => 80.,
             }),
         }
@@ -1138,6 +1651,16 @@ impl Editor {
                 }
             };
         match menu {
+            // A game only browsed has no project to make, save or install.
+            Menu::File if self.module.islands().is_none() => popup
+                .child(with_cx("Switch game…", |this, cx| {
+                    this.leave(Leave::Game, cx)
+                }))
+                .child(widgets::separator())
+                .child(
+                    menu_item("Quit", "Ctrl Q")
+                        .on_click(cx.listener(|this, _, _, cx| this.leave(Leave::Quit, cx))),
+                ),
             Menu::File => {
                 let current = self.project.folder();
                 let recent: Vec<PathBuf> = crate::project::recent(&self.config)
@@ -1182,17 +1705,29 @@ impl Editor {
                         }))
                     }))
                     .child(widgets::menu_section("Islands"))
-                    .child(item("New island…", "", Self::open_wizard))
-                    .child(with_cx(self.import_label(), Self::open_import))
+                    .child(with_cx("New island…", Self::open_wizard))
+                    // One row per game Import reads from.
+                    .children(self.import_sources().into_iter().map(|from| {
+                        menu_item(format!("Import island from {}…", from.profile().title), "")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.menu = None;
+                                this.open_import_from(from, cx);
+                                cx.notify();
+                            }))
+                    }))
+                    // A game without regions (2070) has nothing to convert
+                    // between.
+                    .when(!self.island_rules().regions.is_empty(), |p| {
+                        p.child(with_cx(
+                            "Convert island to another region…",
+                            Self::open_convert,
+                        ))
+                    })
                     // The project's islands under Islands, in its group: past
                     // a rule of their own they read as a stray block.
                     .children(self.project.islands.iter().take(MENU_ISLANDS).map(|i| {
                         let path = i.path.clone();
-                        let name = path
-                            .rsplit('/')
-                            .next()
-                            .unwrap_or("")
-                            .trim_end_matches(".a7m");
+                        let name = crate::project::island_name(&path);
                         menu_item(format!("Open {name}"), "").on_click(cx.listener(
                             move |this, _, _, cx| {
                                 this.menu = None;
@@ -1201,6 +1736,33 @@ impl Editor {
                             },
                         ))
                     }))
+                    .when(self.supports(Workspace::Model), |p| {
+                        p.child(widgets::menu_section("Models"))
+                            .child(menu_item("Open model…", "Ctrl P").on_click(cx.listener(
+                                |this, _, _, cx| {
+                                    this.menu = None;
+                                    if this.require_workspace(Workspace::Model) {
+                                        this.switch(Workspace::Model);
+                                        this.open_model_picker(
+                                            crate::model::picker::Want::Open,
+                                            cx,
+                                        );
+                                    }
+                                    cx.notify();
+                                },
+                            )))
+                            .children(self.model_recent.iter().take(MENU_ISLANDS).map(|path| {
+                                let path = path.clone();
+                                let name = path.rsplit('/').next().unwrap_or(&path).to_owned();
+                                menu_item(format!("Open {name}"), "").on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        this.menu = None;
+                                        this.open_model(&path, cx);
+                                        cx.notify();
+                                    },
+                                ))
+                            }))
+                    })
                     .child(widgets::menu_section("Save and play"))
                     // One name for Ctrl S on one screen: on a game original
                     // it copies the island into the mod, which the
@@ -1223,18 +1785,20 @@ impl Editor {
                                 this.save();
                                 cx.notify();
                             })),
-                            None => item("Save project", "Ctrl S", Self::save),
+                            None => item("Save project", "Ctrl S", |this| {
+                                this.save();
+                            }),
                         },
                     )
-                    .child(
-                        menu_item(self.install_label(), "Ctrl Shift U").on_click(cx.listener(
-                            |this, _, _, cx| {
+                    .when(self.module.packaging().is_some(), |p| {
+                        p.child(menu_item(self.install_label(), "Ctrl Shift U").on_click(
+                            cx.listener(|this, _, _, cx| {
                                 this.menu = None;
-                                this.install_mod();
+                                this.install_mod(cx);
                                 cx.notify();
-                            },
-                        )),
-                    )
+                            }),
+                        ))
+                    })
                     .child(match self.playtest_blocker() {
                         // The next step on its own line, short enough for
                         // the menu; the full sentence is the status message.
@@ -1242,6 +1806,8 @@ impl Editor {
                             "Test in game…",
                             if why.starts_with("Save") {
                                 "Save the island first"
+                            } else if self.module.packaging().is_none() {
+                                "This game has no project installer"
                             } else {
                                 "Needs a saved island on the test map"
                             },
@@ -1261,6 +1827,27 @@ impl Editor {
                         )
                         .into_any_element(),
                     })
+                    // The test map alone, into the project folder: the step
+                    // a game without packaging (2070) has.
+                    .when(
+                        self.module.islands().and_then(|i| i.maps()).is_some(),
+                        |p| {
+                            p.child(match self.test_map_blocker() {
+                                Some(why) => widgets::menu_item_off_why(
+                                    "Make test map",
+                                    if why.starts_with("Save") {
+                                        "Save the island first"
+                                    } else {
+                                        "Needs a saved island on the test map"
+                                    },
+                                    "",
+                                )
+                                .into_any_element(),
+                                None => item("Make test map", "", Self::make_test_map)
+                                    .into_any_element(),
+                            })
+                        },
+                    )
                     .child(widgets::separator())
                     .child(
                         menu_item("Quit", "Ctrl Q")
@@ -1343,12 +1930,218 @@ impl Editor {
                     "Replaces painted tint",
                     Self::bake_tint,
                 )),
+            Menu::Map => {
+                let variants = self.map.as_ref().map_or(0, |m| m.map.variants.len());
+                popup
+                    .child(widgets::menu_header("Layouts"))
+                    .child(with_cx("New map layout…", Self::open_new_map))
+                    .child(with_cx("Open map…", Self::open_map_dialog))
+                    .when(self.map.is_some(), |p| {
+                        p.child(with_cx("Close map", |this, cx| {
+                            this.leave(Leave::CloseMap, cx)
+                        }))
+                    })
+                    .children(self.project.layouts.iter().take(MENU_ISLANDS).map(|l| {
+                        let path = l.path.clone();
+                        menu_item(format!("Open {}", l.name), "").on_click(cx.listener(
+                            move |this, _, _, cx| {
+                                this.menu = None;
+                                this.open_map(&path, cx);
+                                cx.notify();
+                            },
+                        ))
+                    }))
+                    .when(variants > 1, |p| {
+                        p.child(widgets::menu_section("Variants")).child(
+                            menu_item(crate::map::view::copy_label(variants), "").on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    this.menu = None;
+                                    this.copy_variant(cx);
+                                    cx.notify();
+                                }),
+                            ),
+                        )
+                    })
+            }
+            Menu::Model => {
+                use crate::model::picker::{Kind, Want};
+                use gpui_editor_kit::gizmo::Mode;
+                // How a row shows its state: an action, an option, or one of
+                // a set (the gizmo's modes).
+                enum Mark {
+                    Plain,
+                    Check(bool),
+                    Radio(bool),
+                }
+                // One row that runs `f` on the open model and closes the menu.
+                let on_model =
+                    |label: String,
+                     shortcut: &'static str,
+                     mark: Mark,
+                     f: fn(&mut crate::model::ModelEditor)| {
+                        let row = match mark {
+                            Mark::Plain => menu_item(label.clone(), shortcut),
+                            Mark::Check(on) => {
+                                widgets::menu_item_checked(label.clone(), on, shortcut)
+                            }
+                            Mark::Radio(on) => {
+                                widgets::menu_item_radio(label.clone(), on, shortcut)
+                            }
+                        };
+                        match self.model.is_some() {
+                            true => row
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.menu = None;
+                                    if let Some(m) = &mut this.model {
+                                        f(m);
+                                    }
+                                    this.model_edited(cx);
+                                }))
+                                .into_any_element(),
+                            false => widgets::menu_item_off(label, "Open a model first")
+                                .into_any_element(),
+                        }
+                    };
+                let m = self.model.as_ref();
+                let selected = m.and_then(|m| m.selected).is_some();
+                let gizmo = m.map(|m| m.gizmo);
+                let shown = m.map(|m| m.view.shown);
+                let back = self
+                    .previous_model()
+                    .map(|p| p.rsplit('/').next().unwrap_or(p).to_owned());
+                let picker = |label: &'static str, shortcut: &'static str, want: Want| {
+                    menu_item(label, shortcut).on_click(cx.listener(move |this, _, _, cx| {
+                        this.menu = None;
+                        this.open_model_picker(want, cx);
+                        cx.notify();
+                    }))
+                };
+                let mut popup = popup
+                    .child(widgets::menu_header("Models"))
+                    .child(picker("Open model…", "Ctrl P", Want::Open))
+                    .child(match back {
+                        Some(name) => menu_item(format!("Back to {name}"), "Alt ←")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.menu = None;
+                                this.model_back(cx);
+                                cx.notify();
+                            }))
+                            .into_any_element(),
+                        None => widgets::menu_item_off("Back", "No model was open before this one")
+                            .into_any_element(),
+                    })
+                    .child(with_cx(
+                        "Browse game models in Assets",
+                        Self::browse_game_models,
+                    ));
+                if self.model.is_some() {
+                    // Meshes and decals add to 117's and 1800's cfgs, not to a
+                    // prp (one mesh) or a 2070 cfg, as the inspector offers.
+                    let baked = m.is_some_and(|m| {
+                        m.doc.prefix().is_empty()
+                            && m.doc.child(anno_formats::xml::Id::ROOT, "Prop").is_none()
+                    });
+                    popup = popup
+                        .child(widgets::menu_section("Add"))
+                        .child(picker("Add prop…", "", Want::Add(Kind::Prop)))
+                        .child(picker("Add particle effect…", "", Want::Add(Kind::Effect)))
+                        .when(baked, |p| {
+                            p.child(picker("Add mesh…", "", Want::Add(Kind::Mesh)))
+                                .child(picker("Add decal…", "", Want::Add(Kind::Texture)))
+                        })
+                        .child(widgets::menu_section("Selection"))
+                        .child(match selected {
+                            true => on_model("Duplicate".into(), "Ctrl D", Mark::Plain, |m| {
+                                if let Some(s) = m.selected {
+                                    m.duplicate(s);
+                                }
+                            }),
+                            false => widgets::menu_item_off("Duplicate", "Select an entry first")
+                                .into_any_element(),
+                        })
+                        .child(match selected {
+                            true => on_model("Delete".into(), "Del", Mark::Plain, |m| {
+                                if let Some(s) = m.selected {
+                                    m.remove(s);
+                                }
+                            }),
+                            false => widgets::menu_item_off("Delete", "Select an entry first")
+                                .into_any_element(),
+                        })
+                        .child(on_model("Frame selection".into(), "F", Mark::Plain, |m| {
+                            m.frame_selection()
+                        }))
+                        .child(on_model(
+                            "Reset view".into(),
+                            "Ctrl Home",
+                            Mark::Plain,
+                            |m| m.view.reset(),
+                        ))
+                        .child(widgets::menu_section("Gizmo"))
+                        .child(on_model(
+                            "Move".into(),
+                            "W",
+                            Mark::Radio(gizmo == Some(Mode::Move)),
+                            |m| m.gizmo = Mode::Move,
+                        ))
+                        .child(on_model(
+                            "Rotate".into(),
+                            "E",
+                            Mark::Radio(gizmo == Some(Mode::Rotate)),
+                            |m| m.gizmo = Mode::Rotate,
+                        ))
+                        .child(on_model(
+                            "Scale".into(),
+                            "R",
+                            Mark::Radio(gizmo == Some(Mode::Scale)),
+                            |m| m.gizmo = Mode::Scale,
+                        ))
+                        .child(on_model(
+                            "Local axes".into(),
+                            "",
+                            Mark::Check(m.is_some_and(|m| m.view.local)),
+                            |m| m.view.local = !m.view.local,
+                        ))
+                        .child(widgets::menu_section("Playback"))
+                        .child(on_model(
+                            "Play".into(),
+                            "Space",
+                            Mark::Check(m.is_some_and(|m| m.playback.playing)),
+                            |m| m.playback.playing = !m.playback.playing,
+                        ))
+                        .child(on_model("Rewind".into(), "", Mark::Plain, |m| {
+                            m.playback.time = 0.;
+                            m.pose();
+                        }))
+                        .child(widgets::menu_section("Light"))
+                        .child(on_model(
+                            "Night".into(),
+                            "N",
+                            Mark::Check(m.is_some_and(|m| m.view.night)),
+                            |m| m.set_night(!m.view.night),
+                        ))
+                        .child(widgets::menu_section("Show"));
+                    for (overlay, label, key) in crate::model::view::OVERLAYS {
+                        let on = shown.is_some_and(|s| s.has(overlay));
+                        popup = popup.child(widgets::menu_item_checked(label, on, key).on_click(
+                            cx.listener(move |this, _, _, cx| {
+                                this.menu = None;
+                                if let Some(m) = &mut this.model {
+                                    m.toggle_overlay(overlay);
+                                }
+                                this.model_edited(cx);
+                            }),
+                        ));
+                    }
+                }
+                popup
+            }
             Menu::Project => {
                 let current = self.project.folder();
                 popup
                     .child(widgets::menu_header("Projects"))
                     .children(
-                        crate::project::known(&self.config, self.game)
+                        crate::project::known(&self.config, self.module)
                             .into_iter()
                             .take(MENU_RECENT * 2)
                             .map(|p| {
@@ -1401,24 +2194,35 @@ impl Editor {
             Menu::Edit => popup
                 .child(item("Undo", "Ctrl Z", |this| this.undo(false)))
                 .child(item("Redo", "Ctrl Y", |this| this.undo(true))),
-            // Workspaces switch in the bar (Ctrl 0-3); the menu holds what
+            // Workspaces switch in the bar (Ctrl 0-4); the menu holds what
             // the bar does not.
             Menu::View => {
-                let stats = self.stats;
+                let (stats, passes) = (self.stats, self.stats && self.pass_times);
                 let perf = |cx: &mut Context<Self>| {
-                    widgets::menu_item_checked("Performance overlay", stats, "").on_click(
-                        cx.listener(|this, _, _, cx| {
-                            this.menu = None;
-                            this.stats = !this.stats;
-                            cx.notify();
-                        }),
-                    )
+                    [
+                        widgets::menu_item_checked("Performance overlay", stats, "")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.menu = None;
+                                this.stats = !this.stats;
+                                cx.notify();
+                            }))
+                            .into_any_element(),
+                        widgets::menu_item_checked("GPU pass times", passes, "")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.menu = None;
+                                this.pass_times = !passes;
+                                this.stats |= this.pass_times;
+                                cx.notify();
+                            }))
+                            .into_any_element(),
+                    ]
                 };
                 let mut perf_in_viewport = false;
                 popup
                     // Workspaces first, with the shortcuts the switcher has.
                     .child(widgets::menu_header("Workspace"))
-                    .children(Workspace::ALL.into_iter().enumerate().map(|(n, w)| {
+                    .children(self.workspaces().into_iter().map(|w| {
+                        let n = Workspace::ALL.iter().position(|a| *a == w).unwrap_or(0);
                         widgets::menu_item_radio(
                             w.label(),
                             self.workspace == w,
@@ -1493,7 +2297,7 @@ impl Editor {
                             // them, not under a heading of its own.
                             if views {
                                 perf_in_viewport = true;
-                                items.push(perf(cx).into_any_element());
+                                items.extend(perf(cx));
                             }
                         }
                         // Reset after the panes it resets, past a rule: a
@@ -1517,7 +2321,7 @@ impl Editor {
                     })
                     // On Project, with no panels to reset, the overlay alone.
                     .when(!perf_in_viewport, |p| {
-                        p.child(widgets::menu_section("Window")).child(perf(cx))
+                        p.child(widgets::menu_section("Window")).children(perf(cx))
                     })
                     // Last: set once, then rarely touched.
                     .child(widgets::menu_section("Theme"))
@@ -1554,6 +2358,8 @@ impl DockHost for Editor {
     fn pane_idle(&self, pane: Pane) -> bool {
         match pane {
             Pane::IslandLibrary | Pane::IslandMaterials => self.island.is_none(),
+            Pane::MapIslands => self.map.is_none(),
+            Pane::ModelTimeline => self.model.is_none(),
             Pane::UiTimeline | Pane::UiBindings => self.ui.is_none(),
             _ => false,
         }
@@ -1569,7 +2375,9 @@ impl DockHost for Editor {
                 | Pane::ProjectMods
                 | Pane::IslandView
                 | Pane::IslandTop
+                | Pane::MapView
                 | Pane::UiCanvas
+                | Pane::ModelView
         )
     }
 
@@ -1587,9 +2395,14 @@ impl DockHost for Editor {
             Pane::IslandTop => "Top",
             Pane::IslandHierarchy => "Hierarchy",
             Pane::IslandLayers => "Layers",
+            Pane::IslandGraphics => "Graphics",
             Pane::IslandInspector => "Inspector",
             Pane::IslandMaterials => "Ground material",
             Pane::IslandLibrary => "Library",
+            Pane::MapView => "Map",
+            Pane::MapSlots => "Slots",
+            Pane::MapInspector => "Inspector",
+            Pane::MapIslands => "Islands",
             Pane::UiTree => "Widget tree",
             Pane::UiCanvas => "Canvas",
             Pane::UiInspector => "Inspector",
@@ -1597,6 +2410,11 @@ impl DockHost for Editor {
             Pane::UiTimeline => "Timeline",
             Pane::UiBindings => "Bindings",
             Pane::UiLibrary => "Widgets",
+            Pane::ModelView => "Model",
+            Pane::ModelList => "Models",
+            Pane::ModelHierarchy => "Hierarchy",
+            Pane::ModelInspector => "Inspector",
+            Pane::ModelTimeline => "Timeline",
         }
         .into()
     }
@@ -1678,6 +2496,8 @@ pub struct FrameTick;
 pub struct Bench {
     seconds: f32,
     running: bool,
+    /// Pans the UI canvas instead of orbiting an island (`ui_bench_frame`).
+    ui: bool,
     /// When loading ended (the orbit waits a further two seconds), when the
     /// orbit started, and the current second's start and frames.
     loaded: Option<std::time::Instant>,
@@ -1686,6 +2506,107 @@ pub struct Bench {
     frames: u32,
     /// Frames per second of each whole second.
     rates: Vec<u32>,
+    /// The last frame's start, and the UI thread's frame intervals and its
+    /// time on the 3D view while the island opens and while it orbits.
+    last: Option<std::time::Instant>,
+    /// Frame callbacks' ends, from a task each frame spawns at its start:
+    /// the foreground runs it once the frame's callback returns.
+    ends: std::rc::Rc<std::cell::RefCell<Vec<f32>>>,
+    opening: Samples,
+    orbit: Samples,
+}
+
+/// One bench phase's frames (`Bench`).
+#[derive(Default)]
+struct Samples {
+    interval_ms: Vec<f32>,
+    /// Per frame: the UI thread from the frame's start to the end of its
+    /// frame callback, less the swapchain's wait.
+    busy_ms: Vec<f32>,
+    /// Per frame: the UI thread blocked on the renderer's lock while a
+    /// view's thread recorded.
+    blocked_ms: Vec<f32>,
+    timing: gpui_editor_kit::gpu::PaneTiming,
+}
+
+impl Samples {
+    fn add(
+        &mut self,
+        interval: Option<f32>,
+        busy: Vec<f32>,
+        blocked: std::time::Duration,
+        t: gpui_editor_kit::gpu::PaneTiming,
+    ) {
+        self.interval_ms.extend(interval);
+        self.blocked_ms.push(blocked.as_secs_f32() * 1000.);
+        // A frame's end lands with the next frame's samples, its swapchain
+        // wait with its own: pair them from the end.
+        let waits = (t.surface_ms.iter().rev().copied()).chain(std::iter::repeat(0.));
+        let mut busy: Vec<f32> = (busy.iter().rev().zip(waits))
+            .map(|(b, w)| (b - w).max(0.))
+            .collect();
+        busy.reverse();
+        self.busy_ms.extend(busy);
+        let s = &mut self.timing;
+        s.ui_ms.extend(t.ui_ms);
+        s.surface_ms.extend(t.surface_ms);
+        s.move_ms.extend(t.move_ms);
+        s.overtaken += t.overtaken;
+        s.late += t.late;
+        for (a, b) in s.moves.iter_mut().zip(t.moves) {
+            *a += b;
+        }
+    }
+
+    fn report(&self, phase: &str) {
+        let t = &self.timing;
+        eprintln!(
+            "bench: {phase}: {} frames · interval {} · UI thread busy {} · of it waiting on 3D {} · blocked on the renderer {} · swapchain wait {}",
+            self.interval_ms.len(),
+            spread(&self.interval_ms),
+            spread(&self.busy_ms),
+            spread(&t.ui_ms),
+            spread(&self.blocked_ms),
+            spread(&t.surface_ms)
+        );
+        eprintln!(
+            "bench: {phase}: camera moves shown in the next frame {}, one later {}, two later {}, more {}, overtaken {} · move to frame {} · frames that drew an older 3D frame than asked {}",
+            t.moves[0],
+            t.moves[1],
+            t.moves[2],
+            t.moves[3],
+            t.overtaken,
+            spread(&t.move_ms),
+            t.late
+        );
+        // Every frame, in order, as a spread hides which frames stalled.
+        let list = |v: &[f32]| -> String {
+            let v: Vec<String> = v.iter().map(|ms| format!("{ms:.1}")).collect();
+            v.join(" ")
+        };
+        eprintln!(
+            "bench: {phase}: per frame, ms: blocked on the renderer [{}] · UI thread busy [{}]",
+            list(&self.blocked_ms),
+            list(&self.busy_ms)
+        );
+    }
+}
+
+/// Median, 95th percentile and worst of `v`, in milliseconds.
+fn spread(v: &[f32]) -> String {
+    let mut v = v.to_vec();
+    v.sort_by(f32::total_cmp);
+    let at = |q: f32| {
+        v.get(((v.len() as f32 - 1.) * q) as usize)
+            .copied()
+            .unwrap_or(0.)
+    };
+    format!(
+        "p50 {:.2}, p95 {:.2}, max {:.2} ms",
+        at(0.5),
+        at(0.95),
+        at(1.)
+    )
 }
 
 impl Bench {
@@ -1693,11 +2614,16 @@ impl Bench {
         Self {
             seconds,
             running: false,
+            ui: false,
             loaded: None,
             started: None,
             second: std::time::Instant::now(),
             frames: 0,
             rates: Vec::new(),
+            last: None,
+            ends: Default::default(),
+            opening: Samples::default(),
+            orbit: Samples::default(),
         }
     }
 }
@@ -1706,6 +2632,9 @@ impl Editor {
     /// One benchmark frame: turn the first view a little, present, and
     /// report each second.
     fn bench_frame(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.bench.as_ref().is_some_and(|b| b.ui) {
+            return self.ui_bench_frame(window, cx);
+        }
         let editor = cx.entity();
         let Some(island) = &mut self.island else {
             window.on_next_frame(move |w, cx| editor.update(cx, |e, cx| e.bench_frame(w, cx)));
@@ -1713,15 +2642,41 @@ impl Editor {
         };
         let bench = self.bench.as_mut().expect("benchmarking");
         let now = std::time::Instant::now();
-        if island.loading() {
+        // Frame to frame on the UI thread: every bench frame presents, so
+        // frames follow each other as fast as the window takes them.
+        let interval = (bench.last.replace(now)).map(|at| (now - at).as_secs_f32() * 1000.);
+        let timing = island.take_timing(0);
+        let blocked = island.take_blocked();
+        let busy = std::mem::take(&mut *bench.ends.borrow_mut());
+        let ends = bench.ends.clone();
+        cx.spawn(async move |_, _| {
+            ends.borrow_mut().push(now.elapsed().as_secs_f32() * 1000.);
+        })
+        .detach();
+        // The opening runs from the view's first frame to the first time
+        // loading ends; the orbit can stream more in later.
+        let drawn = !timing.ui_ms.is_empty() || !bench.opening.timing.ui_ms.is_empty();
+        let opened = bench.loaded.is_some() || bench.started.is_some();
+        if bench.started.is_some() {
+            bench.orbit.add(interval, busy, blocked, timing);
+        } else if !opened {
+            bench.opening.add(interval, busy, blocked, timing);
+            window.request_present();
+        }
+        if island.loading() || !drawn {
             bench.loaded = None;
         } else if bench.loaded.is_none() {
             bench.loaded = Some(now);
             eprintln!("bench: loaded");
+            if !opened {
+                bench.opening.report("opening");
+            }
         }
-        let ready = bench
-            .loaded
-            .is_some_and(|at| at.elapsed().as_secs_f32() >= 2.);
+        // Once orbiting, streaming the new view in does not pause it.
+        let ready = bench.started.is_some()
+            || bench
+                .loaded
+                .is_some_and(|at| at.elapsed().as_secs_f32() >= 2.);
         if ready {
             let started = *bench.started.get_or_insert_with(|| {
                 bench.second = now;
@@ -1758,12 +2713,58 @@ impl Editor {
                     rates.get(rates.len() / 2).copied().unwrap_or(0),
                     rates.len()
                 );
+                bench.orbit.report("orbit");
                 cx.quit();
                 return;
             }
             self.camera_moved(0, window, cx);
         }
         window.on_next_frame(move |w, cx| editor.update(cx, |e, cx| e.bench_frame(w, cx)));
+    }
+
+    /// One UI benchmark frame: the canvas pans a pixel and back on
+    /// alternate frames, so it draws whole every frame while the other
+    /// panes stay cached. Starts three seconds after a UI file is open.
+    fn ui_bench_frame(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let editor = cx.entity();
+        window.on_next_frame(move |w, cx| editor.update(cx, |e, cx| e.bench_frame(w, cx)));
+        let bench = self.bench.as_mut().expect("benchmarking");
+        let Some(ui) = &mut self.ui else {
+            window.request_present();
+            return;
+        };
+        let now = std::time::Instant::now();
+        let interval = (bench.last.replace(now)).map(|at| (now - at).as_secs_f32() * 1000.);
+        let busy = std::mem::take(&mut *bench.ends.borrow_mut());
+        let ends = bench.ends.clone();
+        cx.spawn(async move |_, _| {
+            ends.borrow_mut().push(now.elapsed().as_secs_f32() * 1000.);
+        })
+        .detach();
+        if bench.started.is_some() {
+            bench.orbit.interval_ms.extend(interval);
+            bench.orbit.busy_ms.extend(busy);
+        }
+        let loaded = *bench.loaded.get_or_insert(now);
+        if loaded.elapsed().as_secs_f32() < 3. {
+            window.request_present();
+            return;
+        }
+        let started = *bench.started.get_or_insert(now);
+        if started.elapsed().as_secs_f32() >= bench.seconds {
+            let o = &bench.orbit;
+            eprintln!(
+                "bench: ui canvas: {} frames · interval {} · UI thread busy {}",
+                o.interval_ms.len(),
+                spread(&o.interval_ms),
+                spread(&o.busy_ms)
+            );
+            cx.quit();
+            return;
+        }
+        ui.pan_by(if bench.frames % 2 == 0 { 1. } else { -1. });
+        bench.frames += 1;
+        self.notify_pane(Pane::UiCanvas, cx);
     }
 }
 
@@ -1781,6 +2782,34 @@ impl Editor {
         } else {
             self.notify_viewports(cx);
         }
+    }
+
+    /// One readout redraw later, and another after that while the viewport
+    /// is still presenting on its own. Notifies the ticker, which this root
+    /// reads, so the cached shell is not rebuilt.
+    ///
+    /// Every redraw is a frame of its own, presented whatever the
+    /// viewport's idle cap: at 10 a second they took a capped resting view
+    /// from 15 frames a second to 20. Under a cap they follow once a second.
+    fn arm_readout(&mut self, cx: &mut Context<Self>) {
+        if std::mem::replace(&mut self.readouts_due, true) {
+            return;
+        }
+        let every = match crate::graphics::current().idle_fps {
+            crate::graphics::IdleFps::Off => std::time::Duration::from_millis(100),
+            _ => std::time::Duration::from_secs(1),
+        };
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(every).await;
+            let _ = this.update(cx, |this, cx| {
+                this.readouts_due = false;
+                this.readouts_at = Some(std::time::Instant::now());
+                if this.island.as_ref().is_some_and(|i| i.wants_frames()) {
+                    App::notify(cx, this.ticker.entity_id());
+                }
+            });
+        })
+        .detach();
     }
 
     /// Redraws the viewport readouts (cursor, frame times) at most every
@@ -1843,6 +2872,7 @@ impl Editor {
             Pane::IslandInspector => "pane inspector",
             Pane::IslandLibrary => "pane library",
             Pane::IslandList => "pane island list",
+            Pane::MapView => "pane map view",
             Pane::UiCanvas => "pane ui canvas",
             Pane::UiInspector => "pane ui inspector",
             Pane::UiTimeline => "pane ui timeline",
@@ -1879,9 +2909,39 @@ impl Editor {
             Pane::IslandTop => self.render_island_view(1, window, cx),
             Pane::IslandHierarchy => self.render_island_hierarchy(window, cx),
             Pane::IslandLayers => self.render_island_layers(window, cx),
+            Pane::IslandGraphics => self.render_graphics(window, cx),
             Pane::IslandInspector => self.render_island_inspector(window, cx),
             Pane::IslandMaterials => self.render_island_materials(cx),
             Pane::IslandLibrary => self.render_island_library(window, cx),
+            Pane::MapView => self.render_map_view(window, cx),
+            Pane::MapSlots => self.render_map_slots(window, cx),
+            Pane::MapInspector => self.render_map_inspector(window, cx),
+            Pane::MapIslands => self.render_map_islands(window, cx),
+            // Files dragged from the Asset browser onto the model: props
+            // and particle effects place at its origin, animations go to
+            // the selected part.
+            Pane::ModelView => div()
+                .size_full()
+                .on_drop(
+                    cx.listener(|this, drag: &crate::browser::AssetDrag, _, cx| {
+                        this.model_drop(&drag.0, cx)
+                    }),
+                )
+                .child(self.render_model_view(window, cx))
+                .into_any_element(),
+            Pane::ModelList => self.render_model_list(window, cx),
+            Pane::ModelHierarchy => self.render_model_hierarchy(window, cx),
+            // A file dropped on the inspector adds as one dropped on the model.
+            Pane::ModelInspector => div()
+                .size_full()
+                .on_drop(
+                    cx.listener(|this, drag: &crate::browser::AssetDrag, _, cx| {
+                        this.model_drop(&drag.0, cx)
+                    }),
+                )
+                .child(self.render_model_inspector(window, cx))
+                .into_any_element(),
+            Pane::ModelTimeline => self.render_model_timeline(window, cx),
             Pane::UiTree => div()
                 .size_full()
                 .capture_any_mouse_down(cx.listener(|this, e: &MouseDownEvent, _, _| {
@@ -1961,9 +3021,7 @@ impl Render for Editor {
             island.mark_frame();
         }
         self.drain_messages();
-        let dirty = self.pending_save
-            || self.island.as_ref().is_some_and(|i| i.dirty())
-            || self.ui.as_ref().is_some_and(|u| u.dirty());
+        let dirty = self.unsaved();
         let title = format!(
             "{}{} — {} — {} Editor",
             self.project.info.name,
@@ -2006,8 +3064,14 @@ impl Render for Editor {
             root = root.children(self.island_status(cx));
         }
         // GPUI lays out and paints after this returns.
-        if let Some(island) = &self.island {
+        let follow = self.island.as_ref().is_some_and(|island| {
             island.mark_built();
+            // Waves present without notifying this view. Tick the readout
+            // anyway, so its frame times keep moving. The shell stays cached.
+            island.wants_frames()
+        });
+        if follow {
+            self.arm_readout(cx);
         }
         root
     }
@@ -2097,9 +3161,15 @@ impl Editor {
             ("Edit", Menu::Edit),
             ("View", Menu::View),
             ("Terrain", Menu::Island),
+            ("Map", Menu::Map),
+            ("Model", Menu::Model),
         ] {
-            // Terrain tools belong to the Island workspace.
-            if menu == Menu::Island && self.workspace != Workspace::Island {
+            // Terrain tools belong to the Island workspace, map layouts to
+            // the Map one, model commands to the Model one.
+            if (menu == Menu::Island && self.workspace != Workspace::Island)
+                || (menu == Menu::Map && self.workspace != Workspace::Map)
+                || (menu == Menu::Model && self.workspace != Workspace::Model)
+            {
                 continue;
             }
             menus = menus.child(
@@ -2119,7 +3189,7 @@ impl Editor {
         // menus.
         let mut bar = widgets::menu_bar().child(menus).child(widgets::segmented(
             "workspaces",
-            Workspace::ALL.map(|w| (w, w.label().into())),
+            (self.workspaces().into_iter()).map(|w| (w, w.label().into())),
             &self.workspace,
             cx,
             |this, w, _, _| this.switch(w),
@@ -2133,7 +3203,16 @@ impl Editor {
         let game = game.split(':').next().unwrap_or(game);
         // Open, the hover fill as the menu titles take, not the selected
         // blue beside the active workspace.
-        let chip = button(format!("{game}  ›  {}  ▾", self.project.info.name), false)
+        let chip = if self.module.islands().is_some() {
+            format!("{game}  ›  {}  ▾", self.project.info.name)
+        } else {
+            if self.module.ui().is_some() {
+                game.to_owned()
+            } else {
+                format!("{game}  ›  browse only")
+            }
+        };
+        let chip = button(chip, false)
             .when(self.menu == Some(Menu::Project), |d| {
                 d.bg(theme::get().hover)
             })
@@ -2145,6 +3224,9 @@ impl Editor {
             .border_1()
             .border_color(theme::get().border)
             .on_click(cx.listener(|this, _, _, cx| {
+                if !this.require_workspace(Workspace::Project) {
+                    return;
+                }
                 this.menu = (this.menu != Some(Menu::Project)).then_some(Menu::Project);
                 cx.notify();
             }));
@@ -2186,7 +3268,9 @@ impl Editor {
             .child({
                 use crate::project::Installed;
                 let installed = self.project_ui.installed;
-                let (dot, text, action) = if unsaved {
+                let (dot, text, action) = if self.module.islands().is_none() {
+                    (theme::get().muted, "Files only", None)
+                } else if unsaved {
                     (
                         theme::get().highlight,
                         "Unsaved changes",
@@ -2203,6 +3287,8 @@ impl Editor {
                                 })),
                         ),
                     )
+                } else if self.module.packaging().is_none() {
+                    (theme::get().muted, "Saved", None)
                 } else {
                     // The same control in every workspace, so it is where
                     // the eye left it.
@@ -2234,7 +3320,7 @@ impl Editor {
                                     detail,
                                 ))
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    this.install_mod();
+                                    this.install_mod(cx);
                                     cx.notify();
                                 }))
                         })
@@ -2279,11 +3365,11 @@ impl Editor {
                     0 => String::new(),
                     n => format!("loading {n} models · "),
                 },
-                crate::project::count(island.doc.objects.len()),
-                crate::project::count(island.doc.props.len()),
+                crate::project::count(island.island.doc.objects.len()),
+                crate::project::count(island.island.doc.props.len()),
             ),
             // Nothing open: what the list on the left offers.
-            (Some(_), None, Workspace::Island) if self.project.files.is_empty() => {
+            (Some(_), None, Workspace::Island) if (self.project.file_count() == 0) => {
                 // Per region, as the list groups them: one total for every
                 // region read as contradicting the open group's count.
                 match &self.island_list {
@@ -2296,7 +3382,7 @@ impl Editor {
                         for s in all.iter() {
                             let e = regions.entry(&s.region).or_default();
                             e.1 += 1;
-                            e.0 += usize::from(kind.admits(&s.path));
+                            e.0 += usize::from(kind.admits(s.kind));
                         }
                         // No "0 in this mod": the list's This mod row says it,
                         // and the filter should lead.
@@ -2305,7 +3391,7 @@ impl Editor {
                         regions.sort_by_key(|(_, (shown, _))| std::cmp::Reverse(*shown));
                         let mut parts: Vec<String> = Vec::new();
                         parts.extend(regions.into_iter().map(|(region, (shown, total))| {
-                            let name = crate::island::province(region);
+                            let name = self.island_rules().province(region);
                             let short = name.split(" (").next().unwrap_or(&name).to_owned();
                             if kind == crate::island::IslandKind::All {
                                 format!("{} {short}", crate::project::count(total))
@@ -2329,8 +3415,29 @@ impl Editor {
                     None => String::new(),
                 }
             }
+            // What the open model holds, as Island counts its objects.
+            (Some(_), _, Workspace::Model) if self.model.is_some() => {
+                let m = &self.model.as_ref().expect("guarded").model;
+                let mut parts = vec![crate::project::plural(m.parts.len(), "mesh", "meshes")];
+                for (n, one, many) in [
+                    (m.props.len(), "prop", "props"),
+                    (m.particles.len(), "particle effect", "particle effects"),
+                    (m.lights.len(), "light", "lights"),
+                    (m.sequences.len(), "sequence", "sequences"),
+                ] {
+                    if n > 0 {
+                        parts.push(crate::project::plural(n, one, many));
+                    }
+                }
+                parts.join(" · ")
+            }
+            // Nothing open: what the Models list on the left offers.
+            (Some(_), _, Workspace::Model) => match &self.model_list.game {
+                Some(all) => format!("{} game models", crate::project::count(all.len())),
+                None => String::new(),
+            },
             // Shown of total, where Assets and Island put their counts.
-            (Some(_), _, Workspace::Ui) if self.project.files.is_empty() => {
+            (Some(_), _, Workspace::Ui) if (self.project.file_count() == 0) => {
                 self.ui_find.shown().unwrap_or_default()
             }
             // The list's count leads the archive totals: in a footer of its
@@ -2354,7 +3461,7 @@ impl Editor {
             // Elsewhere "0 edited game files" read as a lost mod beside the
             // island list, so a mod with nothing counts says nothing there.
             (Some(_), _, ws)
-                if self.project.files.is_empty()
+                if (self.project.file_count() == 0)
                     // Not on Project: its Islands card already counts them.
                     && ws != Workspace::Project
                     && !self.project.islands.is_empty() =>
@@ -2394,7 +3501,7 @@ impl Editor {
             // Not the folder: the Overview's subtitle says it, with Show in
             // file manager beside it. The Overview's own terms elsewhere too.
             (Some(_), _, Workspace::Project) => self.mod_contents(),
-            (Some(_), ..) if self.project.files.is_empty() => String::new(),
+            (Some(_), ..) if (self.project.file_count() == 0) => String::new(),
             (Some(_), ..) => self.mod_contents(),
             (None, ..) => "no install".into(),
         };
@@ -2453,57 +3560,38 @@ impl Editor {
         if let Some(dialog) = self.render_wm_dialog(cx) {
             root = root.child(dialog);
         }
+        if let Some(dialog) = self.render_map_dialog(window, cx) {
+            root = root.child(dialog);
+        }
+        if let Some(picker) = self.render_model_picker(window, cx) {
+            root = root.child(picker);
+        }
         if let Some(leave) = self.leaving.clone() {
-            let (title, what) = match &leave {
-                Leave::Game => ("Switch game?", "switching game"),
-                Leave::Project(_) => ("Switch project?", "switching project"),
-                Leave::NewIsland => ("Start a new island?", "starting a new island"),
-                Leave::Island(_) => ("Open another island?", "opening another island"),
-                Leave::Quit => ("Quit?", "quitting"),
+            let (title, what, save) = leave.words();
+            let names = self.unsaved_names(leave.replaces());
+            let said = match names.as_slice() {
+                [] => "The last save didn't reach the mod folder.".to_owned(),
+                [one] => format!("{one} has unsaved edits."),
+                [rest @ .., last] => format!("{} and {last} have unsaved edits.", rest.join(", ")),
             };
-            let save = if leave == Leave::Quit {
-                "Save and quit"
-            } else {
-                "Save and switch"
+            let answer = |a: Answer| {
+                cx.listener(move |this: &mut Self, _: &ClickEvent, _: &mut Window, cx| {
+                    this.answer_leave(a, cx);
+                    cx.notify();
+                })
             };
-            let go = leave.clone();
             root = root.child(widgets::modal(
                 "leave",
                 widgets::dialog(title)
-                    .child(format!(
-                        "The open document has unsaved edits. Save them before {what}, or discard them."
-                    ))
+                    .child(format!("{said} Save them before {what}, or discard them."))
                     .child(
                         div()
                             .flex()
                             .justify_end()
                             .gap_2()
-                            .child(button("Cancel", false).on_click(cx.listener(|this, _, _, cx| {
-                                this.leaving = None;
-                                cx.notify();
-                            })))
-                                                        .child(button("Discard edits", false).on_click(cx.listener(
-                                move |this, _, _, cx| {
-                                    this.leaving = None;
-                                    // Dropping the island drops its edits;
-                                    // the next one opens clean.
-                                    if matches!(leave, Leave::NewIsland | Leave::Island(_)) {
-                                        this.island = None;
-                                    }
-                                    this.go(leave.clone(), cx);
-                                    cx.notify();
-                                },
-                            )))
-                            .child(button(save, true).on_click(cx.listener(
-                                move |this, _, _, cx| {
-                                    this.leaving = None;
-                                    this.save();
-                                    if !this.error {
-                                        this.go(go.clone(), cx);
-                                    }
-                                    cx.notify();
-                                },
-                            ))),
+                            .child(button("Cancel", false).on_click(answer(Answer::Cancel)))
+                            .child(button("Discard edits", false).on_click(answer(Answer::Discard)))
+                            .child(button(save, true).on_click(answer(Answer::Save))),
                     ),
             ));
         }
@@ -2514,29 +3602,126 @@ impl Editor {
     pub fn unsaved(&self) -> bool {
         self.pending_save
             || self.island.as_ref().is_some_and(|i| i.dirty())
+            || self.map.as_ref().is_some_and(|m| m.dirty())
             || self.ui.as_ref().is_some_and(|u| u.dirty())
+            || self.model.as_ref().is_some_and(|m| m.dirty())
     }
 
-    /// Switches game, project or island, or quits, asking first when edits
-    /// would be lost. A half-typed value counts as an edit: it is applied
-    /// first, from the menu as from the shortcut.
+    /// The documents with edits not yet in the mod folder, by name: the
+    /// one `only` names, or all of them.
+    pub fn unsaved_names(&self, only: Option<Doc>) -> Vec<String> {
+        let wants = |d: Doc| only.is_none_or(|o| o == d);
+        let mut out = Vec::new();
+        if wants(Doc::Island)
+            && let Some(i) = self.island.as_ref().filter(|i| i.dirty())
+        {
+            out.push(crate::island::island_title(self.asset_words(), &i.path));
+        }
+        if wants(Doc::Map)
+            && let Some(m) = self.map.as_ref().filter(|m| m.dirty())
+        {
+            out.push(m.title());
+        }
+        if wants(Doc::Ui)
+            && let Some(u) = self.ui.as_ref().filter(|u| u.dirty())
+        {
+            out.push(self.screen_name(&u.path));
+        }
+        if wants(Doc::Model)
+            && let Some(m) = self.model.as_ref().filter(|m| m.dirty())
+        {
+            let name = crate::project::models::model_name(&m.path);
+            out.push(crate::island::pretty(self.asset_words(), name));
+        }
+        out
+    }
+
+    /// Opens, starts or closes a document, switches game or project, or
+    /// quits, asking first when edits would be lost: only the replaced
+    /// document's, or every one's when leaving them all. A half-typed value
+    /// counts as an edit: it is applied first, from the menu as from the
+    /// shortcut, and one its field refuses stops here.
     pub fn leave(&mut self, to: Leave, cx: &mut Context<Self>) {
-        self.end_typing();
-        if self.unsaved() {
+        if let Err(e) = self.end_typing() {
+            return self.message(e, true);
+        }
+        if self.show_open(&to) {
+            return;
+        }
+        let replaces = to.replaces();
+        // A save that staged but didn't write: the documents read clean,
+        // the mod folder doesn't have them. Only leaving the project
+        // loses that.
+        let lost = replaces.is_none() && self.pending_save;
+        if lost || !self.unsaved_names(replaces).is_empty() {
             self.leaving = Some(to);
             cx.notify();
         } else {
-            self.go(to, cx);
+            self.go(to, false, cx);
         }
     }
 
-    fn go(&mut self, to: Leave, cx: &mut Context<Self>) {
+    /// `to` opens the document already open: shows it, edits and all.
+    fn show_open(&mut self, to: &Leave) -> bool {
+        let workspace = match to {
+            Leave::Island(p) if self.island.as_ref().is_some_and(|i| i.path == *p) => {
+                Workspace::Island
+            }
+            Leave::Map(p) if self.map.as_ref().is_some_and(|m| m.is_at(p)) => Workspace::Map,
+            Leave::Screen(p) if self.ui.as_ref().is_some_and(|u| u.path == *p) => Workspace::Ui,
+            Leave::Model(p) if self.model.as_ref().is_some_and(|m| m.path == *p) => {
+                Workspace::Model
+            }
+            _ => return false,
+        };
+        self.switch(workspace);
+        true
+    }
+
+    /// Goes where `to` says, the edits saved or not to be kept.
+    /// `discarded`: the modder chose Discard, so a load finishing
+    /// replaces the edited document; otherwise one edited while it loaded
+    /// asks again.
+    pub(crate) fn go(&mut self, to: Leave, discarded: bool, cx: &mut Context<Self>) {
         match to {
             Leave::Game => cx.emit(SwitchGame),
             Leave::Project(folder) => self.open_project(&folder),
-            Leave::NewIsland => self.open_wizard(),
-            Leave::Island(path) => self.open_island(&path, cx),
+            Leave::NewIsland => self.wizard_now(),
+            Leave::Island(path) => self.load_island(&path, discarded, cx),
+            Leave::Map(path) => self.read_map(&path, cx),
+            Leave::NewMap => self.new_map_dialog(cx),
+            Leave::CloseMap => self.close_map(),
+            Leave::Screen(path) => self.load_ui_asset(&path, discarded, cx),
+            Leave::Model(path) => self.load_model(&path, discarded, cx),
             Leave::Quit => cx.quit(),
+        }
+    }
+
+    /// The ask's answer. Discard leaves the document in place until what
+    /// replaces it is there: a cancelled wizard or a failed load keeps it,
+    /// edits and all.
+    pub fn answer_leave(&mut self, answer: Answer, cx: &mut Context<Self>) {
+        let Some(to) = self.leaving.take() else {
+            return;
+        };
+        match answer {
+            Answer::Cancel => {}
+            Answer::Discard => self.go(to, true, cx),
+            Answer::Save => self.save_then(to, cx),
+        }
+    }
+
+    /// Save, then go once everything is written: at once, or after the
+    /// shipped-map question is answered. A failed save goes nowhere.
+    pub(crate) fn save_then(&mut self, to: Leave, cx: &mut Context<Self>) {
+        match self.save() {
+            Saved::Written => self.go(to, false, cx),
+            Saved::Waiting => {
+                if let Some(crate::map::panels::Dialog::SaveShipped(d)) = &mut self.map_dialog {
+                    d.then = Some(to);
+                }
+            }
+            Saved::Failed => {}
         }
     }
 }
@@ -2665,3 +3850,106 @@ impl EntityInputHandler for Editor {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod capabilities {
+    use super::{Editor, Module, Project, Workspace};
+    use crate::games::fixtures::PartialGame;
+    use anno_formats::rda::{PackOptions, Packer};
+    use gpui::TestApp;
+
+    fn routes(module: &'static dyn Module, cases: &[(&str, bool)], keys: &[(&str, Workspace)]) {
+        let dir = tempfile::tempdir().unwrap();
+        let archives = dir.path().join("maindata");
+        std::fs::create_dir(&archives).unwrap();
+        let mut pack = Packer::new(PackOptions::default());
+        for &(path, _) in cases {
+            pack.add(path, b"fixture").unwrap();
+        }
+        std::fs::write(archives.join("data0.rda"), pack.encode().unwrap()).unwrap();
+        let mut app = TestApp::new();
+        let mut w = app.open_window(|window, cx| {
+            Editor::new(
+                Project::load(&dir.path().join("config"), module).unwrap(),
+                dir.path().join("config"),
+                Some(dir.path().to_owned()),
+                None,
+                window,
+                cx,
+            )
+        });
+        app.run_until_parked();
+        for &(path, browser) in cases {
+            w.update(|ed, _, cx| {
+                ed.browser.selected = None;
+                ed.open_path(path, cx);
+                assert_eq!(ed.browser.selected.is_some(), browser, "{path}");
+                if browser {
+                    assert_eq!(ed.workspace, Workspace::Assets);
+                    assert_eq!(ed.browser.selected, ed.install.as_ref().unwrap().file(path));
+                }
+            });
+            app.run_until_parked();
+        }
+        w.update(|ed, _, cx| {
+            if ed.module.islands().is_some() {
+                // Not the missing test-map island: packaging alone turns it off.
+                assert_eq!(
+                    ed.playtest_blocker(),
+                    Some("This game has no playtest delivery")
+                );
+                ed.install_mod(cx);
+                assert_eq!(ed.status, "This game has no project installer");
+                assert!(!ed.installing);
+            }
+        });
+        for &(key, expected) in keys {
+            w.simulate_keystrokes(key);
+            w.read(|ed, _| assert_eq!(ed.workspace, expected, "{key}"));
+        }
+    }
+
+    // A game without islands or screens (2070 was one until it edited
+    // islands) shows both kinds of file in Assets.
+    #[test]
+    fn a_browse_only_game_opens_islands_and_screens_in_the_browser() {
+        routes(
+            &PartialGame::Bare,
+            &[("data/one.fixture", true), ("data/one.screen", true)],
+            &[
+                ("ctrl-2", Workspace::Assets),
+                ("ctrl-3", Workspace::Assets),
+                ("ctrl-4", Workspace::Assets),
+                ("ctrl-0", Workspace::Assets),
+            ],
+        );
+    }
+
+    #[test]
+    fn islands_and_ui_route_independently_through_files_and_shortcuts() {
+        routes(
+            &PartialGame::Islands,
+            &[("data/one.screen", true), ("data/one.fixture", false)],
+            // Its islands have maps, so Ctrl 3 opens Map; it has no UI, so
+            // Ctrl 4 leaves the keys there.
+            &[
+                ("ctrl-2", Workspace::Island),
+                ("ctrl-3", Workspace::Map),
+                ("ctrl-4", Workspace::Map),
+                ("ctrl-0", Workspace::Project),
+            ],
+        );
+        routes(
+            &PartialGame::Screens,
+            &[("data/one.fixture", true), ("data/one.screen", false)],
+            // It saves projects, so it has their workspace.
+            // Ctrl 3 is the Map workspace, which it lacks: the keys stay.
+            &[
+                ("ctrl-4", Workspace::Ui),
+                ("ctrl-3", Workspace::Ui),
+                ("ctrl-2", Workspace::Ui),
+                ("ctrl-0", Workspace::Project),
+            ],
+        );
+    }
+}

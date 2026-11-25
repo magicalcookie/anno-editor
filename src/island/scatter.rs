@@ -2,7 +2,7 @@
 // kit's placements into rd3d prop-grid instances on the terrain, and marking
 // the RegrowManager tree cells under trees.
 use super::doc::{self, Doc, Prop};
-use anno_formats::{grids::Kind, island};
+use anno_formats::a7m::{grids::Kind, island};
 use gpui_editor_kit::{heightfield::Brush, scatter};
 use std::sync::Arc;
 
@@ -45,7 +45,7 @@ impl Scatter {
             source.position = [p.at[0], doc.field.height(p.at), p.at[1]];
             source.rotation = [0., (p.yaw / 2.).sin(), 0., (p.yaw / 2.).cos()];
             source.scale = source.scale.map(|v| v * p.scale);
-            Arc::make_mut(&mut doc.props).push(Prop {
+            doc.props.push(Prop {
                 id: *next_id,
                 matrix: doc::trs(source.position, source.rotation, source.scale),
                 source,
@@ -63,7 +63,7 @@ impl Scatter {
     /// brush, each with chance weight × strength. Returns how many.
     pub fn thin(&mut self, doc: &mut Doc, center: [f32; 2], brush: &Brush) -> usize {
         let mut removed = Vec::new();
-        Arc::make_mut(&mut doc.props).retain(|p| {
+        doc.props.retain(|p| {
             if !self.files.is_empty() && !self.files.contains(&p.source.file) {
                 return true;
             }

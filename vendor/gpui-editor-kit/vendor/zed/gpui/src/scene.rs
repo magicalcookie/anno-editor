@@ -769,36 +769,14 @@ pub struct PaintSurface {
     pub order: DrawOrder,
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
+    // Kept on macOS so `gpui_apple`'s Metal renderer still compiles. Window
+    // drawing there goes through `texture`; this buffer is unused.
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     pub image_buffer: objc2_core_foundation::CFRetained<objc2_core_video::CVPixelBuffer>,
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
-    pub canvas: std::sync::Arc<dyn GpuCanvas>,
-}
-
-/// What a [`GpuCanvas`] draws with: GPUI's wgpu device and the frame's
-/// encoder and target, between GPUI's own passes in draw order.
-#[cfg(any(target_os = "linux", target_os = "windows"))]
-#[allow(missing_docs)]
-pub struct GpuCanvasFrame<'a> {
-    pub device: &'a wgpu::Device,
-    pub queue: &'a wgpu::Queue,
-    pub encoder: &'a mut wgpu::CommandEncoder,
-    pub target: &'a wgpu::TextureView,
-    pub format: wgpu::TextureFormat,
-    /// Target size in device pixels.
-    pub size: [u32; 2],
-    /// Where the canvas was painted, and the content mask over it.
-    pub bounds: Bounds<ScaledPixels>,
-    pub clip: Bounds<ScaledPixels>,
-}
-
-/// A viewport an application draws itself with wgpu inside GPUI's frame
-/// (Linux and Windows): `Window::paint_gpu_canvas` places it, and the renderer calls
-/// `draw` in paint order with GPUI's own passes ended around it.
-#[cfg(any(target_os = "linux", target_os = "windows"))]
-pub trait GpuCanvas: std::fmt::Debug + Send + Sync {
-    /// Encodes the canvas into the frame.
-    fn draw(&self, frame: &mut GpuCanvasFrame);
+    /// The texture another thread renders, which the surface draws
+    /// (`TextureHandoff`).
+    #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+    pub texture: std::sync::Arc<crate::TextureHandoff>,
 }
 
 impl From<PaintSurface> for Primitive {

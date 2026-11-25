@@ -3,8 +3,9 @@
 // files, switching between projects, and the New project dialog.
 use super::Project;
 use crate::editor::{Editor, Leave, Workspace};
+use crate::games::GameExt;
 use crate::island::{file_name, island_path};
-use anno_formats::modinfo::{self, DIFFICULTIES, id_from_name, valid_id};
+use anno_core::modinfo::{self, id_from_name, valid_id};
 use gpui_editor_kit::{
     field::{EditEvent, Filter, TextEdit, text_field},
     gpui::{prelude::*, *},
@@ -117,9 +118,13 @@ impl Editor {
     /// Switches to the project in `folder`. Callers go through `leave` so
     /// unsaved edits are not lost.
     pub fn open_project(&mut self, folder: &Path) {
-        match Project::open(folder, self.game) {
+        match Project::open(folder, self.module) {
             Ok(project) => {
                 self.island = None;
+                self.map = None;
+                // The shipped-map question, and the switch it held, were the
+                // old project's.
+                self.map_dialog = None;
                 self.ui = None;
                 self.pending_save = false;
                 self.project = project;
@@ -190,8 +195,11 @@ impl Editor {
 
     /// File → New project…
     pub fn open_new_project(&mut self, _: &mut Context<Self>) {
-        // The dialog takes the keys: a half-typed value is applied first.
-        self.end_typing();
+        // The dialog takes the keys: a half-typed value is applied first,
+        // and one its field refuses keeps them.
+        if let Err(e) = self.end_typing() {
+            return self.message(e, true);
+        }
         self.project_ui.new_project = Some(NewProject {
             name: TextEdit::new((), "", Filter::Text),
             id: TextEdit::new((), "", Filter::Text),
@@ -210,7 +218,7 @@ impl Editor {
         }
         let (name, id) = (d.name.text.trim().to_owned(), d.id.text.trim().to_owned());
         let folder = d.parent.join(&id);
-        match Project::create(&folder, &name, &id, self.game) {
+        match Project::create(&folder, &name, &id, self.module) {
             Ok(_) => {
                 self.project_ui.new_project = None;
                 self.leave(Leave::Project(folder), cx);
@@ -318,14 +326,17 @@ impl Editor {
                 self.mount_project();
                 // An installed copy under the old id would load as a second
                 // mod with the same islands; removing it is the user's call.
-                let stale = (self.install.as_ref()).is_some_and(|i| {
-                    [
-                        modinfo::install_root(self.game, i.dir()),
-                        i.dir().join("mods"),
-                    ]
-                    .iter()
-                    .any(|root| root.join(&old).exists())
-                });
+                let stale = (self.install.as_ref())
+                    .zip(self.module.packaging())
+                    .is_some_and(|(i, packaging)| {
+                        [
+                            modinfo::install_root(self.module, i.dir()),
+                            Some(i.dir().join(packaging.mods_folder)),
+                        ]
+                        .iter()
+                        .flatten()
+                        .any(|root| root.join(&old).exists())
+                    });
                 self.message(
                     if stale {
                         format!(
@@ -352,7 +363,10 @@ impl Editor {
         if open && self.island.as_ref().is_some_and(|i| i.dirty()) {
             return self.message("Save the island (Ctrl S) before renaming it", true);
         }
-        let to = island_path(self.game, &entry.region.to_ascii_lowercase(), name);
+        let Some(islands) = self.module.islands() else {
+            return;
+        };
+        let to = island_path(islands, &entry.region.to_ascii_lowercase(), name);
         if self.install.as_ref().is_some_and(|i| i.file(&to).is_some()) {
             return self.message(format!("{to} is a shipped file; pick another name"), true);
         }
@@ -509,10 +523,11 @@ impl Editor {
     /// `<install>/mods` where installs went before. The next install moves
     /// an old copy over.
     fn installed_copy(&self) -> Option<PathBuf> {
+        let packaging = self.module.packaging()?;
         let install = self.install.as_ref()?;
         [
-            modinfo::install_root(self.game, install.dir()),
-            install.dir().join("mods"),
+            modinfo::install_root(self.module, install.dir())?,
+            install.dir().join(packaging.mods_folder),
         ]
         .into_iter()
         .map(|root| root.join(self.project.mod_id()))
@@ -597,12 +612,7 @@ impl Editor {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         // The islands' map pictures for their rows, as the Islands pane has.
-        if self.thumbs.is_none()
-            && let Some(install) = self.install.clone()
-        {
-            let dir = self.config.join("thumbnails");
-            self.thumbs = Some(crate::island::catalog::Thumbs::start(install, dir));
-        }
+        self.start_thumbs();
         if let Some(thumbs) = &mut self.thumbs {
             thumbs.request(self.project.islands.iter().map(|i| i.path.as_str()));
         }
@@ -793,6 +803,29 @@ impl Editor {
                         Some(_) if self.project.islands.iter().all(|i| !i.listing.on_test_map) => {
                             div().into_any_element()
                         }
+                        // Without packaging, Make test map is the step there
+                        // is: Test in game stays off with its reason.
+                        Some(why) if self.module.packaging().is_none() => div()
+                            .flex()
+                            .gap_2()
+                            .child(widgets::action_off("Test in game…", why))
+                            .child(match self.test_map_blocker() {
+                                Some(why) => {
+                                    widgets::action_off("Make test map", why).into_any_element()
+                                }
+                                None => action("Make test map", Tone::Secondary)
+                                    .tooltip(Tooltip::text(
+                                        "Make test map",
+                                        "",
+                                        "Writes the game's test map for these islands into the project folder",
+                                    ))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.make_test_map();
+                                        cx.notify();
+                                    }))
+                                    .into_any_element(),
+                            })
+                            .into_any_element(),
                         Some(why) => widgets::action_off("Test in game…", why).into_any_element(),
                         // Says the update it brings while the copy is old,
                         // where only its tooltip did.
@@ -817,34 +850,40 @@ impl Editor {
                     })
                     // The warning resolves where it is read: the same action as
                     // the top bar's chip.
-                    .when(matches!(installed, Installed::No | Installed::Older), |d| {
-                        d.child(
-                            action(
-                                if installed == Installed::No {
-                                    "Install"
-                                } else {
-                                    "Update game copy"
-                                },
-                                // While there is no island, New island leads:
-                                // an update then has little new to show.
-                                if self.project.islands.is_empty() {
-                                    Tone::Secondary
-                                } else {
-                                    Tone::Primary
-                                },
+                    .when(
+                        self.module.packaging().is_some()
+                            && matches!(installed, Installed::No | Installed::Older),
+                        |d| {
+                            d.child(
+                                action(
+                                    if installed == Installed::No {
+                                        "Install"
+                                    } else {
+                                        "Update game copy"
+                                    },
+                                    // While there is no island, New island leads:
+                                    // an update then has little new to show.
+                                    if self.project.islands.is_empty() {
+                                        Tone::Secondary
+                                    } else {
+                                        Tone::Primary
+                                    },
+                                )
+                                // Secondary, it still wears the banner's amber: it is
+                                // the action the banner asks for.
+                                .when(self.project.islands.is_empty(), |b| {
+                                    b.border_color(theme::get().highlight)
+                                        .text_color(theme::get().highlight)
+                                })
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        this.install_mod(cx);
+                                        cx.notify();
+                                    },
+                                )),
                             )
-                            // Secondary, it still wears the banner's amber: it is
-                            // the action the banner asks for.
-                            .when(self.project.islands.is_empty(), |b| {
-                                b.border_color(theme::get().highlight)
-                                    .text_color(theme::get().highlight)
-                            })
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.install_mod();
-                                cx.notify();
-                            })),
-                        )
-                    }),
+                        },
+                    ),
             );
 
         let mut details = card()
@@ -888,18 +927,23 @@ impl Editor {
                 "Category",
                 self.detail_field(Field::Category, &info.category, "Misc", cx),
             ));
-        if self.game.profile().difficulty {
+        let difficulties = modinfo::difficulties(self.module);
+        if let Some(&default) = difficulties.first() {
             details = details
                 .child(field_row(
                     "Difficulty",
                     segmented(
                         "project-difficulty",
-                        DIFFICULTIES.map(|d| {
+                        difficulties.iter().map(|&d| {
                             let mut label = d.to_owned();
                             label[..1].make_ascii_uppercase();
                             (d.to_owned(), label.into())
                         }),
-                        &info.difficulty,
+                        &if info.difficulty.is_empty() {
+                            default.to_owned()
+                        } else {
+                            info.difficulty.clone()
+                        },
                         cx,
                         |this, d, _, _| {
                             this.project.info.difficulty = d;
@@ -916,120 +960,117 @@ impl Editor {
         // everyday fields it read as one more thing to fill in now. Its
         // heading says whether the range is reserved, so the warning stays
         // in view.
-        let (publishing, publishing_open) =
-            widgets::collapsible("overview-publishing", "Publishing", false, window, cx);
-        let reserved = self.project.guid_reserved();
-        details = details.child(
-            publishing.child(
-                div()
-                    .ml_2()
-                    .flex()
-                    .items_center()
-                    .gap(px(6.))
-                    .font_weight(FontWeight::NORMAL)
-                    .text_color(theme::get().muted)
-                    // Grey, not amber: fine until publishing, and amber is
-                    // kept for what blocks playing. A ring, as an open step:
-                    // a filled dot read as a one-item list bullet.
-                    .when(!reserved, |d| {
-                        d.child(
-                            div()
-                                .size(px(7.))
-                                .rounded_full()
-                                .border_1()
-                                .border_color(theme::get().muted),
-                        )
-                    })
-                    .child(if reserved {
-                        format!(
-                            "GUIDs {} – {}",
-                            self.project.guid_base(),
-                            self.project.guid_base() + 99
-                        )
-                    } else {
-                        "GUIDs not reserved".to_owned()
-                    }),
-            ),
-        );
-        if publishing_open {
-            details = details.child(field_row(
-            "First GUID",
-            // The value in the row, as every other field shows its value;
-            // the registry is a small action beside it.
-            div()
-                .flex_1()
-                .min_w_0()
-                .flex()
-                .flex_col()
-                .items_start()
-                .gap_1()
-                .child(
-                    // To the field column's right edge, as every other row.
+        // A game without packaging adds no assets, so has no range to show.
+        if let (Some(base), Some(packaging)) = (self.project.guid_base(), self.module.packaging()) {
+            let (publishing, publishing_open) =
+                widgets::collapsible("overview-publishing", "Publishing", false, window, cx);
+            let reserved = self.project.guid_reserved();
+            details = details.child(
+                publishing.child(
                     div()
-                        .w_full()
+                        .ml_2()
                         .flex()
                         .items_center()
-                        .gap_2()
-                        // Editable: the range reserved in the registry is
-                        // entered here, so publishing does not end outside.
-                        .child(
-                            self.detail_field(
-                                Field::GuidBase,
-                                // Raw digits: a GUID is pasted into XML, so
-                                // thousands commas would come along.
-                                &self.project.guid_base().to_string(),
-                                "first GUID",
-                                cx,
-                            )
-                            .flex_1()
-                            .min_w_0(),
-                        )
-                        .child(
-                            action("Reserve GUIDs ↗", Tone::Secondary)
-                                .h(px(24.))
-                                .text_size(px(11.))
-                                .on_click(|_, _, cx| {
-                                    cx.open_url("https://github.com/anno-mods/GuidRanges")
-                                }),
-                        ),
-                )
-                // Whether the value is a reservation or still the one picked
-                // from the mod id: both look like a settled number.
-                .child(if self.project.guid_reserved() {
-                    hint(format!(
-                        "Islands this mod creates are numbered {} – {}; ones already in it keep theirs.",
-                        self.project.guid_base(),
-                        self.project.guid_base() + 99
-                    ))
-                } else {
-                    // A small amber mark, the words muted: it matters before
-                    // publishing, and all-amber text competed with the
-                    // update banner as if both were faults.
-                    // Full width: the column aligns items to the start, which
-                    // sized the row to its unwrapped text, past the card.
-                    div()
-                        .w_full()
-                        .flex()
-                        .items_start()
                         .gap(px(6.))
-                        .child(
-                            div()
-                                .mt(px(6.))
-                                .size(px(7.))
-                                .flex_shrink_0()
-                                .rounded_full()
-                                // The heading's ring: one mark for one state.
-                                .border_1()
-                                .border_color(theme::get().muted),
-                        )
-                        // flex_1 + min_w_0 so it wraps inside the card; a
-                        // bare hint in the row ran past its edge.
-                        .child(hint(
-                            // The wizard's sentence, word for word: one state, one line.
-                            "GUIDs aren’t reserved yet. Fine for testing; reserve before publishing.",
-                        ).flex_1().min_w_0())
-                }),
-        ));
+                        .font_weight(FontWeight::NORMAL)
+                        .text_color(theme::get().muted)
+                        // Grey, not amber: fine until publishing, and amber is
+                        // kept for what blocks playing. A ring, as an open step:
+                        // a filled dot read as a one-item list bullet.
+                        .when(!reserved, |d| {
+                            d.child(
+                                div()
+                                    .size(px(7.))
+                                    .rounded_full()
+                                    .border_1()
+                                    .border_color(theme::get().muted),
+                            )
+                        })
+                        .child(if reserved {
+                            format!("GUIDs {} – {}", base, base + packaging.guid_range.size - 1)
+                        } else {
+                            "GUIDs not reserved".to_owned()
+                        }),
+                ),
+            );
+            if publishing_open {
+                details = details.child(field_row(
+                "First GUID",
+                // The value in the row, as every other field shows its value;
+                // the registry is a small action beside it.
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .items_start()
+                    .gap_1()
+                    .child(
+                        // To the field column's right edge, as every other row.
+                        div()
+                            .w_full()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            // Editable: the range reserved in the registry is
+                            // entered here, so publishing does not end outside.
+                            .child(
+                                self.detail_field(
+                                    Field::GuidBase,
+                                    // Raw digits: a GUID is pasted into XML, so
+                                    // thousands commas would come along.
+                                    &base.to_string(),
+                                    "first GUID",
+                                    cx,
+                                )
+                                .flex_1()
+                                .min_w_0(),
+                            )
+                            .child(
+                                action("Reserve GUIDs ↗", Tone::Secondary)
+                                    .h(px(24.))
+                                    .text_size(px(11.))
+                                    .on_click(move |_, _, cx| cx.open_url(packaging.guid_range.registry)),
+                            ),
+                    )
+                    // Whether the value is a reservation or still the one picked
+                    // from the mod id: both look like a settled number.
+                    .child(if self.project.guid_reserved() {
+                        hint(format!(
+                            "Islands this mod creates are numbered {} – {}; ones already in it keep theirs.",
+                            base,
+                            base + packaging.guid_range.size - 1
+                        ))
+                    } else {
+                        // A small amber mark, the words muted: it matters before
+                        // publishing, and all-amber text competed with the
+                        // update banner as if both were faults.
+                        // Full width: the column aligns items to the start, which
+                        // sized the row to its unwrapped text, past the card.
+                        div()
+                            .w_full()
+                            .flex()
+                            .items_start()
+                            .gap(px(6.))
+                            .child(
+                                div()
+                                    .mt(px(6.))
+                                    .size(px(7.))
+                                    .flex_shrink_0()
+                                    .rounded_full()
+                                    // The heading's ring: one mark for one state.
+                                    .border_1()
+                                    .border_color(theme::get().muted),
+                            )
+                            // flex_1 + min_w_0 so it wraps inside the card; a
+                            // bare hint in the row ran past its edge.
+                            .child(hint(
+                                // The wizard's sentence, word for word: one state, one line.
+                                "GUIDs aren’t reserved yet. Fine for testing; reserve before publishing.",
+                            ).flex_1().min_w_0())
+                    }),
+            ));
+            }
         }
 
         let missing = self.missing_dependencies();
@@ -1092,6 +1133,7 @@ impl Editor {
         }
 
         let islands = self.overview_islands(window, cx);
+        let layouts = self.overview_layouts(cx);
         let others = self.overview_files(window, cx);
         // Two rows of one shape: what it does on the left, the button on
         // the right.
@@ -1180,6 +1222,7 @@ impl Editor {
                             } else {
                                 islands.flex_1()
                             })
+                            .children(layouts)
                             .child(others)
                             .child(requires)
                             // Under the left column, not page wide below
@@ -1193,6 +1236,7 @@ impl Editor {
         } else {
             column()
                 .child(islands)
+                .children(layouts)
                 .child(others)
                 .child(details)
                 .child(requires)
@@ -1234,22 +1278,26 @@ impl Editor {
                         },
                     )
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.open_wizard();
+                        this.open_wizard(cx);
                         cx.notify();
                     })),
                 )
                 // After New island, the order File → Islands and the Island
                 // viewport use.
                 .child(
-                    action(
-                        crate::game_text::of(self.game).import_short,
-                        Tone::Secondary,
-                    )
-                    .tooltip(widgets::Tooltip::text(self.import_label(), "", ""))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.open_import(cx);
-                        cx.notify();
-                    })),
+                    action("Import island…", Tone::Secondary)
+                        .tooltip(widgets::Tooltip::text(
+                            "Import island",
+                            "",
+                            (self.import_sources().iter())
+                                .map(|m| m.profile().title)
+                                .collect::<Vec<_>>()
+                                .join(" or "),
+                        ))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.open_import(cx);
+                            cx.notify();
+                        })),
                 ),
         ));
         if self.project.islands.is_empty() {
@@ -1283,17 +1331,10 @@ impl Editor {
             ));
         }
         for (index, i) in self.project.islands.iter().enumerate() {
-            let name = i
-                .path
-                .rsplit('/')
-                .next()
-                .unwrap_or("")
-                .trim_end_matches(".a7m")
-                .to_owned();
-            let role = super::ROLES
-                .iter()
-                .find(|(_, k)| *k == i.listing.kind)
-                .map_or(i.listing.kind.as_str(), |(label, _)| label);
+            let name = super::island_name(&i.path).to_owned();
+            let role = (self.module.islands())
+                .and_then(|r| r.rules().role(&i.listing.kind))
+                .map_or(i.listing.kind.as_str(), |r| r.label);
             let path = i.path.clone();
             let open = self.island.as_ref().is_some_and(|o| o.path == i.path);
             // A list row, as the Islands pane draws one: the island's map, its
@@ -1356,7 +1397,7 @@ impl Editor {
                             // "island": bare, "Regular or start" trailed off.
                             .child(hint(format!(
                                 "{} · {} · {role} island",
-                                crate::island::province_short(&i.region),
+                                self.island_rules().province_short(&i.region),
                                 i.class()
                             )))
                             // Whether Test in game will show it, here where
@@ -1432,12 +1473,101 @@ impl Editor {
         list
     }
 
+    /// The project's map layouts, each opening in the Map workspace, with
+    /// New and Open as the Map view has them. None for a game whose maps
+    /// don't open in the editor.
+    fn overview_layouts(&self, cx: &mut Context<Self>) -> Option<Div> {
+        self.maps()?;
+        let rules = self.island_rules();
+        let open = self
+            .map
+            .as_ref()
+            .filter(|m| !m.shipped)
+            .and_then(|m| m.path.as_deref());
+        let mut list = card().child(card_title(
+            counted("Map layouts", self.project.layouts.len()),
+            div()
+                .flex()
+                .gap_2()
+                .child(
+                    action("New map layout…", Tone::Secondary).on_click(cx.listener(
+                        |this, _, _, cx| {
+                            this.open_new_map(cx);
+                            cx.notify();
+                        },
+                    )),
+                )
+                .child(action("Open map…", Tone::Secondary).on_click(cx.listener(
+                    |this, _, _, cx| {
+                        this.open_map_dialog(cx);
+                        cx.notify();
+                    },
+                ))),
+        ));
+        if self.project.layouts.is_empty() {
+            list = list.child(hint(
+                "No layouts yet. Start one on a shipped sea, or open one of the game's maps and save it as a layout.",
+            ));
+        }
+        for (index, l) in self.project.layouts.iter().enumerate() {
+            let path = l.path.clone();
+            let detail = crate::map::panels::layout_detail(rules, l);
+            let here = open == Some(l.path.as_str());
+            list = list.child(
+                div()
+                    .id(("project-layout", index))
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.))
+                            .child({
+                                let path = path.clone();
+                                div()
+                                    .id(("project-layout-name", index))
+                                    .text_size(px(13.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme::get().accent)
+                                    .cursor_pointer()
+                                    .hover(|s| s.underline())
+                                    .child(l.name.clone())
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.open_map(&path, cx);
+                                        cx.notify();
+                                    }))
+                            })
+                            .child(hint(detail)),
+                    )
+                    .when(here, |d| d.child(badge("open", theme::get().accent)))
+                    .child(action("Open", Tone::Secondary).on_click(cx.listener(
+                        move |this, _, _, cx| {
+                            this.open_map(&path, cx);
+                            cx.notify();
+                        },
+                    ))),
+            );
+        }
+        Some(list)
+    }
+
     /// Files the mod edits that are neither islands nor models: the
     /// Overview's "Other edited files", and the status bar's count of them.
     pub fn other_edited_files(&self) -> Vec<String> {
         let models: Vec<String> = super::models::project_cfg_files(&self.project);
+        // A layout's files are its variants' map files and those beside
+        // them of the same stem (`.a7tinfo`, `.a7te`): the Map layouts card
+        // lists them.
+        let stem = |p: &str| p.rsplit_once('.').map_or(p, |(s, _)| s).to_owned();
+        let layouts: Vec<String> = (self.project.layouts.iter())
+            .flat_map(|l| l.variants.iter().map(|v| stem(&v.path)))
+            .collect();
         (self.project.other_files().into_iter())
-            .filter(|f| !models.contains(f))
+            .filter(|f| !models.contains(f) && !layouts.contains(&stem(f)))
             .collect()
     }
 
@@ -1447,7 +1577,7 @@ impl Editor {
     /// Overview that said no other files were edited.
     pub fn mod_contents(&self) -> String {
         // Models, not their files: each brings its meshes and textures.
-        let models = crate::island::port::project_models(&self.project.files).len();
+        let models = self.project.models().len();
         let others = self.other_edited_files().len();
         let mut parts = vec![super::plural(
             self.project.islands.len(),
@@ -1456,6 +1586,13 @@ impl Editor {
         )];
         if models > 0 {
             parts.push(super::plural(models, "model", "models"));
+        }
+        if !self.project.layouts.is_empty() {
+            parts.push(super::plural(
+                self.project.layouts.len(),
+                "map layout",
+                "map layouts",
+            ));
         }
         if others > 0 {
             parts.push(super::plural(others, "other file", "other files"));
@@ -1487,6 +1624,13 @@ impl Editor {
                 "Edit a UI screen →",
                 crate::editor::Workspace::Ui,
             ))
+            .when(self.supports(crate::editor::Workspace::Model), |d| {
+                d.child(link(
+                    "overview-edit-model",
+                    "Edit a model →",
+                    crate::editor::Workspace::Model,
+                ))
+            })
             .child(link(
                 "overview-browse-assets",
                 "Browse game files →",
@@ -1527,7 +1671,7 @@ impl Editor {
                         window,
                         cx,
                         move |this, _, _| {
-                            this.project.files.remove(&path);
+                            this.project.remove_file(&path);
                             this.finish_project_edit(format!("Removed {path}"));
                         },
                     )),
@@ -1573,12 +1717,12 @@ impl Editor {
             // A step down from the description, so the first field does not
             // run into it.
             .child(hint("Name · required").mt_2())
-            .child(field("new-project-name", &d.name, NewField::Name, "e.g. Latium Isles"))
+            .child(field("new-project-name", &d.name, NewField::Name, "e.g. Northern Isles"))
 
             // Until typed into, the id follows the name; the help line says
             // so (in the label it read as a developer's note).
             .child(hint("Mod id"))
-            .child(field("new-project-id", &d.id, NewField::Id, "e.g. latium-isles"))
+            .child(field("new-project-id", &d.id, NewField::Id, "e.g. northern-isles"))
             .child(hint(if id_ok || d.id.text.is_empty() {
                 // Why there are two names: the id is what the game and
                 // other mods see. Which characters it takes is said only

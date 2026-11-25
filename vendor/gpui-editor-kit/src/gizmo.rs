@@ -58,6 +58,26 @@ pub enum Delta {
     Scale(Option<Vec3>, f32),
 }
 
+/// The steps a snapping drag goes in: moves in world units, turns in
+/// radians, scales by a factor.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Snap {
+    pub step: f32,
+    pub turn: f32,
+    pub scale: f32,
+}
+
+impl From<f32> for Snap {
+    /// Moves in steps of `step`, turns in 15° and scales in 0.1.
+    fn from(step: f32) -> Snap {
+        Snap {
+            step,
+            turn: PI / 12.,
+            scale: 0.1,
+        }
+    }
+}
+
 fn xy(p: Point<Pixels>) -> [f32; 2] {
     [p.x.into(), p.y.into()]
 }
@@ -85,11 +105,11 @@ fn segment_distance(p: [f32; 2], a: [f32; 2], b: [f32; 2]) -> f32 {
     dot(delta, delta).sqrt()
 }
 
-fn snap(value: f32, step: f32, enabled: bool) -> f32 {
-    if enabled {
-        (value / step).round() * step
-    } else {
-        value
+/// `value` rounded to `step`; as it is without one.
+fn stepped(value: f32, step: Option<f32>) -> f32 {
+    match step {
+        Some(s) => (value / s).round() * s,
+        None => value,
     }
 }
 
@@ -331,18 +351,16 @@ impl Frame {
             .map(|(_, handle)| handle)
     }
 
-    /// Converts a drag from `start` to `cursor` into a transform. With
-    /// `snap`, moves go in steps of that many world units, rotations in 15
-    /// degrees and scales in 0.1 steps.
+    /// Converts a drag from `start` to `cursor` into a transform, in
+    /// `snap`'s steps when given.
     pub fn delta(
         &self,
         handle: Handle,
         start: Point<Pixels>,
         cursor: Point<Pixels>,
-        snap_step: Option<f32>,
+        snap: Option<Snap>,
     ) -> Option<Delta> {
-        let snapping = snap_step.is_some();
-        let step = snap_step.unwrap_or(1.).max(0.001);
+        let step = snap.map(|s| s.step.max(0.001));
         let (start, cursor) = (xy(start), xy(cursor));
         let d = sub(cursor, start);
         match self.mode {
@@ -350,26 +368,22 @@ impl Frame {
                 let translation = match handle {
                     Handle::Axis(a) => scale(
                         self.axes[a],
-                        snap(
+                        stepped(
                             dot(d, self.screen[a]) / dot(self.screen[a], self.screen[a])
                                 * self.length,
                             step,
-                            snapping,
                         ),
                     ),
                     Handle::Plane(a, b) => {
                         let uv = solve(d, self.screen[a], self.screen[b])?;
                         add(
-                            scale(self.axes[a], snap(uv[0] * self.length, step, snapping)),
-                            scale(self.axes[b], snap(uv[1] * self.length, step, snapping)),
+                            scale(self.axes[a], stepped(uv[0] * self.length, step)),
+                            scale(self.axes[b], stepped(uv[1] * self.length, step)),
                         )
                     }
                     Handle::Screen => add(
-                        scale(
-                            self.right,
-                            snap(d[0] * self.length / LENGTH, step, snapping),
-                        ),
-                        scale(self.down, snap(d[1] * self.length / LENGTH, step, snapping)),
+                        scale(self.right, stepped(d[0] * self.length / LENGTH, step)),
+                        scale(self.down, stepped(d[1] * self.length / LENGTH, step)),
                     ),
                 };
                 Some(Delta::Move(translation))
@@ -390,9 +404,10 @@ impl Frame {
                     self.axes[a],
                 )
                 .signum();
+                let turn = snap.map(|s| s.turn.max(1e-4));
                 Some(Delta::Rotate(
                     self.axes[a],
-                    snap(angle, PI / 12., snapping) * handedness,
+                    stepped(angle, turn) * handedness,
                 ))
             }
             Mode::Scale => {
@@ -403,8 +418,13 @@ impl Frame {
                     Handle::Screen => ((d[0] - d[1]) * 0.008).exp(),
                     Handle::Plane(_, _) => return None,
                 };
-                // Scale never crosses zero; a reflection is not a drag result.
-                let factor = snap(factor, 0.1, snapping).clamp(0.01, 100.);
+                // Scale never crosses zero; a reflection is not a drag
+                // result. Snapped, it stops at one step.
+                let factor = match snap.map(|s| s.scale.max(0.001)) {
+                    Some(s) => stepped(factor, Some(s)).max(s),
+                    None => factor,
+                };
+                let factor = factor.clamp(0.01, 100.);
                 Some(Delta::Scale(
                     match handle {
                         Handle::Axis(a) => Some(self.axes[a]),
@@ -516,14 +536,14 @@ impl Gesture {
     }
 
     /// `None` until the cursor leaves a 3 px dead zone, so clicks never edit.
-    /// `snap_step`, when snapping, is the move step in world units.
-    pub fn delta(&mut self, cursor: Point<Pixels>, snap_step: Option<f32>) -> Option<Delta> {
+    /// `snap`, when snapping: its steps, or a move step in world units.
+    pub fn delta(&mut self, cursor: Point<Pixels>, snap: Option<impl Into<Snap>>) -> Option<Delta> {
         let d = sub(xy(cursor), xy(self.start));
         self.moved |= dot(d, d) > 9.;
         if !self.moved {
             return None;
         }
-        self.frame.delta(self.handle, self.start, cursor, snap_step)
+        (self.frame).delta(self.handle, self.start, cursor, snap.map(Into::into))
     }
 }
 
@@ -648,15 +668,58 @@ mod tests {
             panic!()
         };
         close(&d, &[2.3, 0., 0.]);
-        let Some(Delta::Move(d)) = frame.delta(Handle::Axis(0), start, end, Some(1.)) else {
+        let Some(Delta::Move(d)) = frame.delta(Handle::Axis(0), start, end, Some(1f32.into()))
+        else {
             panic!()
         };
         close(&d, &[2., 0., 0.]);
         // A finer step for small props: 2.3 m lands on 2.5 at half a metre.
-        let Some(Delta::Move(d)) = frame.delta(Handle::Axis(0), start, end, Some(0.5)) else {
+        let Some(Delta::Move(d)) = frame.delta(Handle::Axis(0), start, end, Some(0.5f32.into()))
+        else {
             panic!()
         };
         close(&d, &[2.5, 0., 0.]);
+    }
+
+    #[test]
+    fn turns_and_scales_snap_to_the_steps_given() {
+        let r = frame(Mode::Rotate, None);
+        // Round the Y ring: from its +Z side 0.2 rad (11.5°) toward +X.
+        let at = |t: f32| {
+            let (sin, cos) = t.sin_cos();
+            point2(add(
+                r.origin,
+                add(scale(r.screen[2], cos), scale(r.screen[0], sin)),
+            ))
+        };
+        let turn = |s: Option<Snap>| match r.delta(Handle::Axis(1), at(0.), at(0.2), s) {
+            Some(Delta::Rotate(_, a)) => a.abs().to_degrees(),
+            d => panic!("{d:?}"),
+        };
+        let fine = Snap {
+            step: 1.,
+            turn: 5f32.to_radians(),
+            scale: 0.25,
+        };
+        close(&[turn(None)], &[0.2f32.to_degrees()]);
+        close(&[turn(Some(1f32.into()))], &[15.]);
+        close(&[turn(Some(fine))], &[10.]);
+
+        let s = frame(Mode::Scale, None);
+        let factor = |to: f32, snap: Option<Snap>| match s.delta(
+            Handle::Axis(1),
+            tip(&s, 1, 1.),
+            tip(&s, 1, to),
+            snap,
+        ) {
+            Some(Delta::Scale(Some(_), f)) => f,
+            d => panic!("{d:?}"),
+        };
+        close(&[factor(1.37, None)], &[1.37]);
+        close(&[factor(1.37, Some(1f32.into()))], &[1.4]);
+        close(&[factor(1.37, Some(fine))], &[1.25]);
+        // Snapped, a drag through zero stops at one step.
+        close(&[factor(-5., Some(fine))], &[0.25]);
     }
 
     #[test]
@@ -698,10 +761,18 @@ mod tests {
         };
         assert_eq!(factor, 0.01);
         let mut gesture = Gesture::with_handle(frame, Handle::Screen, start);
-        assert!(gesture.delta(start + point(px(2.), px(0.)), None).is_none());
-        assert!(gesture.delta(start + point(px(9.), px(0.)), None).is_some());
+        assert!(
+            gesture
+                .delta(start + point(px(2.), px(0.)), None::<Snap>)
+                .is_none()
+        );
+        assert!(
+            gesture
+                .delta(start + point(px(9.), px(0.)), None::<Snap>)
+                .is_some()
+        );
         // Returning to the start after moving still reports an identity delta.
-        let Some(Delta::Scale(None, f)) = gesture.delta(start, None) else {
+        let Some(Delta::Scale(None, f)) = gesture.delta(start, None::<Snap>) else {
             panic!()
         };
         assert_eq!(f, 1.);

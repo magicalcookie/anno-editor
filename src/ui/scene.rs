@@ -1,5 +1,5 @@
 // Owns turning a compiled widget tree into canvas nodes: the cross-file
-// layout from `phx::layout` (anchors, stacks, pivots), image textures
+// layout from `layout` (anchors, stacks, pivots), image textures
 // (ImageAsset → DDS, cut into nine when it has a slice centre) and label
 // text; and the inverse, turning a canvas rectangle change back into
 // Position/Scale edits; plus the static part of the game's
@@ -8,8 +8,10 @@
 // Rotated images are drawn into their bounding box on the CPU (GPUI
 // cannot rotate images); rotated labels draw unrotated.
 use super::canvas::{Kind, Node, Slices};
+use super::layout;
+use anno_core::ui::Screens;
 use anno_formats::{
-    phx::{self, Asset, Edit, Guid, Value, Widget, layout},
+    phx::{self, Asset, Edit, Guid, Value, Widget},
     vfs::Install,
 };
 use gpui_editor_kit::{
@@ -94,7 +96,7 @@ pub struct Frame {
     pub anchor_span: Option<(usize, u32)>,
     /// Values data bindings put over the stored ones; editing the stored
     /// value does not show while a binding overrides it.
-    pub bound: phx::binding::Bound,
+    pub bound: super::evaluate::Bound,
 }
 
 /// A decoded ImageAsset before tinting.
@@ -173,8 +175,9 @@ impl Font {
 
 /// Image and template assets resolved through the install, once per guid;
 /// images are rendered once per (guid, ColorTint, BlendingMode).
-#[derive(Default)]
 pub struct Images {
+    /// What the install's screens share (the image index, sample data).
+    pub(super) shared: Arc<super::Shared>,
     decoded: FastMap<Guid, Option<Arc<Decoded>>>,
     images: FastMap<(Guid, [u8; 3], u32), Image>,
     /// Textures by source path, for images a binding sets by path.
@@ -252,6 +255,25 @@ const KEPT_SCREENS: usize = 16;
 const KEPT_BAKES: u64 = 16;
 
 impl Images {
+    pub fn new(shared: Arc<super::Shared>) -> Images {
+        Images {
+            shared,
+            decoded: Default::default(),
+            images: Default::default(),
+            by_path: Default::default(),
+            path_images: Default::default(),
+            templates: Default::default(),
+            prefetched: Default::default(),
+            fonts: Default::default(),
+            new_fonts: Default::default(),
+            layout: Default::default(),
+            bakes: Default::default(),
+            layouts: Default::default(),
+            statics: Default::default(),
+            kept: Default::default(),
+        }
+    }
+
     /// The instances of template `g` in the last layout of root `root`.
     pub fn instances_of(&self, root: Option<Guid>, g: Guid) -> Option<Vec<u64>> {
         Some(self.layout.tree(root)?.instances_of(g))
@@ -338,10 +360,11 @@ impl Images {
         if let Some(image) = self.images.get(&(guid, tint, blend)) {
             return Some(image.clone());
         }
+        let screens = self.shared.screens;
         let decoded = self
             .decoded
             .entry(guid)
-            .or_insert_with(|| load_image(install, guid).map(Arc::new))
+            .or_insert_with(|| load_image(screens, install, guid).map(Arc::new))
             .clone()?;
         let image = render(&decoded, tint, blend);
         self.images.insert((guid, tint, blend), image.clone());
@@ -364,7 +387,7 @@ impl Images {
         let decoded = self
             .by_path
             .entry(path.to_owned())
-            .or_insert_with(|| load_path(install, path).map(Arc::new))
+            .or_insert_with(|| load_path(&self.shared, install, path).map(Arc::new))
             .clone()?;
         let image = render(&decoded, tint, blend);
         self.path_images
@@ -411,12 +434,13 @@ impl Images {
         // Built here, not inside a job: its first use runs jobs of its own,
         // and pool workers that block on it while one builds it would wait
         // for jobs only they could run.
+        let shared = &*self.shared;
         if sources.iter().any(Result::is_err) {
-            image_assets(install);
+            image_assets(shared, install);
         }
         let loaded = parallel(&sources, |src| match src {
-            Ok(g) => load_image(install, *g),
-            Err(p) => load_path(install, p),
+            Ok(g) => load_image(shared.screens, install, *g),
+            Err(p) => load_path(shared, install, p),
         });
         for (src, d) in sources.iter().zip(loaded) {
             let d = d.map(Arc::new);
@@ -504,10 +528,9 @@ impl Images {
         if let Some(a) = self.templates.get(&guid) {
             return a.clone();
         }
-        let asset = read_asset(install, guid).map(Arc::new);
+        let asset = read_asset(&self.shared, install, guid).map(Arc::new);
         self.templates.insert(guid, asset.clone());
         if let Some(a) = &asset {
-            phx::register_palette(a);
             self.palettes_of(install, a);
         }
         asset
@@ -541,15 +564,15 @@ impl Images {
             if level.is_empty() {
                 break;
             }
+            let shared = &*self.shared;
             let read = parallel(&level, |&g| {
-                let a = read_asset(install, g).map(Arc::new);
+                let a = read_asset(shared, install, g).map(Arc::new);
                 let next = a.as_deref().map(refs).unwrap_or_default();
                 (a, next)
             });
             let mut next = Vec::new();
             for (&g, (a, refs)) in level.iter().zip(read) {
                 if let Some(a) = &a {
-                    phx::register_palette(a);
                     loaded.push(a.clone());
                 }
                 self.templates.insert(g, a);
@@ -560,10 +583,10 @@ impl Images {
         // Widget trees once every palette they resolve against is in. An
         // asset no reference names (a native template building asks for)
         // is read here as building would.
-        let templates = &self.templates;
+        let (templates, shared) = (&self.templates, &*self.shared);
         self.layout.warm(&loaded, &|g| match templates.get(&g) {
             Some(a) => a.clone(),
-            None => read_asset(install, g).map(Arc::new),
+            None => read_asset(shared, install, g).map(Arc::new),
         });
     }
 
@@ -579,27 +602,28 @@ impl Images {
     }
 }
 
-/// A compiled UI asset by guid: templates are under `generated/`, image
-/// assets under `images/`.
-pub(super) fn read_asset(install: &Install, guid: Guid) -> Option<Asset> {
-    let bytes = install
-        .read(&format!("data/ui/studio/generated/{guid}"))
-        .or_else(|_| install.read(&format!("data/ui/studio/images/{guid}")))
-        .ok()?;
-    Asset::parse(bytes).ok()
+/// A compiled UI asset by guid, from the game's `generated` folder, else
+/// its `images` one, resolving colours through the install's palettes; a
+/// palette is registered with them.
+pub(super) fn read_asset(shared: &super::Shared, install: &Install, guid: Guid) -> Option<Asset> {
+    let asset = Asset::parse(read_compiled(shared.screens, install, guid)?).ok()?;
+    shared.palettes.register(&asset);
+    asset.use_palettes(&shared.palettes);
+    Some(asset)
 }
 
-/// The texture of a UI source path. Sources are named `.png`; the game ships
-/// `<stem>_0.dds`. Assets are authored against `data/ui/fhd/`, and the game
-/// ships only the `4k` set (twice the pixels, same UV rects).
-fn load_texture(install: &Install, path: &str) -> Option<super::gpu::Source> {
-    let source = path.replace('\\', "/");
-    let stem = source.rsplit_once('.').map_or(source.as_str(), |(s, _)| s);
-    let lower = stem.to_ascii_lowercase();
-    [stem, &lower]
-        .iter()
-        .flat_map(|stem| [stem.to_string(), stem.replacen("/fhd/", "/4k/", 1)])
-        .find_map(|stem| install.read(&format!("{stem}_0.dds")).ok())
+fn read_compiled(screens: &Screens, install: &Install, guid: Guid) -> Option<Vec<u8>> {
+    install
+        .read(format!("{}{guid}", screens.generated))
+        .or_else(|_| install.read(format!("{}{guid}", screens.images)))
+        .ok()
+}
+
+/// The texture of a UI source path, as the game names it
+/// (`Screens::textures`: 117's `<stem>.png` ships as `<stem>_0.dds`).
+fn load_texture(screens: &Screens, install: &Install, path: &str) -> Option<super::gpu::Source> {
+    (screens.textures.candidates(path).iter())
+        .find_map(|p| install.read(p).ok())
         .and_then(|b| {
             let dds = Dds::parse(&b).ok()?;
             Some(super::gpu::Source {
@@ -618,13 +642,12 @@ fn path_key(path: &str) -> String {
 }
 
 /// Every ImageAsset of the install by its texture path ([`path_key`]),
-/// read once per process (about 940 assets; one install per process).
-/// Building it runs [`parallel`] jobs: first use must not be from one.
-fn image_assets(install: &Install) -> &'static HashMap<String, Guid> {
-    static INDEX: std::sync::OnceLock<HashMap<String, Guid>> = std::sync::OnceLock::new();
-    INDEX.get_or_init(|| {
+/// read once per install (about 940 assets) into `shared`. Building it
+/// runs [`parallel`] jobs: first use must not be from one.
+fn image_assets<'a>(shared: &'a super::Shared, install: &Install) -> &'a HashMap<String, Guid> {
+    shared.images.get_or_init(|| {
         let mut out = HashMap::new();
-        let Some(folder) = install.folder("data/ui/studio/generated") else {
+        let Some(folder) = install.folder(shared.screens.generated.trim_end_matches('/')) else {
             return out;
         };
         // On every core: a screen's first image loads all wait on this.
@@ -647,11 +670,11 @@ fn image_assets(install: &Install) -> &'static HashMap<String, Guid> {
 /// A texture by source path, as an ImageAsset with it has it: that knows
 /// its design size (4k textures are larger than it) and 9-slice centre.
 /// Else the whole texture at its pixel size.
-fn load_path(install: &Install, path: &str) -> Option<Decoded> {
-    if let Some(&guid) = image_assets(install).get(&path_key(path)) {
-        return load_image(install, guid);
+fn load_path(shared: &super::Shared, install: &Install, path: &str) -> Option<Decoded> {
+    if let Some(&guid) = image_assets(shared, install).get(&path_key(path)) {
+        return load_image(shared.screens, install, guid);
     }
-    let source = Arc::new(load_texture(install, path)?);
+    let source = Arc::new(load_texture(shared.screens, install, path)?);
     let texture = source.rgba.clone();
     Some(Decoded {
         blank: false,
@@ -663,13 +686,10 @@ fn load_path(install: &Install, path: &str) -> Option<Decoded> {
     })
 }
 
-fn load_image(install: &Install, guid: Guid) -> Option<Decoded> {
-    let bytes = install
-        .read(&format!("data/ui/studio/generated/{guid}"))
-        .or_else(|_| install.read(&format!("data/ui/studio/images/{guid}")))
-        .ok()?;
+fn load_image(screens: &Screens, install: &Install, guid: Guid) -> Option<Decoded> {
+    let bytes = read_compiled(screens, install, guid)?;
     let info = phx::image_info(&Asset::parse(bytes).ok()?)?;
-    let source = load_texture(install, &info.path).map(Arc::new);
+    let source = load_texture(screens, install, &info.path).map(Arc::new);
     let texture = source.as_ref().map(|s| s.rgba.clone());
     let blank = texture
         .as_ref()
@@ -865,7 +885,7 @@ pub struct View {
 /// One file instance's evaluated bindings: what each binding read and
 /// wrote, and its template property values.
 pub struct FileEval {
-    pub trace: Arc<phx::binding::Traces>,
+    pub trace: Arc<super::evaluate::Traces>,
     inputs: Option<layout::Values>,
     outputs: Option<layout::Values>,
 }
@@ -881,7 +901,7 @@ impl FileEval {
 }
 
 /// Lays out every widget, expanding containers from their template files
-/// (`phx::layout`: anchors in the parent's Size, stacks, pivots, metrics).
+/// (`layout`: anchors in the parent's Size, stacks, pivots, metrics).
 /// `names` turns class crcs into labels; `texts` resolves LocalizationIds.
 pub fn layout(
     asset: &Asset,
@@ -891,13 +911,12 @@ pub fn layout(
     view: View,
     name: impl Fn(u32) -> String,
 ) -> (Vec<Node>, Vec<Frame>) {
+    // The root comes from the editor, not `read_asset`.
+    asset.use_palettes(&images.shared.palettes);
     // An untyped file (a class version the schema lacks, as after a game
     // patch) has no widget tree: it opens read-only and draws nothing.
     if asset.widgets().is_empty() {
         return (Vec::new(), Vec::new());
-    }
-    if view.sample {
-        super::preview::load_scene_content(install);
     }
     images.load_references(install, asset);
     images.palettes_of(install, asset);
@@ -912,6 +931,8 @@ pub fn layout(
         sample: view
             .sample
             .then_some(super::preview::sample_value as layout::Sampler),
+        list_items: super::preview::Sample::LIST_ITEMS,
+        fields: Some(images.shared.screens.data_fields),
         sample_generation: super::preview::game_data_generation(),
         stale: view.stale,
         ..Default::default()
@@ -919,20 +940,27 @@ pub fn layout(
     // Bindings that read a label's size get it measured with its font, as
     // the label draws.
     let mut cache = std::mem::take(&mut images.layout);
+    let content = super::preview::Sample {
+        data: images.shared.sample_read().cloned(),
+        icon: images.shared.screens.sample_icon,
+        list_items: super::preview::Sample::LIST_ITEMS,
+    };
     let cell = std::cell::RefCell::new(&mut *images);
-    let mut tree = layout::Tree::build_cached(
-        asset,
-        &mut |g| cell.borrow_mut().asset(install, g),
-        &mut |style, text| {
-            let mut im = cell.borrow_mut();
-            let s = im.asset(install, style).and_then(|a| phx::text_style(&a))?;
-            let font = im.font(install, s.font?.id)?;
-            let size = s.size.max(4.);
-            Some(font.width(text, size, s.letter_spacing * size / 1000.))
-        },
-        &opts,
-        &mut cache,
-    );
+    let mut tree = super::preview::with_sample(content, || {
+        layout::Tree::build_cached(
+            asset,
+            &mut |g| cell.borrow_mut().asset(install, g),
+            &mut |style, text| {
+                let mut im = cell.borrow_mut();
+                let s = im.asset(install, style).and_then(|a| phx::text_style(&a))?;
+                let font = im.font(install, s.font?.id)?;
+                let size = s.size.max(4.);
+                Some(font.width(text, size, s.letter_spacing * size / 1000.))
+            },
+            &opts,
+            &mut cache,
+        )
+    });
     images.layout = cache;
     if tree.nodes.is_empty() {
         return (Vec::new(), Vec::new());
@@ -956,7 +984,7 @@ pub fn layout(
     }
     let prev = tree.previous().to_vec();
     let was = |i: usize| match prev.get(i) {
-        Some(&m) if m != layout::NOT_KEPT => Some(m as usize),
+        Some(&m) if m != layout::Tree::NOT_KEPT => Some(m as usize),
         _ => None,
     };
     let mut set: Vec<(Option<[f32; 2]>, [f32; 2])> = vec![(None, [0.; 2]); tree.nodes.len()];
@@ -1046,6 +1074,7 @@ pub fn layout(
                 && tree.instance[i].and_then(|c| keys.get(&c)) == Some(&key)
         }
     };
+    let player_color = images.shared.screens.sample_player_color;
     // Per node: the tint it draws with and its blend mode.
     let mut tints: Vec<[u8; 3]> = Vec::with_capacity(tree.nodes.len());
     let mut drawn: Vec<(Option<[u8; 3]>, u32)> = Vec::with_capacity(tree.nodes.len());
@@ -1060,7 +1089,7 @@ pub fn layout(
         // Game code tints player-colour layers (the governor portrait's
         // disc); sample data shows the reference player's red.
         if sample && tint.is_none_or(|t| t == [255; 3]) && st.player_color {
-            tint = Some(SAMPLE_PLAYER_COLOR);
+            tint = Some(player_color);
         }
         let inherited = tree.parent[i].map_or([255; 3], |p| tints[p]);
         let own = tint.unwrap_or([255; 3]);
@@ -1957,12 +1986,13 @@ impl Static {
         install: &Install,
         images: &mut Images,
     ) -> Vec<Static> {
+        let screens = images.shared.screens;
         let root_components = widgets.first().map(|r| f.components(r)).unwrap_or_default();
         widgets
             .iter()
             .map(|widget| {
                 let own = f.components(widget);
-                let comps: Vec<&layout::Component> = if widget.parent == Some(0) {
+                let comps: Vec<&phx::Component> = if widget.parent == Some(0) {
                     own.iter().chain(&root_components).collect()
                 } else {
                     own.iter().collect()
@@ -1976,7 +2006,7 @@ impl Static {
                 let mask_fx = effects
                     .iter()
                     .find(|e| e.template.is_some_and(|g| g.to_string() == EFFECT_MASK));
-                let label = f.label(widget);
+                let label = widget.label();
                 let style = label
                     .as_ref()
                     .and_then(|l| l.style)
@@ -1989,10 +2019,10 @@ impl Static {
                 Static {
                     name: widget.name.as_deref().map(Arc::from),
                     blend: enum_prop(widget, "BlendingMode"),
-                    image: f.widget_image(widget),
+                    image: widget.image(),
                     radial_item: has(COMPONENT_RADIAL_ITEM),
-                    infotip_area: has(COMPONENT_INFOTIP_AREA),
-                    drop_zone: has(COMPONENT_DROP_ZONE),
+                    infotip_area: screens.infotip_area.is_some_and(&has),
+                    drop_zone: screens.drop_zone.is_some_and(&has),
                     label,
                     style,
                     font,
@@ -2065,27 +2095,14 @@ fn bool_prop(widget: &Widget, name: &str) -> bool {
         .any(|p| p.name == Some(name) && p.value == Value::Bool(true))
 }
 
-/// What player-colour layers show with sample data (player 1's red).
-const SAMPLE_PLAYER_COLOR: [u8; 3] = [140, 28, 36];
+// The Phoenix templates below ship in 117 and 1800 alike; one game's own
+// (117's InfoTipArea and DropZone) are its `Screens` data.
 
 /// ComponentTemplate of radial menu items (custom properties Position,
 /// Rotation, AngleSize, SkipAnimations, DisableWobbling): the game spreads
 /// them round a circle at runtime (minimap sectors, construction radial),
 /// so their stored placement is meaningless on its own.
 const COMPONENT_RADIAL_ITEM: &str = "5065a655-d1cc-4a8a-824e-d167d02099ec";
-
-/// ComponentTemplate `InfoTipArea`: the hover zone that opens an infotip.
-/// Its template's images (`LayoutArea`, a blue `Preview`) only show the
-/// zone in the designer.
-const COMPONENT_INFOTIP_AREA: &str = "41f69505-a029-4bdb-bd17-6ab85420c93f";
-
-/// ComponentTemplate DropZone (Enabled, AllowedDragType, IsValidDropTarget,
-/// IsCurrentDropTarget, DropSuccessful). The construction bar's pin slots
-/// stack three of them (Entry, Pin, PinMaterial) over every slot; none of
-/// their bindings hides them, and in game they only show while a building
-/// is dragged.
-/// TODO(alex): which native call toggles them is not read from the exe.
-const COMPONENT_DROP_ZONE: &str = "7831a47e-2d9c-4945-afda-0ab73f55074b";
 
 // EffectTemplate guids (`PHXEF`, no names in the asset; read from usage:
 // every carrier of the blur is named `*_Blur`, the mask effect's custom
@@ -2929,15 +2946,53 @@ mod tests {
 
     /// `asset` laid out in `view`, with fresh images and no game texts.
     fn lay(install: &Install, asset: &Asset, view: View) -> (Vec<Node>, Vec<Frame>) {
+        let mut images = Images::new(crate::ui::test_support::shared(install));
+        if view.sample {
+            images.shared.sample(install);
+        }
         let name = |c: u32| format!("{c:08x}");
-        layout(
-            asset,
-            install,
-            &mut Images::default(),
-            &HashMap::new(),
-            view,
-            name,
-        )
+        layout(asset, install, &mut images, &HashMap::new(), view, name)
+    }
+
+    // Each editor's index is its own install's: 117's, then 1800's in the
+    // same process, then 117's again, each from a fresh editor's caches.
+    #[test]
+    fn switching_installs_rebuilds_the_image_index() {
+        use crate::games::GameExt;
+        let installs = [
+            anno_core::game::Game::Anno117,
+            anno_core::game::Game::Anno1800,
+        ]
+        .map(|g| g.environment_dir());
+        let [Some(d117), Some(d1800)] = installs else {
+            eprintln!("skip: ANNO117_DIR or ANNO1800_DIR unset");
+            return;
+        };
+        let [i117, i1800] = [
+            (anno_core::game::Game::Anno117, d117),
+            (anno_core::game::Game::Anno1800, d1800),
+        ]
+        .map(|(g, d)| Install::open(d, g.profile().archive_families).unwrap());
+        let s117 = crate::ui::test_support::shared(&i117);
+        let a117 = image_assets(&s117, &i117).clone();
+        let s1800 = crate::ui::test_support::shared(&i1800);
+        let a1800 = image_assets(&s1800, &i1800).clone();
+        assert!(!a117.is_empty() && !a1800.is_empty());
+        let only_1800 = a1800
+            .keys()
+            .find(|k| !a117.contains_key(*k))
+            .expect("an 1800 texture");
+        let only_117 = a117
+            .keys()
+            .find(|k| !a1800.contains_key(*k))
+            .expect("a 117 texture");
+        assert!(
+            load_path(&s1800, &i1800, only_1800).is_some(),
+            "{only_1800}"
+        );
+        let again = crate::ui::test_support::shared(&i117);
+        assert!(image_assets(&again, &i117).contains_key(only_117));
+        assert!(!image_assets(&again, &i117).contains_key(only_1800));
     }
 
     /// Design view with bindings run.
@@ -3590,7 +3645,7 @@ mod tests {
     #[test]
     fn textures_by_path_take_their_image_asset() {
         let Some(install) = install() else { return };
-        let image = Images::default()
+        let image = Images::new(crate::ui::test_support::shared(&install))
             .by_path(
                 &install,
                 "data\\ui\\fhd\\base\\ds\\deco\\deco_roman_1side_40x12.png",
@@ -3721,7 +3776,7 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         let name = |c: u32| format!("{c:08x}");
-        let mut warm = Images::default();
+        let mut warm = Images::new(crate::ui::test_support::shared(&install));
         let (before, frames) = layout(&asset, &install, &mut warm, &HashMap::new(), game(), name);
         // Move the first widget the file stores a Position for.
         let span = frames.iter().find_map(|f| f.position_span).unwrap();
@@ -3764,7 +3819,7 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         let name = |c: u32| format!("{c:08x}");
-        let mut warm = Images::default();
+        let mut warm = Images::new(crate::ui::test_support::shared(&install));
         let (before, _) = layout(
             &asset,
             &install,
@@ -3821,6 +3876,9 @@ mod tests {
     // between them, vector component axes and bound text.
     #[test]
     fn worklist_evaluation_matches_full_sweeps() {
+        let _flags = crate::ui::preview::FLAG_TESTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let Some(install) = install() else { return };
         for file in [
             "hippodromeeventtestracescene",
@@ -3829,23 +3887,44 @@ mod tests {
         ] {
             let asset = read(&install, file);
             let run = |full: bool| {
-                phx::binding::set_full_sweeps(full);
+                crate::ui::evaluate::set_full_sweeps(full);
                 let nodes = lay(&install, &asset, game()).0;
-                phx::binding::set_full_sweeps(false);
+                crate::ui::evaluate::set_full_sweeps(false);
                 nodes
-                    .iter()
-                    .map(|n| {
-                        (
-                            n.rect.map(f32::to_bits),
-                            n.visible,
-                            n.opacity.to_bits(),
-                            n.text.clone(),
-                            n.color,
-                        )
-                    })
-                    .collect::<Vec<_>>()
             };
-            assert!(run(false) == run(true), "{file}");
+            let (worklist, full) = (run(false), run(true));
+            assert_eq!(worklist.len(), full.len(), "{file}: node count");
+            for (i, (a, b)) in worklist.iter().zip(&full).enumerate() {
+                let what = |n: &Node| {
+                    (
+                        n.rect.map(f32::to_bits),
+                        n.visible,
+                        n.opacity.to_bits(),
+                        n.text.clone(),
+                        n.color,
+                    )
+                };
+                assert!(
+                    what(a) == what(b),
+                    "{file}: node {i} {} (widget {}, item {}, depth {})\n\
+                     worklist: rect {:?} visible {} opacity {} text {:?} color {:?}\n\
+                     full:     rect {:?} visible {} opacity {} text {:?} color {:?}",
+                    a.name,
+                    a.widget,
+                    a.item,
+                    a.depth,
+                    a.rect,
+                    a.visible,
+                    a.opacity,
+                    a.text,
+                    a.color,
+                    b.rect,
+                    b.visible,
+                    b.opacity,
+                    b.text,
+                    b.color,
+                );
+            }
         }
     }
 
@@ -3883,7 +3962,12 @@ mod tests {
     fn archive_header_reads_its_localized_title() {
         let Some(install) = install() else { return };
         let texts = install
-            .read(install.game().profile().texts_path)
+            .read(
+                crate::games::module(crate::games::of(&install))
+                    .database()
+                    .unwrap()
+                    .texts_path,
+            )
             .map(|b| phx::parse_texts(&String::from_utf8_lossy(&b)))
             .unwrap();
         let asset = read(&install, "e5be560d-d94b-4f25-ad7a-13118b1c2c13");
@@ -3891,7 +3975,7 @@ mod tests {
         let (nodes, _) = layout(
             &asset,
             &install,
-            &mut Images::default(),
+            &mut Images::new(crate::ui::test_support::shared(&install)),
             &texts,
             game(),
             name,

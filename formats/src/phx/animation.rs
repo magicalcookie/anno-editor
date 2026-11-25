@@ -18,19 +18,7 @@ use std::collections::HashMap;
 
 use anyhow::{Context, Result, bail, ensure};
 
-use super::{Asset, DefaultValue, ObjectId, Record, Splice, Value, name_crc};
-
-const CLASS_CLIP: u32 = name_crc(b"AnimationInstance");
-const PROP_CLIPS: u32 = name_crc(b"AnimationInstances");
-const PROP_TRACKS: u32 = name_crc(b"Tracks");
-const PROP_TARGET: u32 = 0x1935_a21e;
-const PROP_KEYS: u32 = name_crc(b"Track");
-const PROP_TIME: u32 = name_crc(b"Time");
-const PROP_EASE: u32 = 0x8f7a_a617;
-const PROP_VALUE: u32 = name_crc(b"Value");
-const PROP_FRAME_RATE: u32 = name_crc(b"FrameRate");
-const PROP_DURATION: u32 = name_crc(b"Duration");
-const PROP_NAME: u32 = super::PROP_NAME;
+use super::{Asset, Class, DefaultValue, ObjectId, Prop, Record, Splice, Value, name_crc};
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Key {
@@ -62,7 +50,7 @@ pub struct Clip {
     pub id: Option<super::Guid>,
     pub name: String,
     pub frame_rate: u32,
-    pub frames: u32,
+    pub(crate) frames: u32,
     pub tracks: Vec<Track>,
     /// Spans of the stored name and Duration, for editing in place.
     pub name_span: Option<usize>,
@@ -70,23 +58,6 @@ pub struct Clip {
 }
 
 impl Clip {
-    /// Plays when a screen opens, by the names shipped clips use: `Anim_In`,
-    /// `Content_In`, `FadeIn`, `Show`, `Open`. Clips that react to input or
-    /// data (`ShowInteractionBG`, `ScrollbarAppear`, the governors bar's
-    /// `Data_Change_in`, which swaps its second row to another party's
-    /// island) do not count.
-    pub fn opens(&self) -> bool {
-        let n = self.name.to_ascii_lowercase();
-        if n.contains("change") {
-            return false;
-        }
-        n.ends_with("_in")
-            || matches!(
-                n.as_str(),
-                "in" | "fadein" | "fade_in" | "show" | "open" | "appear"
-            )
-    }
-
     /// Length in seconds: the stored duration, or the last key when that
     /// is later.
     pub fn duration(&self) -> f32 {
@@ -234,10 +205,10 @@ impl Asset {
         let Some((root, _)) = self.objects().next() else {
             return Vec::new();
         };
-        self.values_of(root, PROP_CLIPS)
+        self.values_of(root, Prop::CLIPS)
             .into_iter()
             .filter_map(|c| match &self.spans[c].record {
-                Record::Object(h) if h.class == CLASS_CLIP => Some(match h.id {
+                Record::Object(h) if h.class == Class::CLIP => Some(match h.id {
                     ObjectId::Id(g) => Some(g),
                     _ => None,
                 }),
@@ -258,10 +229,10 @@ impl Asset {
                     _ => None,
                 })
         };
-        self.values_of(root, PROP_CLIPS)
+        self.values_of(root, Prop::CLIPS)
             .into_iter()
             .filter(
-                |&c| matches!(&self.spans[c].record, Record::Object(h) if h.class == CLASS_CLIP),
+                |&c| matches!(&self.spans[c].record, Record::Object(h) if h.class == Class::CLIP),
             )
             .map(|c| Clip {
                 id: match &self.spans[c].record {
@@ -272,24 +243,24 @@ impl Asset {
                     _ => None,
                 },
                 name: self
-                    .values_of(c, PROP_NAME)
+                    .values_of(c, Prop::NAME)
                     .first()
                     .and_then(|&s| match &self.spans[s].record {
                         Record::Str(t) => Some(t.text.clone()),
                         _ => None,
                     })
                     .unwrap_or_default(),
-                frame_rate: u32_of(c, PROP_FRAME_RATE).unwrap_or(60),
-                frames: u32_of(c, PROP_DURATION).unwrap_or(0),
-                name_span: self.values_of(c, PROP_NAME).first().copied(),
-                frames_span: self.values_of(c, PROP_DURATION).first().copied(),
+                frame_rate: u32_of(c, Prop::FRAME_RATE).unwrap_or(60),
+                frames: u32_of(c, Prop::DURATION).unwrap_or(0),
+                name_span: self.values_of(c, Prop::NAME).first().copied(),
+                frames_span: self.values_of(c, Prop::DURATION).first().copied(),
                 tracks: self
-                    .values_of(c, PROP_TRACKS)
+                    .values_of(c, Prop::TRACKS)
                     .into_iter()
                     .filter_map(|tr| {
-                        let target = u32_of(tr, PROP_TARGET)? as usize;
+                        let target = u32_of(tr, Prop::TRACK_TARGET)? as usize;
                         let keys = self
-                            .values_of(tr, PROP_KEYS)
+                            .values_of(tr, Prop::KEYS)
                             .into_iter()
                             .map(|k| self.key(k))
                             .collect();
@@ -307,15 +278,15 @@ impl Asset {
         };
         for p in self.object_props(k) {
             match (p.crc, p.value) {
-                (PROP_TIME, Value::F32(t)) => {
+                (Prop::TIME, Value::F32(t)) => {
                     key.time = t;
                     key.time_span = Some(p.span);
                 }
-                (PROP_EASE, Value::Enum { value, .. }) => {
+                (Prop::EASE, Value::Enum { value, .. }) => {
                     key.ease = value;
                     key.ease_span = Some(p.span);
                 }
-                (PROP_VALUE, v) => {
+                (Prop::VALUE, v) => {
                     key.value_span = Some(p.span);
                     key.value = match v {
                         Value::F32(x) => Some(DefaultValue::F32(x.to_bits())),
@@ -457,9 +428,7 @@ pub struct NewKey {
 
 fn key_bytes(kind: TrackKind, k: &NewKey, out: &mut Vec<u8>) -> Result<()> {
     let (_, key) = kind.classes();
-    out.extend_from_slice(&[0x02, 0x00]);
-    out.extend_from_slice(&key.to_le_bytes());
-    out.extend_from_slice(&[0x04, 0x70]);
+    super::new_object(out, super::ObjectId::None, key);
     out.extend_from_slice(&k.time.to_bits().to_le_bytes());
     out.extend_from_slice(&k.ease.to_le_bytes());
     kind.encode(&k.value, out)
@@ -471,12 +440,14 @@ impl Asset {
     pub fn add_clip(&self, name: &str, fps: u32, frames: u32) -> Result<Asset> {
         let (root, _) = self.objects().next().context("empty file")?;
         let clips = self
-            .array(root, PROP_CLIPS)
+            .array(root, Prop::CLIPS)
             .context("this file stores no AnimationInstances")?;
-        let mut c = vec![0x02, 0x02];
-        c.extend_from_slice(&super::Guid::random().0);
-        c.extend_from_slice(&CLASS_CLIP.to_le_bytes());
-        c.extend_from_slice(&[0x06, 0x7c]);
+        let mut c = Vec::new();
+        super::new_object(
+            &mut c,
+            super::ObjectId::Id(super::Guid::random()),
+            Class::CLIP,
+        );
         c.extend_from_slice(&fps.max(1).to_le_bytes());
         c.extend_from_slice(&frames.to_le_bytes());
         c.push(0);
@@ -485,7 +456,7 @@ impl Asset {
         let mut splices = Vec::new();
         let mut counts = HashMap::new();
         super::binding::append(self, &mut splices, &mut counts, &clips, vec![c]);
-        self.finish(splices, counts, &[CLASS_CLIP])
+        self.finish(splices, counts, &[Class::CLIP])
     }
 
     /// Adds a track to clip `clip` (index into [`Asset::clips`]) writing
@@ -509,31 +480,30 @@ impl Asset {
         );
         let (root, _) = self.objects().next().context("empty file")?;
         let &object = self
-            .values_of(root, PROP_CLIPS)
+            .values_of(root, Prop::CLIPS)
             .iter()
             .filter(
-                |&&c| matches!(&self.spans[c].record, Record::Object(h) if h.class == CLASS_CLIP),
+                |&&c| matches!(&self.spans[c].record, Record::Object(h) if h.class == Class::CLIP),
             )
             .nth(clip)
             .context("no such clip")?;
         let tracks = self
-            .array(object, PROP_TRACKS)
+            .array(object, Prop::TRACKS)
             .context("the clip stores no track list")?;
         let mut plan = super::binding::SlotPlan::new(self, widgets)?;
         let at = plan.resolve(target)?;
         let slot = plan.number(&at);
         let (track_class, key_class) = kind.classes();
-        let mut t = vec![0x02, 0x00];
-        t.extend_from_slice(&track_class.to_le_bytes());
-        t.extend_from_slice(&[0x03, 0x60]);
+        let mut t = Vec::new();
+        super::new_object(&mut t, super::ObjectId::None, track_class);
         t.extend_from_slice(&slot.to_le_bytes());
-        super::write_varint(&mut t, keys.len() as u32);
+        crate::varint::write(&mut t, keys.len() as u32);
         for k in keys {
             key_bytes(kind, k, &mut t)?;
         }
         let (mut splices, mut counts) = plan.finish();
         super::binding::append(self, &mut splices, &mut counts, &tracks, vec![t]);
-        let mut classes = super::binding::SLOT_CLASSES.to_vec();
+        let mut classes = super::binding::SlotPlan::CLASSES.to_vec();
         classes.extend([track_class, key_class]);
         self.finish(splices, counts, &classes)
     }
@@ -603,7 +573,7 @@ impl Asset {
 
 #[cfg(test)]
 mod tests {
-    use super::{Clip, Key, ease, sample_track};
+    use super::{Key, ease, sample_track};
     use crate::phx::DefaultValue;
 
     #[test]
@@ -645,23 +615,5 @@ mod tests {
         let hold = [key(0.0, 0, 3.0), key(1.0, 0, 7.0)];
         assert_eq!(at(&hold, 0.99), 3.0);
         assert_eq!(at(&hold, 1.0), 7.0);
-    }
-
-    #[test]
-    fn opening_clips_by_name() {
-        let clip = |name: &str| Clip {
-            id: None,
-            name: name.into(),
-            frame_rate: 60,
-            frames: 0,
-            tracks: Vec::new(),
-            name_span: None,
-            frames_span: None,
-        };
-        assert!(clip("Anim_In").opens());
-        assert!(clip("FadeIn").opens());
-        // Swaps the governors bar's second row to another party's island.
-        assert!(!clip("Data_Change_in").opens());
-        assert!(!clip("ScrollbarAppear").opens());
     }
 }

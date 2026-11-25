@@ -8,14 +8,14 @@ pub mod design;
 pub mod dock;
 pub mod field;
 pub mod gizmo;
-// Needs GPUI's windows on gpui_wgpu: Linux, and Windows via vendor/zed.
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+// Needs GPUI's windows on gpui_wgpu: Linux, Windows and macOS (vendor/zed).
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 pub mod gpu;
 pub mod heightfield;
 pub mod history;
 pub mod icon;
 pub mod math;
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 pub mod model_view;
 pub mod paint;
 pub mod pick;

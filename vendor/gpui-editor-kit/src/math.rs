@@ -129,6 +129,15 @@ pub fn bounds(points: impl IntoIterator<Item = Vec3>) -> [Vec3; 2] {
     b
 }
 
+/// The box holding both boxes. Empty ones (`bounds` of nothing) add
+/// nothing: taken as points, their infinite corners made the union infinite.
+pub fn union(a: [Vec3; 2], b: [Vec3; 2]) -> [Vec3; 2] {
+    [
+        std::array::from_fn(|i| a[0][i].min(b[0][i])),
+        std::array::from_fn(|i| a[1][i].max(b[1][i])),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -3,120 +3,57 @@
 // offers.
 //
 // The file is a schema-driven object stream. The 16-byte header, the class
-// table and the layout section decode fully. The body is objects
+// table and the heap section decode fully. The body is objects
 // (`02 <id form> <class crc> <prop count> <presence mask>`) followed by their
 // property values in class order. The per-class property lists come from the
 // exes' runtime registries (formats/data/<game>/classes.tsv, read by
-// phx/tables.rs), picked per class by the schema hash in the file's class table. Assets that use a
-// class or version the table lacks fall back to a scan that claims strings,
-// references and colors and keeps the rest opaque.
+// phx/tables.rs), picked per class by the schema hash in the file's class
+// table. Assets that use a class or version the tables lack fall back to a
+// scan that claims strings, references and colors and keeps the rest opaque.
 //
-// Widget trees, geometry and image lookup live in phx/widget.rs.
+// Widget trees, components, geometry and image lookup live in phx/widget.rs.
+// Evaluating a screen's layout and bindings is the shell's (src/ui/layout.rs,
+// src/ui/evaluate.rs).
 
 pub mod animation;
 pub mod binding;
 mod pwl;
-pub use pwl::{
-    EnumEntry, EnumInfo, TemplateInfo, TypeProperty, enum_entry_name, enum_info, enum_named,
-    enum_of_type, property_description, register_sources, unique_entry_name, widget_type_info,
-};
+pub use pwl::{EnumEntry, EnumInfo, SourceDirs, Sources, TemplateInfo};
 
-/// A game-object field's name by its property id (`TextData`, `Text`): the
-/// exe's property rows, then its event and action rows (the scene
-/// transition's ShowSingle) and Anno 1800's names for ids files kept from it
-/// use (the construction bar's ConstructionBarData).
-pub fn data_field_name(id: u32) -> Option<&'static str> {
-    tables::data_field(id)
-        .map(|f| f.1)
-        .or_else(|| tables::named_id(id))
-}
-
-/// A component's or effect's custom property by UniqueId, from the shipped
-/// component JSON: (component, property), `("Tween", "Started")`. For paths
-/// whose component instance sits in a template that does not ship.
-pub fn component_property_name(id: u32) -> Option<(&'static str, &'static str)> {
-    tables::component_prop(id)
-}
-
-/// A game-object field's PropertyType code by its property id (0 bool,
-/// 1 int, 3 float, 4 string…); None for objects and unknown types.
-pub fn data_field_type(id: u32) -> Option<u32> {
-    // Ids the stubs type one way and the screens use another (ids collide
-    // across classes): unknown. Indentation (0x20e047c1) is Boolean in the
-    // stubs, and the screens pass it on into Float properties 15 times.
-    const UNSURE: [u32; 1] = [0x20e0_47c1];
-    tables::data_field(id)
-        .map(|f| f.2)
-        .filter(|&t| t != u32::MAX && !UNSURE.contains(&id))
-}
-pub mod layout;
 mod tables;
+pub use tables::DataFields;
 mod widget;
 
 pub use widget::{
-    AtlasRegion, Geometry, ImageInfo, LabelText, PropValue, Removed, TextStyle, Widget, WidgetCopy,
-    WidgetImage, atlas_regions, font_file, image_info, localization_line_id, localized_font,
-    parse_texts, register_palette, text_style,
+    Component, Geometry, ImageInfo, LabelText, Palettes, PropValue, Removed, TextStyle, Widget,
+    WidgetCopy, WidgetImage, font_file, image_info, localization_line_id, localized_font,
+    parse_texts, text_style,
 };
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::ops::Range;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result, bail, ensure};
 
-use crate::game::Game;
+use crate::varint;
 
-const HEADER_LEN: usize = 0x10;
+// Every record: a name or class crc is a u32, an id 16 bytes.
+const CRC: usize = size_of::<u32>();
+const ID: usize = size_of::<Guid>();
 
-/// The CustomPropertyInstance class.
-pub const CLASS_CUSTOM_PROPERTY: u32 = name_crc(b"CustomPropertyInstance");
-/// Color: three RGB bytes, no alpha on the wire.
-pub const CLASS_COLOR: u32 = name_crc(b"Color");
-/// ColorType: optional palette reference, palette entry, `Color`.
-pub const CLASS_COLOR_TYPE: u32 = name_crc(b"ColorType");
-/// The EnumAsset class.
-pub const CLASS_ENUM_ASSET: u32 = name_crc(b"EnumAsset");
-
-// Color: 4 properties, 1..=3 present (R, G, B). Seen 6344 times, no variant.
-const COLOR_PROPS: u8 = 4;
-const COLOR_MASK: u8 = 0x70;
-
-// Longest real string is 232 bytes. Bare (crc-less) string candidates past
-// this are noise in float runs, not text.
+// Scanner policy. Longest real string is 232 bytes. Bare (crc-less) string
+// candidates past this, or shorter than the minimum, are noise in float
+// runs, not text; so are lengths whose varint takes more than two bytes.
 const MAX_SCAN_STR: usize = 4096;
+const MIN_SCAN_STR: u32 = 4;
+const MAX_SCAN_LEN_VARINT: usize = 2;
 // Classes per file top out around 60; the varint is untrusted input.
 const MAX_TYPES: u32 = 4096;
-const MAX_LAYOUT_TOKENS: u32 = 1 << 22;
+const MAX_ALLOCATIONS: u32 = 1 << 22;
 
-/// The 21 asset kinds of the runtime kind table:
-/// magic letters, kind id, crc32 of the root class.
-pub const KINDS: [([u8; 2], u8, u32); 21] = [
-    (*b"SC", 0x00, name_crc(b"SceneTemplate")),
-    (*b"WI", 0x01, name_crc(b"ContainerWidgetTemplate")),
-    (*b"IM", 0x02, name_crc(b"ImageAsset")),
-    (*b"VI", 0x04, name_crc(b"VideoAsset")),
-    (*b"FT", 0x05, name_crc(b"FontBaseAsset")),
-    (*b"TS", 0x06, name_crc(b"TextStyleBaseAsset")),
-    (*b"GO", 0x07, name_crc(b"GameObjectTemplate")),
-    (*b"BE", 0x0b, name_crc(b"WidgetTypeTemplate")),
-    (*b"LF", 0x0c, name_crc(b"LocalizedFontAsset")),
-    (*b"TA", 0x0d, name_crc(b"ImageAtlasAsset")),
-    (*b"CS", 0x0e, 0x2529_e5ff),
-    (*b"FD", 0x0f, name_crc(b"FontDescriptorAsset")),
-    (*b"EF", 0x10, name_crc(b"EffectTemplate")),
-    (*b"EN", 0x11, name_crc(b"EnumAsset")),
-    (*b"CP", 0x12, name_crc(b"ComponentTemplate")),
-    (*b"PA", 0x13, name_crc(b"ColorPaletteAsset")),
-    (*b"LG", 0x14, 0xe152_3167),
-    (*b"VS", 0x15, name_crc(b"VectorShapeAsset")),
-    (*b"EC", 0x16, name_crc(b"FallbackFontGroup")),
-    (*b"FF", 0x18, name_crc(b"FallbackFontAsset")),
-    (*b"CO", 0x19, 0x6bf4_061d),
-];
-
-pub fn crc32(bytes: &[u8]) -> u32 {
+fn crc32(bytes: &[u8]) -> u32 {
     crc32fast::hash(bytes)
 }
 
@@ -150,9 +87,27 @@ pub const fn name_crc(name: &[u8]) -> u32 {
 pub struct Guid(pub [u8; 16]);
 
 impl Guid {
+    /// Wire byte `k` holds byte `WIRE_ORDER[k]` of the text form: the first
+    /// three groups little-endian, the rest as written. The order is its own
+    /// inverse, so it maps text to wire and back.
+    const WIRE_ORDER: [usize; 16] = [3, 2, 1, 0, 5, 4, 7, 6, 8, 9, 10, 11, 12, 13, 14, 15];
+    /// Where the text form's dashes go: before these bytes.
+    const DASHES: [usize; 4] = [4, 6, 8, 10];
+
+    /// `text`, the 16 bytes in text order, in wire order.
+    const fn from_text_order(text: [u8; 16]) -> Guid {
+        let mut out = [0u8; 16];
+        let mut k = 0;
+        while k < 16 {
+            out[k] = text[Guid::WIRE_ORDER[k]];
+            k += 1;
+        }
+        Guid(out)
+    }
+
     /// A new version-4 style id. Seeded from the std hasher's per-process
     /// random keys, a clock and a counter; ids only need to be unique.
-    pub fn random() -> Guid {
+    fn random() -> Guid {
         use std::hash::{BuildHasher, Hasher};
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -161,18 +116,18 @@ impl Guid {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos() as u64);
         let mut b = [0u8; 16];
-        for (k, chunk) in b.chunks_mut(8).enumerate() {
+        for (k, chunk) in b.chunks_mut(size_of::<u64>()).enumerate() {
             let mut h = std::collections::hash_map::RandomState::new().build_hasher();
             h.write_u64(now);
             h.write_u64(n);
             h.write_usize(k);
             chunk.copy_from_slice(&h.finish().to_le_bytes());
         }
-        // Mixed-endian layout: the version nibble is the high nibble of
-        // byte 7, the variant the top bits of byte 8.
-        b[7] = (b[7] & 0x0f) | 0x40;
+        // In text order, the version is the high nibble of byte 6 and the
+        // variant the top bits of byte 8.
+        b[6] = (b[6] & 0x0f) | 0x40;
         b[8] = (b[8] & 0x3f) | 0x80;
-        Guid(b)
+        Guid::from_text_order(b)
     }
 
     /// [`Guid::parse`] at compile time, for guid constants compared in hot
@@ -199,18 +154,7 @@ impl Guid {
             i += 1;
         }
         assert!(n == 32, "a guid has 32 digits");
-        // Same byte order as `parse`: the first three groups little-endian.
-        let mut out = g;
-        let mut k = 0;
-        while k < 4 {
-            out[k] = g[3 - k];
-            k += 1;
-        }
-        out[4] = g[5];
-        out[5] = g[4];
-        out[6] = g[7];
-        out[7] = g[6];
-        Guid(out)
+        Guid::from_text_order(g)
     }
 
     /// Parses the canonical `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` form (any
@@ -224,23 +168,17 @@ impl Guid {
         for (i, pair) in hex.chunks(2).enumerate() {
             g[i] = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
         }
-        g[0..4].reverse();
-        g[4..6].reverse();
-        g[6..8].reverse();
-        Some(Guid(g))
+        Some(Guid::from_text_order(g))
     }
 }
 
 impl fmt::Display for Guid {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let b = &self.0;
-        write!(
-            f,
-            "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-",
-            b[3], b[2], b[1], b[0], b[5], b[4], b[7], b[6], b[8], b[9]
-        )?;
-        for x in &b[10..] {
-            write!(f, "{x:02x}")?;
+        for (k, &at) in Guid::WIRE_ORDER.iter().enumerate() {
+            if Guid::DASHES.contains(&k) {
+                f.write_str("-")?;
+            }
+            write!(f, "{:02x}", self.0[at])?;
         }
         Ok(())
     }
@@ -255,24 +193,42 @@ impl fmt::Debug for Guid {
 /// Bytes 0x00..0x10, kept whole. Bytes 8..16 (`09 01 ce f4 b1 ba f0 1c`) are
 /// identical in all 733 shipped assets; nothing in the header depends on size.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Header(pub [u8; HEADER_LEN]);
+pub struct Header(pub [u8; Header::LEN]);
 
 impl Header {
-    /// The two kind letters after `PHX`, e.g. `WI`.
-    pub fn kind(&self) -> [u8; 2] {
-        [self.0[3], self.0[4]]
-    }
+    const LEN: usize = 0x10;
+
+    /// The 21 asset kinds of the runtime kind table:
+    /// magic letters, kind id, crc32 of the root class.
+    const KINDS: [([u8; 2], u8, u32); 21] = [
+        (*b"SC", 0x00, name_crc(b"SceneTemplate")),
+        (*b"WI", 0x01, name_crc(b"ContainerWidgetTemplate")),
+        (*b"IM", 0x02, name_crc(b"ImageAsset")),
+        (*b"VI", 0x04, name_crc(b"VideoAsset")),
+        (*b"FT", 0x05, name_crc(b"FontBaseAsset")),
+        (*b"TS", 0x06, name_crc(b"TextStyleBaseAsset")),
+        (*b"GO", 0x07, name_crc(b"GameObjectTemplate")),
+        (*b"BE", 0x0b, name_crc(b"WidgetTypeTemplate")),
+        (*b"LF", 0x0c, name_crc(b"LocalizedFontAsset")),
+        (*b"TA", 0x0d, name_crc(b"ImageAtlasAsset")),
+        (*b"CS", 0x0e, 0x2529_e5ff),
+        (*b"FD", 0x0f, name_crc(b"FontDescriptorAsset")),
+        (*b"EF", 0x10, name_crc(b"EffectTemplate")),
+        (*b"EN", 0x11, name_crc(b"EnumAsset")),
+        (*b"CP", 0x12, name_crc(b"ComponentTemplate")),
+        (*b"PA", 0x13, name_crc(b"ColorPaletteAsset")),
+        (*b"LG", 0x14, 0xe152_3167),
+        (*b"VS", 0x15, name_crc(b"VectorShapeAsset")),
+        (*b"EC", 0x16, name_crc(b"FallbackFontGroup")),
+        (*b"FF", 0x18, name_crc(b"FallbackFontAsset")),
+        (*b"CO", 0x19, 0x6bf4_061d),
+    ];
+
+    /// Bytes 0..3; the kind letters (`Header::KINDS`) follow.
+    const MAGIC: [u8; 3] = *b"PHX";
+
     pub fn kind_str(&self) -> String {
         String::from_utf8_lossy(&self.0[3..5]).into_owned()
-    }
-    /// Phoenix DataVersion: `1c 09 01` = 28.9.1 (also 28.7.1, 28.0.1).
-    pub fn data_version(&self) -> [u8; 3] {
-        [self.0[5], self.0[6], self.0[7]]
-    }
-    /// Kind id and root class crc from the runtime kind table, if known.
-    pub fn kind_info(&self) -> Option<(u8, u32)> {
-        let k = self.kind();
-        KINDS.iter().find(|e| e.0 == k).map(|e| (e.1, e.2))
     }
 }
 
@@ -280,55 +236,59 @@ impl Header {
 /// schema hash is what the earlier notes called the per-kind "schema guid".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypeEntry {
-    pub class: u32,
+    class: u32,
     /// Per-class schema hash, byte-identical to the runtime registry block.
-    pub schema: [u8; 16],
-    /// Heap instances of this class in the file (= its `0x40` layout tokens).
+    schema: [u8; 16],
+    /// Heap instances of this class in the file (= its `0x40` allocations).
     /// Value-embedded structs such as `Color` count 0 even when present.
-    pub instances: u32,
+    instances: u32,
 }
 
-/// Layout section between the class table and the root object: a pre-order
-/// list of the object graph's pointer slots.
-///
-/// Token kinds: `0x40 n class` heap object of `class` (n is always 1),
-/// `0x42 n` array of n elements, `0x08 n` and `0x51 n` runs of other slots
-/// (likely null and reference slots; not proven). `counts` holds the per-kind
-/// sums of `n` for every kind except `0x40`.
+/// The heap section between the class table and the root object: every heap
+/// object and non-empty array the body holds, in pre-order (the rule is on
+/// `Asset::rebuild`). `counts` holds the per-kind sums of `n` for every kind
+/// but heap objects.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Layout {
-    pub counts: Vec<(u8, u32)>,
+pub struct Heap {
+    counts: Vec<(AllocKind, u32)>,
     /// Always 0 in the shipped files.
-    pub reserved: u8,
-    pub tokens: Vec<LayoutToken>,
+    reserved: u8,
+    pub allocations: Vec<Allocation>,
 }
 
+/// One entry of the heap section: a heap object of a class, or a run of
+/// `count` array elements of one kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LayoutToken {
-    pub kind: u8,
-    pub count: u32,
-    /// Index into the class table, for `0x40` tokens only.
-    pub class_index: Option<u32>,
+pub struct Allocation {
+    kind: AllocKind,
+    count: u32,
+    /// Index into the class table, for `0x40` allocations only.
+    class_index: Option<u32>,
 }
 
-pub const TOKEN_OBJECT: u8 = 0x40;
-pub const TOKEN_ARRAY: u8 = 0x42;
-/// Binding index runs, see [`Asset::rebuild`].
-const TOKEN_BINDING_INDICES: u8 = 0x51;
-// A binding's source and target index arrays (class `0xedcf0433`).
-const PROP_BINDING_SOURCES: u32 = 0x28c3_8074;
-const PROP_BINDING_TARGETS: u32 = 0xcec4_084b;
+/// An allocation's kind byte: `<kind> <varint n> [<varint class index>]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct AllocKind(u8);
 
-/// Classes stored by value: never counted in the class table, never a
-/// layout token. The same three in all 4,682 installed assets; every other
-/// class is a heap object wherever it occurs.
-const VALUE_CLASSES: [u32; 3] = [CLASS_COLOR_TYPE, CLASS_COLOR, 0xc761_3662];
+impl AllocKind {
+    /// One heap object of the class it names (n is always 1).
+    const OBJECT: AllocKind = AllocKind(WireType::Pointer as u8);
+    /// A binding's source and target index arrays, after its targets' run
+    /// (see [`Asset::rebuild`]).
+    const BINDING_INDICES: AllocKind = AllocKind(0x51);
+
+    /// A run of n array elements of wire type `t`: the root's child list
+    /// is `OwnedPointer`'s, u32 arrays `U32`'s.
+    const fn slots(t: WireType) -> AllocKind {
+        AllocKind(t as u8)
+    }
+}
 
 /// Replace bytes `range` of the file (inside the body) with `bytes`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Splice {
-    pub range: Range<usize>,
-    pub bytes: Vec<u8>,
+struct Splice {
+    range: Range<usize>,
+    bytes: Vec<u8>,
 }
 
 /// How an object header names itself.
@@ -342,6 +302,41 @@ pub enum ObjectId {
     Id(Guid),
 }
 
+impl ObjectId {
+    /// A pointer slot's first byte, any pointer or asset reference type:
+    /// null, a [`Reference`], or an owned object.
+    const NULL: u8 = 0x00;
+    const REFERENCE: u8 = 0x01;
+    const OWNED: u8 = 0x02;
+    /// An owned object's id form after `OWNED`; the root carries its guid
+    /// bare instead.
+    const NO_ID: u8 = 0x00;
+    const WITH_ID: u8 = 0x02;
+    /// A pointer tag or an id form: one byte each.
+    const TAG: usize = size_of::<u8>();
+
+    fn encode(&self, out: &mut Vec<u8>) {
+        out.push(ObjectId::OWNED);
+        match self {
+            ObjectId::Root(g) => out.extend_from_slice(&g.0),
+            ObjectId::None => out.push(ObjectId::NO_ID),
+            ObjectId::Id(g) => {
+                out.push(ObjectId::WITH_ID);
+                out.extend_from_slice(&g.0);
+            }
+        }
+    }
+
+    /// Bytes before the class crc.
+    fn len(&self) -> usize {
+        match self {
+            ObjectId::Root(_) => ObjectId::TAG + ID,
+            ObjectId::None => 2 * ObjectId::TAG,
+            ObjectId::Id(_) => 2 * ObjectId::TAG + ID,
+        }
+    }
+}
+
 /// `02 <id form> <u32 class crc> <u8 prop count> <presence mask>`.
 ///
 /// The mask is MSB-first over the class's flattened property list; bit 0 is
@@ -353,16 +348,27 @@ pub struct ObjectHeader {
     pub id: ObjectId,
     pub class: u32,
     pub prop_count: u8,
-    pub mask: Box<[u8]>,
-    /// Located through a `0x40` layout token (heap object) rather than by scan.
-    pub heap: bool,
+    mask: Box<[u8]>,
+    /// Located through a `0x40` allocation (heap object) rather than by scan.
+    heap: bool,
 }
 
 impl ObjectHeader {
-    pub fn present(&self, prop: usize) -> bool {
-        prop < self.prop_count as usize && self.mask[prop / 8] & (0x80 >> (prop % 8)) != 0
+    /// Where presence bit `prop` sits: its mask byte, and the bit in it,
+    /// most significant first.
+    fn mask_bit(prop: usize) -> (usize, u8) {
+        (prop / 8, 0x80 >> (prop % 8))
     }
-    pub fn present_count(&self) -> u32 {
+
+    fn bit(&self, prop: usize) -> bool {
+        let (byte, bit) = ObjectHeader::mask_bit(prop);
+        self.mask.get(byte).is_some_and(|m| m & bit != 0)
+    }
+
+    fn present(&self, prop: usize) -> bool {
+        prop < self.prop_count as usize && self.bit(prop)
+    }
+    fn present_count(&self) -> u32 {
         self.mask.iter().map(|b| b.count_ones()).sum()
     }
 }
@@ -377,7 +383,12 @@ pub struct StrRecord {
 }
 
 impl StrRecord {
-    pub fn crc(&self) -> u32 {
+    /// The encoding byte after a non-empty string's length: ASCII, or text
+    /// with non-ASCII UTF-8.
+    const ASCII: u8 = 0x01;
+    const UTF8: u8 = 0x03;
+
+    fn crc(&self) -> u32 {
         crc32(self.text.as_bytes())
     }
 }
@@ -443,23 +454,23 @@ pub enum DefaultValue {
 }
 
 impl DefaultValue {
-    fn tag(&self) -> u8 {
+    fn wire_type(&self) -> WireType {
         match self {
-            DefaultValue::None => 0x00,
-            DefaultValue::Bool(_) => 0x01,
-            DefaultValue::S32(_) => 0x07,
-            DefaultValue::U32(_) => 0x08,
-            DefaultValue::F32(_) => 0x10,
-            DefaultValue::Vec(v) => 0x0f + v.len() as u8,
-            DefaultValue::Str(_) => 0x17,
-            DefaultValue::ObjectId(_) => 0x19,
-            DefaultValue::Object(_) => 0x40,
+            DefaultValue::None => WireType::None,
+            DefaultValue::Bool(_) => WireType::Bool,
+            DefaultValue::S32(_) => WireType::S32,
+            DefaultValue::U32(_) => WireType::U32,
+            DefaultValue::F32(_) => WireType::F32,
+            DefaultValue::Vec(v) => WireType::vector(v.len()).expect("a 2- to 4-lane vector"),
+            DefaultValue::Str(_) => WireType::Str,
+            DefaultValue::ObjectId(_) => WireType::Id,
+            DefaultValue::Object(_) => WireType::Pointer,
         }
     }
 
     fn encode(&self, out: &mut Vec<u8>) {
         out.push(0);
-        out.push(self.tag());
+        out.push(self.wire_type() as u8);
         match self {
             DefaultValue::None => {}
             DefaultValue::Bool(v) => out.push(*v),
@@ -563,8 +574,8 @@ pub enum Record {
     Header,
     /// The class table, see [`Asset::types`].
     Types,
-    /// The layout section, see [`Asset::layout`].
-    Layout,
+    /// The heap section, see [`Asset::heap`].
+    Heap,
     Object(ObjectHeader),
     /// A fixed-width scalar property value.
     Value(Value),
@@ -612,120 +623,367 @@ impl Span {
 }
 
 /// A property slot: the object header span and the wire property index
-/// (1-based, the presence-mask bit; see [`wire_props`]).
+/// (1-based, the presence-mask bit; see `wire_props`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Field {
     pub object: usize,
-    pub prop: u16,
+    prop: u16,
 }
 
-/// One class version from a game's runtime registry.
+/// One class version: the exe's current one, or an older one found in
+/// installed assets (`phx/tables.rs`).
 #[derive(Debug)]
-pub struct Class {
-    pub crc: u32,
-    pub name: Option<&'static str>,
+struct Class {
+    crc: u32,
+    name: Option<&'static str>,
     /// Base class crc, 0 for the registry root.
-    pub base: u32,
-    /// Runtime instance size in bytes.
-    pub size: u32,
+    base: u32,
     /// Schema hash of this version; a file's class table carries the hash
     /// of the version it was written with.
-    pub hash: [u8; 16],
-    /// The class's own descriptor rows, registry order.
-    pub props: &'static [Prop],
+    hash: [u8; 16],
+    /// The version's own descriptor rows: a current version's in registry
+    /// order, an older one's serialized rows in wire order.
+    props: &'static [Prop],
 }
 
-/// An older version of a class: its own serialized props by name crc, in
-/// wire order (0 = [`LEGACY_BOOL`]).
-#[derive(Debug)]
-pub struct Legacy {
-    pub class: u32,
-    pub hash: [u8; 16],
-    pub props: &'static [u32],
+/// A wire type, as one byte: the high byte of a registry type word, the tag
+/// of a variant's payload, and the kind of an allocation that counts array
+/// slots of that type. The codec reads and writes types through this table
+/// alone; a byte it lacks (`0x1a`, `0x41`… in a few registry rows) leaves
+/// the asset to the scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum WireType {
+    /// A variant with no payload (events, actions, object references).
+    None = 0x00,
+    /// One byte: 0 and 1 read as a bool, any other value is kept as a byte.
+    Bool = 0x01,
+    U8 = 0x04,
+    U16 = 0x06,
+    S32 = 0x07,
+    U32 = 0x08,
+    U64 = 0x0a,
+    /// A u32 entry of the enum type the prop's `type_crc` names.
+    Enum = 0x0b,
+    F32 = 0x10,
+    Vec2 = 0x11,
+    Vec3 = 0x12,
+    Vec4 = 0x13,
+    /// `<varint len> <encoding> <bytes>`.
+    Str = 0x17,
+    /// A 16-byte object id.
+    Id = 0x19,
+    /// `00 <type> <payload>`: a CustomPropertyInstance default.
+    Variant = 0x1f,
+    /// Two pointer kinds the exe tells apart and the wire does not: null, a
+    /// reference, or an owned object (see [`ObjectId`]). Owned children
+    /// (Components, Effects, CustomProperties) are `OwnedPointer`.
+    Pointer = 0x40,
+    OwnedPointer = 0x42,
+    /// Two asset reference kinds, alike on the wire: null or a reference.
+    AssetRef = 0x43,
+    AssetRef2 = 0x44,
 }
 
-/// The one old property the current classes no longer have: a bool between
-/// `Font` and `ScalingFactor` in old font bindings (`0xca32a806`).
-pub static LEGACY_BOOL: Prop = Prop {
-    name_crc: 0,
-    name: None,
-    ty: 0x0100,
-    type_crc: 0,
-    mode: 0x2001,
-    offset: 0,
-};
+impl WireType {
+    const ALL: [WireType; 19] = [
+        WireType::None,
+        WireType::Bool,
+        WireType::U8,
+        WireType::U16,
+        WireType::S32,
+        WireType::U32,
+        WireType::U64,
+        WireType::Enum,
+        WireType::F32,
+        WireType::Vec2,
+        WireType::Vec3,
+        WireType::Vec4,
+        WireType::Str,
+        WireType::Id,
+        WireType::Variant,
+        WireType::Pointer,
+        WireType::OwnedPointer,
+        WireType::AssetRef,
+        WireType::AssetRef2,
+    ];
 
-/// One property descriptor row `{type word, value type crc, mode, name crc,
-/// struct offset}`.
-#[derive(Debug)]
-pub struct Prop {
-    pub name_crc: u32,
-    pub name: Option<&'static str>,
-    /// Type word: high byte = type code (`01` bool, `04` u8, `06` u16, `07`
-    /// s32, `08` u32, `0a` u64, `0b` enum, `10` f32, `11`..`13` vec2..4, `17`
-    /// string, `19` 16-byte id, `1f` variant, `40`/`42` pointer, `43`/`44`
-    /// asset reference); low bit = array.
-    pub ty: u16,
-    /// Value type: enum type, pointee class or asset class crc; 0 for scalars.
-    pub type_crc: u32,
-    pub mode: u32,
-    pub offset: u32,
-}
+    fn of(byte: u8) -> Option<WireType> {
+        WireType::ALL.into_iter().find(|t| *t as u8 == byte)
+    }
 
-impl Prop {
-    /// Mode bit 0 (`0x2001`, `0x2009`) or bit 16 (`0x12000`) = written to the
-    /// wire; `0x2000`/`0x2080` (transient) and the computed accessors
-    /// (`0x1c`, `0x94`) are not.
-    pub fn serialized(&self) -> bool {
-        self.mode & 0x1_0001 != 0
+    /// The bytes of a fixed-width value; None for the rest.
+    fn width(self) -> Option<usize> {
+        Some(match self {
+            WireType::Bool | WireType::U8 => 1,
+            WireType::U16 => 2,
+            WireType::S32 | WireType::U32 | WireType::Enum | WireType::F32 => 4,
+            WireType::U64 => 8,
+            WireType::Vec2 | WireType::Vec3 | WireType::Vec4 => 4 * self.lanes()?,
+            WireType::Id => 16,
+            _ => return None,
+        })
+    }
+
+    /// The f32 lanes of a vector type.
+    fn lanes(self) -> Option<usize> {
+        match self {
+            WireType::Vec2 => Some(2),
+            WireType::Vec3 => Some(3),
+            WireType::Vec4 => Some(4),
+            _ => None,
+        }
+    }
+
+    /// The vector type of `n` lanes.
+    fn vector(n: usize) -> Option<WireType> {
+        [WireType::Vec2, WireType::Vec3, WireType::Vec4]
+            .into_iter()
+            .find(|t| t.lanes() == Some(n))
     }
 }
 
-pub fn class_info(crc: u32) -> Option<&'static Class> {
-    tables::registry(Game::Anno117)
-        .class(crc)
-        .or_else(|| tables::registry(Game::Anno1800).class(crc))
+/// One property descriptor row `{type word, value type crc, mode, name crc}`;
+/// the registry's struct offset is checked but not kept.
+#[derive(Debug, Clone)]
+struct Prop {
+    name_crc: u32,
+    name: Option<&'static str>,
+    /// Type word: the high byte is the [`WireType`], the low bit marks an
+    /// array (`Prop::wire_type`, `Prop::is_array`).
+    ty: u16,
+    /// Value type: enum type, pointee class or asset class crc; 0 for scalars.
+    type_crc: u32,
+    mode: u32,
 }
 
-fn class_version(crc: u32, hash: &[u8; 16]) -> Option<&'static Class> {
-    class_info(crc)
-        .filter(|c| c.hash == *hash)
-        .or_else(|| (tables::registry(Game::Anno1800).class(crc)).filter(|c| c.hash == *hash))
+impl Prop {
+    /// The type word's array bit.
+    const ARRAY: u16 = 1;
+    /// The mode bits that put a prop on the wire (see [`Prop::serialized`]).
+    const SERIALIZED: u32 = 0x1_0001;
+
+    /// The type word's high byte: a [`WireType`] when the codec knows it.
+    fn type_byte(&self) -> u8 {
+        (self.ty >> 8) as u8
+    }
+
+    fn wire_type(&self) -> Option<WireType> {
+        WireType::of(self.type_byte())
+    }
+
+    fn is_array(&self) -> bool {
+        self.ty & Prop::ARRAY != 0
+    }
+
+    /// Mode bit 0 (`0x2001`, `0x2009`) or bit 16 (`0x12000`) = written to the
+    /// wire; `0x2000`/`0x2080` (transient) and the computed accessors
+    /// (`0x1c`, `0x94`) are not.
+    fn serialized(&self) -> bool {
+        self.mode & Prop::SERIALIZED != 0
+    }
+}
+
+// Classes the codec reads by name: `name_crc` of the name, or the bare crc
+// where the name is unknown.
+impl Class {
+    // Color: 4 properties, 1..=3 present (R, G, B), one byte each. Seen
+    // 6344 times, no variant.
+    const COLOR_PROPS: u8 = 4;
+    const COLOR_MASK: u8 = 0x70;
+    const COLOR_BYTES: usize = 3;
+
+    /// Classes stored by value: never counted in the class table, never a
+    /// allocation. The same three in all 4,682 installed assets; every other
+    /// class is a heap object wherever it occurs.
+    const BY_VALUE: [u32; 3] = [Class::COLOR_TYPE, Class::COLOR, 0xc761_3662];
+
+    /// The CustomPropertyInstance class.
+    const CUSTOM_PROPERTY: u32 = name_crc(b"CustomPropertyInstance");
+    /// Color: three RGB bytes, no alpha on the wire.
+    const COLOR: u32 = name_crc(b"Color");
+    /// ColorType: optional palette reference, palette entry, `Color`.
+    const COLOR_TYPE: u32 = name_crc(b"ColorType");
+    const OBJECT: u32 = name_crc(b"Object");
+    const GROUP_TEMPLATE: u32 = name_crc(b"GroupTemplate");
+    const GROUP_INSTANCE: u32 = name_crc(b"GroupInstance");
+    const WIDGET_INSTANCE: u32 = name_crc(b"WidgetInstance");
+    const IMAGE_ASSET: u32 = name_crc(b"ImageAsset");
+    // TextStyle root; the PHXTS kind root 0xc697c96c is its abstract base.
+    const TEXT_STYLE: u32 = name_crc(b"SlugTextStyleAsset");
+    const CONTAINER_TEMPLATE: u32 = name_crc(b"ContainerWidgetTemplate");
+    const CONTAINER_INSTANCE: u32 = name_crc(b"ContainerWidgetInstance");
+    const IMAGE_WIDGET: u32 = name_crc(b"ImageWidgetInstance");
+    const LABEL_WIDGET: u32 = name_crc(b"LabelWidgetInstance");
+    const PALETTE_COLOR: u32 = name_crc(b"ColorPaletteEntry");
+    const FONT_ASSET: u32 = name_crc(b"FontBaseAsset");
+    const COMPONENT_INSTANCE: u32 = name_crc(b"ComponentInstance");
+    const PROPERTY_VALUE: u32 = name_crc(b"PropertyValue");
+    const EFFECT_INSTANCE: u32 = name_crc(b"EffectInstance");
+    const PROPERTY_CONTAINER: u32 = name_crc(b"PropertyContainer");
+    const PROPERTY_ID: u32 = name_crc(b"PropertyId");
+    const PROVIDER: u32 = name_crc(b"DataProviderContainer");
+    const STEP: u32 = name_crc(b"DataProviderId");
+    const TEMPLATE_CONTAINER: u32 = name_crc(b"CustomPropertyContainer");
+    const CONSTANT: u32 = name_crc(b"ConstantPropertyContainer");
+    const BINDING: u32 = 0xedcf_0433;
+    /// The class widget references in provider steps name.
+    const WIDGET_REF: u32 = 0xbb96_607d;
+    const CLIP: u32 = name_crc(b"AnimationInstance");
+}
+
+// Properties the codec reads by name, as [`Class`]'s.
+impl Prop {
+    // A binding's source and target index arrays (class `0xedcf0433`).
+    const BINDING_SOURCES: u32 = 0x28c3_8074;
+    const BINDING_TARGETS: u32 = 0xcec4_084b;
+    const UNIQUE_ID: u32 = name_crc(b"UniqueId");
+    const PROPERTY_TYPE: u32 = name_crc(b"PropertyType");
+    const DEFAULT_VALUE: u32 = name_crc(b"DefaultValue");
+    const OBJECT_TEMPLATE: u32 = name_crc(b"ObjectTemplate");
+    const ENUM_ASSET: u32 = name_crc(b"EnumAsset");
+    // The name string of named objects (widgets, custom properties); its
+    // `NameCrc` u32 sits right before it.
+    const NAME: u32 = name_crc(b"PhoenixDebugName");
+    // Property name crcs.
+    const POSITION: u32 = name_crc(b"Position");
+    const PIVOT: u32 = name_crc(b"PivotPoint");
+    const ROTATION: u32 = name_crc(b"RotationAngle");
+    const SCALE: u32 = name_crc(b"Scale");
+    const ALPHA_TINT: u32 = name_crc(b"AlphaTint");
+    const COLOR_TINT: u32 = name_crc(b"ColorTint");
+    const VISIBLE: u32 = name_crc(b"Visible");
+    const IS_HIDDEN: u32 = name_crc(b"IsHidden");
+    const ANCHOR: u32 = name_crc(b"AnchorPoint");
+    // Anchor metrics x/y (unnamed; registered as legacy aliases),
+    // then WidthResizing/HeightResizing.
+    const ANCHOR_METRICS: [u32; 2] = [0x5c63_f4bb, 0xc16c_15cd];
+    const RESIZE_METRICS: [u32; 2] = [name_crc(b"WidthResizing"), name_crc(b"HeightResizing")];
+    const ASPECT_RATIO: u32 = name_crc(b"AspectRatio");
+    const Z_INDEX: u32 = name_crc(b"ZIndex");
+    const ENUM_ENTRY: u32 = name_crc(b"EnumEntry");
+    const WIDGET_TYPE: u32 = name_crc(b"WidgetType");
+    const PARENT_WIDGET_TYPE: u32 = name_crc(b"ParentWidgetType");
+    const CURRENT_ENUM_VALUE: u32 = name_crc(b"CurrentEnumValue");
+    const CONSIDER_SIZE: u32 = name_crc(b"ConsiderSize");
+    const WIDGET_INSTANCES: u32 = name_crc(b"WidgetInstances");
+    const GROUP_TEMPLATE: u32 = name_crc(b"GroupTemplate");
+    const IMAGE_ID: u32 = name_crc(b"ImageId");
+    const SIZE: u32 = name_crc(b"Size");
+    // Unnamed ImageAsset field holding the UV rectangle object.
+    const UV_RECT: u32 = 0x65fc_c08e;
+    const TEXTURE_FILTERING: u32 = name_crc(b"TextureFiltering");
+    const IMAGE_ATLAS: u32 = name_crc(b"ImageAtlas");
+    const TOP_LEFT: u32 = name_crc(b"TopLeft");
+    const BOTTOM_RIGHT: u32 = name_crc(b"BottomRight");
+    const IMAGE: u32 = name_crc(b"Image");
+    const UV_OFFSET: u32 = name_crc(b"UVOffset");
+    const UV_SCALE: u32 = name_crc(b"UVScale");
+    const UV_ROTATION: u32 = name_crc(b"UVRotation");
+    const FILL_MODE: u32 = name_crc(b"FillMode");
+    /// See [`WidgetImage::path`]; its name is unknown.
+    const IMAGE_PATH: u32 = name_crc(b"DynamicImageId");
+    const TEXT: u32 = name_crc(b"Text");
+    const DISPLAYED_TEXT: u32 = name_crc(b"DisplayedText");
+    const LOCALIZATION_ID: u32 = name_crc(b"LocalizationId");
+    // Unnamed; self-typed with the PHXLG kind root class.
+    const FONT: u32 = 0xe152_3167;
+    const TEXT_STYLE: u32 = name_crc(b"TextStyle");
+    const ALIGNMENT: [u32; 2] = [name_crc(b"AlignmentX"), name_crc(b"AlignmentY")];
+    const TEXT_PLANE: u32 = name_crc(b"TextPlane");
+    const OVERFLOW: [u32; 2] = [
+        name_crc(b"HorizontalOverflow"),
+        name_crc(b"VerticalOverflow"),
+    ];
+    const SIZING: [u32; 2] = [name_crc(b"HorizontalSizing"), name_crc(b"VerticalSizing")];
+    const MAX_LINES: u32 = name_crc(b"MaxLineCount");
+    const LINE_SPACING: u32 = name_crc(b"LineSpacing");
+    const LOCALIZED_FONT: u32 = name_crc(b"LocalizedFont");
+    const BASE_COLOR: u32 = name_crc(b"BaseColor");
+    const OUTLINE_ENABLED: u32 = name_crc(b"OutlineEnabled");
+    // Unnamed ColorType right after OutlineEnabled.
+    const OUTLINE_COLOR: u32 = name_crc(b"OutlineColor");
+    const OUTLINE_ALPHA: u32 = name_crc(b"OutlineAlpha");
+    const SHADOW_ENABLED: u32 = name_crc(b"ShadowEnabled");
+    const SHADOW_COLOR: u32 = name_crc(b"ShadowColor");
+    const SHADOW_ALPHA: u32 = name_crc(b"ShadowAlpha");
+    const SHADOW_DISTANCE: u32 = name_crc(b"ShadowDistance");
+    const SHADOW_ANGLE: u32 = name_crc(b"ShadowAngle");
+    const LETTER_SPACING: u32 = name_crc(b"LetterSpacing");
+    const REFERENCE_SIZE: u32 = name_crc(b"ReferenceSize");
+    const TEMPLATE: u32 = name_crc(b"Template");
+    const GROUPS: u32 = name_crc(b"Groups");
+    const PALETTE_COLORS: u32 = name_crc(b"Colors");
+    const PALETTE_ENTRY: u32 = 0x46a1_7a33;
+    const COMPONENTS: u32 = name_crc(b"Components");
+    const PROPERTY_VALUES: u32 = name_crc(b"PropertyValues");
+    const COMPONENT_TEMPLATE: u32 = name_crc(b"ComponentTemplate");
+    const EFFECTS: u32 = name_crc(b"Effects");
+    const EFFECT_TEMPLATE: u32 = name_crc(b"EffectTemplate");
+    // PropertyValue: the override's path (u32 ids) and its variant value.
+    const PROPERTY_ID_PATH: u32 = name_crc(b"PropertyIdPath");
+    const VALUE: u32 = name_crc(b"Value");
+    const BINDINGS: u32 = 0xa433_6119;
+    /// A binding's converter object; the property shares its class's name.
+    const CONVERTER: u32 = name_crc(b"ConverterInstance");
+    const CONTAINERS: u32 = name_crc(b"PropertyContainers");
+    const TEMPLATE_CONTAINERS: u32 = name_crc(b"CustomPropertyContainers");
+    const CONSTANTS: u32 = name_crc(b"ConstantPropertyContainers");
+    const PROVIDERS: u32 = name_crc(b"DataProviderContainers");
+    const PROPERTY_PATH: u32 = name_crc(b"PropertyPath");
+    const FIELD: u32 = name_crc(b"PropertyField");
+    const PROVIDER: u32 = name_crc(b"DataProviderIndex");
+    const TEMPLATE_INDEX: u32 = name_crc(b"CustomPropertyIndex");
+    const STEPS: u32 = name_crc(b"DataProviderPath");
+    const TARGET_WIDGET: u32 = name_crc(b"DataProviderObject");
+    /// A provider step's DataMode: 0 a widget, 1 the root, 2 a clip.
+    const DATA_MODE: u32 = name_crc(b"DataMode");
+    const BINDING_MODE: u32 = name_crc(b"BindingMode");
+    const BINDING_INFOS: u32 = name_crc(b"BindingInfos");
+    const RULE_ENTRY: u32 = name_crc(b"EnumValueId");
+    const RULE_TARGET: u32 = name_crc(b"TargetIndex");
+    const RULE_ID: u32 = name_crc(b"RuleId");
+    const CONVERSION_RULES: u32 = name_crc(b"ConversionRules");
+    const CONVERSION_VALUES: u32 = name_crc(b"ConversionValues");
+    /// ConversionValue's enum entry UniqueId.
+    const CONVERSION_ENTRY: u32 = name_crc(b"EnumEntryUniqueId");
+    const USE_COUNT: u32 = name_crc(b"UseCount");
+    const PROFILE_ID: u32 = name_crc(b"ProfileID");
+    /// Timeline tracks name their slot in the same table.
+    const TRACK_TARGET: u32 = 0x1935_a21e;
+    const CLIPS: u32 = name_crc(b"AnimationInstances");
+    const TRACKS: u32 = name_crc(b"Tracks");
+    const KEYS: u32 = name_crc(b"Track");
+    const TIME: u32 = name_crc(b"Time");
+    const EASE: u32 = 0x8f7a_a617;
+    const FRAME_RATE: u32 = name_crc(b"FrameRate");
+    const DURATION: u32 = name_crc(b"Duration");
+}
+
+fn class_info(crc: u32) -> Option<&'static Class> {
+    tables::class(crc)
 }
 
 // Base of a class, including the ones the exe dropped (decoded as their base).
 fn base_of(crc: u32) -> Option<u32> {
     match class_info(crc) {
         Some(c) => (c.base != 0).then_some(c.base),
-        None => (tables::registry(Game::Anno117).removed.iter())
-            .find(|r| r.0 == crc)
-            .map(|r| r.1),
+        None => tables::removed_base(crc),
     }
 }
 
-// Own serialized props of `class` as written with schema `hash`.
+// Own serialized props of `class` as written with schema `hash`, or in its
+// current version when the file names none.
 fn own_props(class: u32, hash: Option<&[u8; 16]>) -> Option<Vec<&'static Prop>> {
-    if let Some(version) = hash.and_then(|h| class_version(class, h)) {
-        return Some(version.props.iter().filter(|p| p.serialized()).collect());
-    }
-    let Some(c) = class_info(class) else {
-        // Registry root `Object` and dropped classes have no own props.
-        let removed = &tables::registry(Game::Anno117).removed;
-        return (class == CLASS_OBJECT || removed.iter().any(|r| r.0 == class)).then(Vec::new);
+    let version = match hash {
+        Some(h) => tables::class_version(class, h),
+        None => class_info(class),
     };
-    if hash.is_none_or(|h| *h == c.hash) {
-        return Some(c.props.iter().filter(|p| p.serialized()).collect());
+    match version {
+        Some(v) => Some(v.props.iter().filter(|p| p.serialized()).collect()),
+        // Registry root `Object` and dropped classes have no own props.
+        None => (class == Class::OBJECT || tables::removed_base(class).is_some()).then(Vec::new),
     }
-    let legacy = (tables::registry(Game::Anno117).legacy.iter())
-        .find(|l| l.class == class && Some(&l.hash) == hash)?;
-    legacy
-        .props
-        .iter()
-        .map(|&n| match n {
-            0 => Some(&LEGACY_BOOL),
-            n => c.props.iter().find(|p| p.name_crc == n),
-        })
-        .collect()
 }
 
 /// Per-file wire property lists, keyed by class: base chain first, using the
@@ -738,7 +996,7 @@ fn file_schema(types: &[TypeEntry]) -> Option<HashMap<u32, Vec<&'static Prop>>> 
         let mut chain = vec![t.class];
         while let Some(b) = {
             let c = *chain.last().unwrap();
-            match hashes.get(&c).and_then(|h| class_version(c, h)) {
+            match hashes.get(&c).and_then(|h| tables::class_version(c, h)) {
                 Some(version) => (version.base != 0).then_some(version.base),
                 None => base_of(c),
             }
@@ -754,17 +1012,17 @@ fn file_schema(types: &[TypeEntry]) -> Option<HashMap<u32, Vec<&'static Prop>>> 
     Some(out)
 }
 
-const CLASS_OBJECT: u32 = name_crc(b"Object");
-
 /// A class's wire property list in the current (exe) version: base chain
 /// first, serialized rows only. Index `i` here is presence-mask bit `i + 1`
 /// (bit 0 is never set). Assets written with older versions use
 /// [`Asset::class_props`].
-pub fn wire_props(crc: u32) -> Option<&'static [&'static Prop]> {
+fn wire_props(crc: u32) -> Option<&'static [&'static Prop]> {
     static CACHE: std::sync::OnceLock<HashMap<u32, Vec<&'static Prop>>> =
         std::sync::OnceLock::new();
     let cache = CACHE.get_or_init(|| {
-        (tables::registry(Game::Anno117).classes.iter())
+        // Every class's current version: the first registry's.
+        (tables::registries().flat_map(|r| &r.classes))
+            .filter(|&c| std::ptr::eq(c, class_info(c.crc).unwrap()))
             .map(|c| {
                 let mut chain = vec![c];
                 while let Some(b) = class_info(chain.last().unwrap().base) {
@@ -798,7 +1056,7 @@ pub fn is_a(class: u32, base: u32) -> bool {
 /// indices into [`Asset::spans`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CustomProperty {
-    pub object: usize,
+    object: usize,
     pub uid: u32,
     /// `PropertyType` enum value, see [`property_type_name`].
     pub kind: u32,
@@ -807,7 +1065,7 @@ pub struct CustomProperty {
     pub object_asset: Option<Reference>,
     /// The EnumAsset of enum-typed properties.
     pub enum_asset: Option<Reference>,
-    pub name: usize,
+    name: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -821,95 +1079,93 @@ pub struct Names {
     map: HashMap<u32, Box<str>>,
 }
 
-// Class and property names with a verified crc. The *Widget*, Group, Track,
-// ImageAtlasAsset and LocalizedFontAsset names were recovered by dictionary
-// search against the class tables; each lands in a coherent family (see
-// phx-decode.md section 3).
-const BUILTIN_NAMES: &[&str] = &[
-    "SceneTemplate",
-    "ImageAsset",
-    "VideoAsset",
-    "GameObjectTemplate",
-    "WidgetTypeTemplate",
-    "FontDescriptorAsset",
-    "EffectTemplate",
-    "EnumAsset",
-    "ComponentTemplate",
-    "ColorPaletteAsset",
-    "ImageAtlasAsset",
-    "LocalizedFontAsset",
-    "ContainerWidgetTemplate",
-    "WidgetInstance",
-    "ContainerWidgetInstance",
-    "ImageWidgetInstance",
-    "LabelWidgetInstance",
-    "VideoWidgetInstance",
-    "GroupTemplate",
-    "GroupInstance",
-    "Object",
-    "Asset",
-    "EnumEntry",
-    "AnyEnumValue",
-    "AffectedProperty",
-    "CustomPropertyInstance",
-    "CustomPropertyContainer",
-    "ComponentInstance",
-    "EffectInstance",
-    "PropertyContainer",
-    "PropertyValue",
-    "PropertyId",
-    "Color",
-    "ColorType",
-    "TrackKey",
-    "TrackInstance",
-    "FloatKey",
-    "BooleanKey",
-    "ColorKey",
-    "EventActionKey",
-    "BooleanTrackInstance",
-    "ColorTrackInstance",
-    "EventTrackInstance",
-    "ActionTrackInstance",
-    "EnumTrackInstance",
-    "AnimationInstance",
-    "OnPress",
-    "OnRelease",
-    "IsChecked",
-    "BtnStates",
-    "InfoTip",
-    "InfoTipContext",
-    "Alignment",
-    "BackgroundColor",
-    "ColorPalette",
-];
-
-// The harvested corpus, names only (~500 KB; the crc is recomputed on load,
-// ~1 ms). Shipped binaries have no scripts/ folder, and without these names
-// most UI properties show as bare crcs.
-// TODO(alex): 22k Box<str> copies of static text; a sorted crc array with
-// offsets into this string would need no allocation at all.
-const CORPUS_NAMES: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/data/phx_names.txt"));
-
 impl Names {
+    // Class and property names with a verified crc. The *Widget*, Group, Track,
+    // ImageAtlasAsset and LocalizedFontAsset names were recovered by dictionary
+    // search against the class tables; each lands in a coherent family (see
+    // phx-decode.md section 3).
+    const BUILTIN: &[&str] = &[
+        "SceneTemplate",
+        "ImageAsset",
+        "VideoAsset",
+        "GameObjectTemplate",
+        "WidgetTypeTemplate",
+        "FontDescriptorAsset",
+        "EffectTemplate",
+        "EnumAsset",
+        "ComponentTemplate",
+        "ColorPaletteAsset",
+        "ImageAtlasAsset",
+        "LocalizedFontAsset",
+        "ContainerWidgetTemplate",
+        "WidgetInstance",
+        "ContainerWidgetInstance",
+        "ImageWidgetInstance",
+        "LabelWidgetInstance",
+        "VideoWidgetInstance",
+        "GroupTemplate",
+        "GroupInstance",
+        "Object",
+        "Asset",
+        "EnumEntry",
+        "AnyEnumValue",
+        "AffectedProperty",
+        "CustomPropertyInstance",
+        "CustomPropertyContainer",
+        "ComponentInstance",
+        "EffectInstance",
+        "PropertyContainer",
+        "PropertyValue",
+        "PropertyId",
+        "Color",
+        "ColorType",
+        "TrackKey",
+        "TrackInstance",
+        "FloatKey",
+        "BooleanKey",
+        "ColorKey",
+        "EventActionKey",
+        "BooleanTrackInstance",
+        "ColorTrackInstance",
+        "EventTrackInstance",
+        "ActionTrackInstance",
+        "EnumTrackInstance",
+        "AnimationInstance",
+        "OnPress",
+        "OnRelease",
+        "IsChecked",
+        "BtnStates",
+        "InfoTip",
+        "InfoTipContext",
+        "Alignment",
+        "BackgroundColor",
+        "ColorPalette",
+    ];
+
+    // The harvested corpus, names only (~500 KB; the crc is recomputed on load,
+    // ~1 ms). Shipped binaries have no scripts/ folder, and without these names
+    // most UI properties show as bare crcs.
+    // TODO(alex): 22k Box<str> copies of static text; a sorted crc array with
+    // offsets into this string would need no allocation at all.
+    const CORPUS: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/data/phx_names.txt"));
+
     /// The schema's class and property names, the hand-verified list, and the
     /// embedded corpus.
     pub fn builtin() -> Names {
         let mut names = Names::default();
-        let schema = (tables::registry(Game::Anno117).classes.iter())
-            .chain(&tables::registry(Game::Anno1800).classes)
-            .flat_map(|c| {
-                c.name
-                    .into_iter()
-                    .chain(c.props.iter().filter_map(|p| p.name))
-            });
-        let corpus = CORPUS_NAMES.lines().filter(|l| !l.starts_with('#'));
-        for n in BUILTIN_NAMES.iter().copied().chain(schema).chain(corpus) {
+        let schema = (tables::registries().flat_map(|r| &r.classes)).flat_map(|c| {
+            c.name
+                .into_iter()
+                .chain(c.props.iter().filter_map(|p| p.name))
+        });
+        let corpus = Names::CORPUS.lines().filter(|l| !l.starts_with('#'));
+        for n in Names::BUILTIN.iter().copied().chain(schema).chain(corpus) {
             names.insert(n);
         }
         names
     }
 
-    pub fn insert(&mut self, name: &str) -> u32 {
+    fn insert(&mut self, name: &str) -> u32 {
         let crc = crc32(name.as_bytes());
         self.map.insert(crc, name.into());
         crc
@@ -943,16 +1199,8 @@ impl Names {
         Ok(added)
     }
 
-    pub fn get(&self, crc: u32) -> Option<&str> {
+    fn get(&self, crc: u32) -> Option<&str> {
         self.map.get(&crc).map(|s| &**s)
-    }
-
-    pub fn len(&self) -> usize {
-        self.map.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.map.is_empty()
     }
 }
 
@@ -964,7 +1212,7 @@ pub struct Asset {
     bytes: Vec<u8>,
     header: Header,
     types: Vec<TypeEntry>,
-    layout: Layout,
+    heap: Heap,
     spans: Vec<Span>,
     properties: Vec<CustomProperty>,
     // Every value decoded through the class schema (no fallback scan).
@@ -981,20 +1229,36 @@ pub struct Asset {
     // An EnumAsset's conversion rules, read on first use (bindings ask
     // for a rule's value every time they run).
     enum_rules: std::sync::OnceLock<Vec<EnumRule>>,
+    // Its WidgetType chain (`Asset::widget_types`), read on first use.
+    widget_types: std::sync::OnceLock<Box<[Guid]>>,
     // See `Asset::widgets`.
     widgets: WidgetCache,
 }
 
-/// [`Asset::widgets`] as last read, with the palette generation it was
-/// read at.
-#[derive(Debug, Default)]
-struct WidgetCache(std::sync::Mutex<Option<(u64, std::sync::Arc<[Widget]>)>>);
+/// The palettes an asset's ColorTypes resolve through
+/// ([`Asset::use_palettes`]), and [`Asset::widgets`] as last read, keyed by
+/// those palettes and their generation.
+#[derive(Default)]
+struct WidgetCache {
+    palettes: std::sync::RwLock<Option<std::sync::Arc<Palettes>>>,
+    read: std::sync::Mutex<Option<(PaletteKey, std::sync::Arc<[Widget]>)>>,
+}
+
+/// Which palettes (by address) at which of their generations.
+type PaletteKey = (usize, u64);
 
 impl Clone for WidgetCache {
     fn clone(&self) -> WidgetCache {
-        WidgetCache(std::sync::Mutex::new(
-            self.0.lock().expect("widget cache").clone(),
-        ))
+        WidgetCache {
+            palettes: std::sync::RwLock::new(self.palettes.read().expect("palettes lock").clone()),
+            read: std::sync::Mutex::new(self.read.lock().expect("widget cache").clone()),
+        }
+    }
+}
+
+impl fmt::Debug for WidgetCache {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("WidgetCache")
     }
 }
 
@@ -1078,51 +1342,51 @@ pub struct Edited {
     /// Offsets in the new file where `old_crc` still appears outside the
     /// edited record: something else (a binding, a property id) keys on the
     /// old name. Other assets can hold it too (widgets bind component
-    /// properties by name crc); check them with [`Asset::find_u32`].
+    /// properties by name crc); check them with `Asset::find_u32`.
     pub crc_refs: Vec<usize>,
 }
 
 impl Asset {
     pub fn parse(bytes: Vec<u8>) -> Result<Asset> {
         ensure!(
-            bytes.len() > HEADER_LEN,
+            bytes.len() > Header::LEN,
             "PHX asset too short ({} bytes)",
             bytes.len()
         );
         ensure!(
-            &bytes[..3] == b"PHX",
+            bytes[..Header::MAGIC.len()] == Header::MAGIC,
             "not a PHX asset (magic {:02x?})",
             &bytes[..5]
         );
-        let header = Header(bytes[..HEADER_LEN].try_into().unwrap());
+        let header = Header(bytes[..Header::LEN].try_into().unwrap());
 
         let (types, types_end) = parse_types(&bytes)?;
         ensure!(!types.is_empty(), "class table is empty");
-        let (layout, layout_end) = parse_layout(&bytes, types_end, types.len())?;
+        let (heap, heap_end) = parse_heap(&bytes, types_end, types.len())?;
 
         // About one span per 7 bytes (font data aside, which is one): one
         // reserve with room, shrunk once decoded, instead of growing
         // through a dozen copies.
         let mut head = Vec::with_capacity(bytes.len() / 4 + 16);
-        head.extend([
-            Span::new(0..HEADER_LEN, Record::Header),
-            Span::new(HEADER_LEN..types_end, Record::Types),
-            Span::new(types_end..layout_end, Record::Layout),
-        ]);
+        let sections = [
+            Span::new(0..Header::LEN, Record::Header),
+            Span::new(Header::LEN..types_end, Record::Types),
+            Span::new(types_end..heap_end, Record::Heap),
+        ];
+        let section_count = sections.len();
+        head.extend(sections);
         let schema = file_schema(&types).unwrap_or_default();
         // The body decodes into the span list after the header sections,
         // not into one of its own to be copied over.
         let mut wire = Wire::new(&bytes, &types, &schema, head);
-        let parsed = (!schema.is_empty())
-            .then(|| wire.parse(layout_end))
-            .flatten();
+        let parsed = (!schema.is_empty()).then(|| wire.parse(heap_end)).flatten();
         let (mut spans, properties, typed) = match parsed {
             Some(()) => (wire.spans, wire.properties, true),
             None => {
                 let mut spans = wire.spans;
-                spans.truncate(3);
+                spans.truncate(section_count);
                 let mut body = Body::new(&bytes, &types);
-                body.parse(layout_end, &layout)?;
+                body.parse(heap_end, &heap)?;
                 spans.append(&mut body.spans);
                 (spans, Vec::new(), false)
             }
@@ -1141,7 +1405,7 @@ impl Asset {
             bytes,
             header,
             types,
-            layout,
+            heap,
             spans,
             properties,
             typed,
@@ -1150,6 +1414,7 @@ impl Asset {
             field_spans,
             guid: None,
             enum_rules: std::sync::OnceLock::new(),
+            widget_types: std::sync::OnceLock::new(),
             widgets: WidgetCache::default(),
         };
         let guid = asset.objects().find_map(|(_, o)| match o.id {
@@ -1175,8 +1440,8 @@ impl Asset {
     pub fn types(&self) -> &[TypeEntry] {
         &self.types
     }
-    pub fn layout(&self) -> &Layout {
-        &self.layout
+    pub fn heap(&self) -> &Heap {
+        &self.heap
     }
     /// Every byte of the file lies in exactly one span, in file order.
     pub fn spans(&self) -> &[Span] {
@@ -1193,16 +1458,12 @@ impl Asset {
     }
     /// Wire property list of `class` as this file wrote it (older class
     /// versions included). Index `i` is presence-mask bit `i + 1`.
-    pub fn class_props(&self, class: u32) -> Option<&[&'static Prop]> {
+    fn class_props(&self, class: u32) -> Option<&[&'static Prop]> {
         self.schema.get(&class).map(|v| v.as_slice())
     }
 
     pub fn root_class(&self) -> u32 {
         self.types[0].class
-    }
-    /// Schema hash of the root class (the doc's per-kind "schema guid").
-    pub fn schema(&self) -> [u8; 16] {
-        self.types[0].schema
     }
     /// The guid in the root object header; equals the file name.
     pub fn guid(&self) -> Option<Guid> {
@@ -1219,7 +1480,7 @@ impl Asset {
             })
     }
 
-    pub fn strings(&self) -> impl Iterator<Item = (usize, &StrRecord)> {
+    fn strings(&self) -> impl Iterator<Item = (usize, &StrRecord)> {
         self.spans
             .iter()
             .enumerate()
@@ -1229,7 +1490,7 @@ impl Asset {
             })
     }
 
-    pub fn references(&self) -> impl Iterator<Item = (usize, &Reference)> {
+    fn references(&self) -> impl Iterator<Item = (usize, &Reference)> {
         self.spans
             .iter()
             .enumerate()
@@ -1261,12 +1522,12 @@ impl Asset {
             .collect()
     }
 
-    /// Size of the array in the root's first pointer slot, when the layout
+    /// Size of the array in the root's first pointer slot, when the heap
     /// starts `40 root, 42 n`. For widget templates this is the number of
     /// top-level widgets (`… <mask> 01 00 00 00 <n> 02 02 <id> …`).
     pub fn root_children(&self) -> Option<u32> {
-        match self.layout.tokens.get(1) {
-            Some(t) if t.kind == TOKEN_ARRAY => Some(t.count),
+        match self.heap.allocations.get(1) {
+            Some(t) if t.kind == AllocKind::slots(WireType::OwnedPointer) => Some(t.count),
             _ => None,
         }
     }
@@ -1326,7 +1587,7 @@ impl Asset {
     }
 
     /// Offsets of every little-endian occurrence of `value` in the file.
-    pub fn find_u32(&self, value: u32) -> Vec<usize> {
+    fn find_u32(&self, value: u32) -> Vec<usize> {
         let needle = value.to_le_bytes();
         self.bytes
             .windows(4)
@@ -1370,7 +1631,7 @@ impl Asset {
         match record {
             Record::Header => out.extend_from_slice(&self.header.0),
             Record::Types => encode_types(&self.types, out),
-            Record::Layout => encode_layout(&self.layout, out),
+            Record::Heap => encode_heap(&self.heap, out),
             Record::Object(o) => encode_object(o, out),
             Record::Str(s) => {
                 if s.with_crc {
@@ -1378,15 +1639,11 @@ impl Asset {
                 }
                 write_str_payload(out, &s.text);
             }
-            Record::Ref(r) => {
-                out.push(1);
-                out.extend_from_slice(&r.class.to_le_bytes());
-                out.extend_from_slice(&r.id.0);
-            }
+            Record::Ref(r) => r.encode(out),
             Record::Color(rgb) => out.extend_from_slice(rgb),
             Record::Value(v) => v.encode(out),
-            Record::Null => out.push(0),
-            Record::Count(n) => write_varint(out, *n),
+            Record::Null => out.push(ObjectId::NULL),
+            Record::Count(n) => varint::write(out, *n),
             Record::Default(v) => v.encode(out),
             Record::Bytes | Record::Opaque => out.extend_from_slice(&self.bytes[range.clone()]),
         }
@@ -1397,8 +1654,8 @@ impl Asset {
     /// span byte-identical.
     ///
     /// Length changes are safe in the container: there are no offset tables
-    /// or size fields (header bytes 8..16 are constant, the layout byte count
-    /// covers only the layout section, string lengths are per-record varints).
+    /// or size fields (header bytes 8..16 are constant, the heap byte count
+    /// covers only the heap section, string lengths are per-record varints).
     pub fn apply(&self, edit: &Edit) -> Result<Edited> {
         self.apply_many(std::slice::from_ref(edit))
     }
@@ -1409,7 +1666,7 @@ impl Asset {
     /// span stays byte-identical. No two edits may target the same span.
     /// `old_crc`/`crc_refs` report the first text edit that changes a CRC'd
     /// string (the one consumers of a single `apply` would see).
-    pub fn apply_many(&self, edits: &[Edit]) -> Result<Edited> {
+    fn apply_many(&self, edits: &[Edit]) -> Result<Edited> {
         if edits.is_empty() {
             bail!("no edits to apply");
         }
@@ -1486,17 +1743,17 @@ impl Asset {
     }
 
     /// First byte of the body (the root object).
-    pub fn body_start(&self) -> usize {
+    fn body_start(&self) -> usize {
         self.spans[2].range.end
     }
 
     /// Applies structural splices to the body (objects added, removed or
     /// moved; array counts changed) and re-derives what depends on it: the
-    /// class table's heap instance counts and the layout section. `classes`
+    /// class table's heap instance counts and the heap section. `classes`
     /// adds class table entries (with their base chains) for objects of
     /// classes this file did not use before.
     ///
-    /// The layout section is a function of the body, checked against all
+    /// The heap section is a function of the body, checked against all
     /// 4,682 installed assets: in file order, `0x40 1 <class index>` per heap
     /// object and `<element type code> n` per non-empty array (`0x42` pointer
     /// arrays, `0x08` u32 arrays), plus after a binding's target array one
@@ -1505,7 +1762,7 @@ impl Asset {
     /// file); new kinds go last.
     // TODO(alex): new class table entries are appended; the serializer adds
     // them in first-use order. Not known whether the runtime cares.
-    pub fn rebuild(&self, splices: &[Splice], classes: &[u32]) -> Result<Asset> {
+    fn rebuild(&self, splices: &[Splice], classes: &[u32]) -> Result<Asset> {
         let start = self.body_start();
         let mut sorted: Vec<&Splice> = splices.iter().collect();
         sorted.sort_by_key(|s| (s.range.start, s.range.end));
@@ -1559,11 +1816,11 @@ impl Asset {
             Record::Object(o) => o.class,
             _ => unreachable!("field owner is an object"),
         };
-        let mut tokens = Vec::new();
+        let mut allocations = Vec::new();
         for s in &wire.spans {
             match &s.record {
-                Record::Object(o) if o.heap => tokens.push(LayoutToken {
-                    kind: TOKEN_OBJECT,
+                Record::Object(o) if o.heap => allocations.push(Allocation {
+                    kind: AllocKind::OBJECT,
                     count: 1,
                     class_index: Some(index[&o.class]),
                 }),
@@ -1572,18 +1829,18 @@ impl Asset {
                     let class = class_of(f.object);
                     let prop = schema[&class][f.prop as usize - 1];
                     if *n > 0 {
-                        tokens.push(LayoutToken {
-                            kind: (prop.ty >> 8) as u8,
+                        allocations.push(Allocation {
+                            kind: AllocKind(prop.type_byte()),
                             count: *n,
                             class_index: None,
                         });
                     }
-                    if prop.name_crc == PROP_BINDING_TARGETS {
+                    if prop.name_crc == Prop::BINDING_TARGETS {
                         let sources = wire.spans.iter().find_map(|t| match (&t.record, t.field) {
                             (Record::Count(k), Some(g))
                                 if g.object == f.object
                                     && schema[&class][g.prop as usize - 1].name_crc
-                                        == PROP_BINDING_SOURCES =>
+                                        == Prop::BINDING_SOURCES =>
                             {
                                 Some(*k)
                             }
@@ -1591,8 +1848,8 @@ impl Asset {
                         });
                         for k in [sources.unwrap_or(0), *n] {
                             if k > 0 {
-                                tokens.push(LayoutToken {
-                                    kind: TOKEN_BINDING_INDICES,
+                                allocations.push(Allocation {
+                                    kind: AllocKind::BINDING_INDICES,
                                     count: k,
                                     class_index: None,
                                 });
@@ -1603,27 +1860,27 @@ impl Asset {
                 _ => {}
             }
         }
-        let mut sums: BTreeMap<u8, u32> = BTreeMap::new();
-        for t in tokens.iter().filter(|t| t.kind != TOKEN_OBJECT) {
+        let mut sums: BTreeMap<AllocKind, u32> = BTreeMap::new();
+        for t in allocations.iter().filter(|t| t.kind != AllocKind::OBJECT) {
             *sums.entry(t.kind).or_default() += t.count;
         }
-        let mut counts: Vec<(u8, u32)> = self
-            .layout
+        let mut counts: Vec<(AllocKind, u32)> = self
+            .heap
             .counts
             .iter()
             .filter_map(|&(k, _)| Some((k, sums.remove(&k)?)))
             .collect();
         counts.extend(sums.into_iter().rev());
-        let layout = Layout {
+        let heap = Heap {
             counts,
-            reserved: self.layout.reserved,
-            tokens,
+            reserved: self.heap.reserved,
+            allocations,
         };
 
         let mut out = Vec::with_capacity(body.len() + start);
         out.extend_from_slice(&self.header.0);
         encode_types(&types, &mut out);
-        encode_layout(&layout, &mut out);
+        encode_heap(&heap, &mut out);
         out.extend_from_slice(&body);
         let next = Asset::parse(out).context("the rebuilt asset does not parse")?;
         ensure!(next.typed, "the rebuilt asset is not fully typed");
@@ -1701,82 +1958,59 @@ fn is_image_path(s: &str) -> bool {
 // ---------------------------------------------------------------------------
 // Header sections
 
-// LEB128, canonical only: a padded form (`85 00` for 5) or one that overflows
-// u32 is rejected, so every decoded record re-encodes to its own bytes.
-fn read_varint(b: &[u8], mut p: usize) -> Option<(u32, usize)> {
-    let mut v: u32 = 0;
-    for shift in (0..35).step_by(7) {
-        let x = *b.get(p)?;
-        p += 1;
-        if (shift == 28 && x > 0x0f) || (shift > 0 && x == 0) {
-            return None;
-        }
-        v |= u32::from(x & 0x7f) << shift;
-        if x < 0x80 {
-            return Some((v, p));
-        }
-    }
-    None
-}
-
-fn write_varint(out: &mut Vec<u8>, mut v: u32) {
-    while v >= 0x80 {
-        out.push((v as u8) | 0x80);
-        v >>= 7;
-    }
-    out.push(v as u8);
-}
-
 fn u32_at(b: &[u8], p: usize) -> Option<u32> {
     Some(u32::from_le_bytes(
-        b.get(p..p.checked_add(4)?)?.try_into().unwrap(),
+        b.get(p..p.checked_add(CRC)?)?.try_into().unwrap(),
     ))
 }
 
 fn guid_at(b: &[u8], p: usize) -> Option<Guid> {
-    Some(Guid(b.get(p..p.checked_add(16)?)?.try_into().unwrap()))
+    Some(Guid(b.get(p..p.checked_add(ID)?)?.try_into().unwrap()))
 }
 
 fn write_str_payload(out: &mut Vec<u8>, s: &str) {
-    write_varint(out, s.len() as u32);
+    varint::write(out, s.len() as u32);
     if !s.is_empty() {
         out.push(str_encoding(s));
         out.extend_from_slice(s.as_bytes());
     }
 }
 
-// The byte after a non-empty string's length: `01` for ASCII, `03` for text
-// with non-ASCII UTF-8 (2 shipped strings, both mojibake). Empty strings are
-// the bare `00` length.
+// The byte after a non-empty string's length (2 shipped strings are
+// non-ASCII, both mojibake). Empty strings are the bare `00` length.
 fn str_encoding(s: &str) -> u8 {
-    if s.is_ascii() { 1 } else { 3 }
+    if s.is_ascii() {
+        StrRecord::ASCII
+    } else {
+        StrRecord::UTF8
+    }
 }
 
 // `<varint len> <encoding> <bytes>` at `p`; the encoding byte must be the one
 // write_str_payload would emit so the record re-encodes exactly.
 fn read_str(b: &[u8], p: usize) -> Option<(String, usize)> {
-    let (n, q) = read_varint(b, p)?;
+    let (n, q) = varint::read(b, p)?;
     if n == 0 {
         return Some((String::new(), q));
     }
-    let end = (q + 1).checked_add(n as usize)?;
-    let text = std::str::from_utf8(b.get(q + 1..end)?).ok()?;
+    let end = (q + ObjectId::TAG).checked_add(n as usize)?;
+    let text = std::str::from_utf8(b.get(q + ObjectId::TAG..end)?).ok()?;
     (*b.get(q)? == str_encoding(text)).then(|| (text.to_owned(), end))
 }
 
 fn parse_types(b: &[u8]) -> Result<(Vec<TypeEntry>, usize)> {
-    let (n, mut p) = read_varint(b, HEADER_LEN).context("class table count")?;
+    let (n, mut p) = varint::read(b, Header::LEN).context("class table count")?;
     ensure!(n <= MAX_TYPES, "class table claims {n} entries");
     let mut types = Vec::with_capacity(n as usize);
     for i in 0..n {
         let truncated = || format!("class table entry {i} truncated");
         let class = u32_at(b, p).with_context(truncated)?;
-        let schema: [u8; 16] = b
-            .get(p + 4..p + 20)
+        let schema: [u8; ID] = b
+            .get(p + CRC..p + CRC + ID)
             .with_context(truncated)?
             .try_into()
             .unwrap();
-        let (instances, q) = read_varint(b, p + 20).with_context(truncated)?;
+        let (instances, q) = varint::read(b, p + CRC + ID).with_context(truncated)?;
         types.push(TypeEntry {
             class,
             schema,
@@ -1787,120 +2021,150 @@ fn parse_types(b: &[u8]) -> Result<(Vec<TypeEntry>, usize)> {
     let mut check = Vec::new();
     encode_types(&types, &mut check);
     ensure!(
-        check == b[HEADER_LEN..p],
+        check == b[Header::LEN..p],
         "class table uses non-canonical varints"
     );
     Ok((types, p))
 }
 
 fn encode_types(types: &[TypeEntry], out: &mut Vec<u8>) {
-    write_varint(out, types.len() as u32);
+    varint::write(out, types.len() as u32);
     for t in types {
         out.extend_from_slice(&t.class.to_le_bytes());
         out.extend_from_slice(&t.schema);
-        write_varint(out, t.instances);
+        varint::write(out, t.instances);
     }
 }
 
-fn parse_layout(b: &[u8], start: usize, n_types: usize) -> Result<(Layout, usize)> {
-    let bad = || format!("layout section at {start:#x} truncated");
-    let (k, mut p) = read_varint(b, start).with_context(bad)?;
-    ensure!(k <= 256, "layout claims {k} count kinds");
+fn parse_heap(b: &[u8], start: usize, n_types: usize) -> Result<(Heap, usize)> {
+    let bad = || format!("heap section at {start:#x} truncated");
+    let (k, mut p) = varint::read(b, start).with_context(bad)?;
+    ensure!(k <= 256, "heap section claims {k} count kinds");
     let mut counts = Vec::with_capacity(k as usize);
     for _ in 0..k {
-        let kind = *b.get(p).with_context(bad)?;
-        let (n, q) = read_varint(b, p + 1).with_context(bad)?;
+        let kind = AllocKind(*b.get(p).with_context(bad)?);
+        let (n, q) = varint::read(b, p + 1).with_context(bad)?;
         counts.push((kind, n));
         p = q;
     }
     let reserved = *b.get(p).with_context(bad)?;
-    let (n_tokens, q) = read_varint(b, p + 1).with_context(bad)?;
-    let (n_bytes, q) = read_varint(b, q).with_context(bad)?;
+    let (n_allocs, q) = varint::read(b, p + 1).with_context(bad)?;
+    let (n_bytes, q) = varint::read(b, q).with_context(bad)?;
     ensure!(
-        n_tokens <= MAX_LAYOUT_TOKENS,
-        "layout claims {n_tokens} tokens"
+        n_allocs <= MAX_ALLOCATIONS,
+        "heap section claims {n_allocs} allocations"
     );
     let end = q
         .checked_add(n_bytes as usize)
         .filter(|&e| e <= b.len())
         .with_context(bad)?;
-    let mut tokens = Vec::with_capacity(n_tokens as usize);
+    let mut allocations = Vec::with_capacity(n_allocs as usize);
     let mut p = q;
     while p < end {
-        let kind = b[p];
-        let (count, q) = read_varint(b, p + 1)
+        let kind = AllocKind(b[p]);
+        let (count, q) = varint::read(b, p + 1)
             .filter(|x| x.1 <= end)
             .with_context(bad)?;
         p = q;
-        let class_index = if kind == TOKEN_OBJECT {
-            let (ci, q) = read_varint(b, p).filter(|x| x.1 <= end).with_context(bad)?;
+        let class_index = if kind == AllocKind::OBJECT {
+            let (ci, q) = varint::read(b, p)
+                .filter(|x| x.1 <= end)
+                .with_context(bad)?;
             ensure!(
                 (ci as usize) < n_types,
-                "layout token names class {ci} of {n_types}"
+                "allocation names class {ci} of {n_types}"
             );
             p = q;
             Some(ci)
         } else {
             None
         };
-        tokens.push(LayoutToken {
+        allocations.push(Allocation {
             kind,
             count,
             class_index,
         });
     }
     ensure!(
-        tokens.len() == n_tokens as usize,
-        "layout has {} tokens, its header says {n_tokens}",
-        tokens.len()
+        allocations.len() == n_allocs as usize,
+        "heap section has {} allocations, its header says {n_allocs}",
+        allocations.len()
     );
-    let layout = Layout {
+    let heap = Heap {
         counts,
         reserved,
-        tokens,
+        allocations,
     };
     let mut check = Vec::new();
-    encode_layout(&layout, &mut check);
+    encode_heap(&heap, &mut check);
     ensure!(
         check == b[start..end],
-        "layout section uses non-canonical varints"
+        "heap section uses non-canonical varints"
     );
-    Ok((layout, end))
+    Ok((heap, end))
 }
 
-fn encode_layout(layout: &Layout, out: &mut Vec<u8>) {
-    write_varint(out, layout.counts.len() as u32);
-    for &(kind, n) in &layout.counts {
-        out.push(kind);
-        write_varint(out, n);
+fn encode_heap(heap: &Heap, out: &mut Vec<u8>) {
+    varint::write(out, heap.counts.len() as u32);
+    for &(kind, n) in &heap.counts {
+        out.push(kind.0);
+        varint::write(out, n);
     }
-    out.push(layout.reserved);
+    out.push(heap.reserved);
     let mut body = Vec::new();
-    for t in &layout.tokens {
-        body.push(t.kind);
-        write_varint(&mut body, t.count);
+    for t in &heap.allocations {
+        body.push(t.kind.0);
+        varint::write(&mut body, t.count);
         if let Some(ci) = t.class_index {
-            write_varint(&mut body, ci);
+            varint::write(&mut body, ci);
         }
     }
-    write_varint(out, layout.tokens.len() as u32);
-    write_varint(out, body.len() as u32);
+    varint::write(out, heap.allocations.len() as u32);
+    varint::write(out, body.len() as u32);
     out.extend_from_slice(&body);
 }
 
 fn encode_object(o: &ObjectHeader, out: &mut Vec<u8>) {
-    out.push(2);
-    match o.id {
-        ObjectId::Root(g) => out.extend_from_slice(&g.0),
-        ObjectId::None => out.push(0),
-        ObjectId::Id(g) => {
-            out.push(2);
-            out.extend_from_slice(&g.0);
-        }
-    }
+    o.id.encode(out);
     out.extend_from_slice(&o.class.to_le_bytes());
     out.push(o.prop_count);
     out.extend_from_slice(&o.mask);
+}
+
+/// The header of a new object of `class`, written as the editor writes
+/// every object it adds: the class's current version, each of its wire
+/// properties present. Its values follow in wire order.
+fn new_object(out: &mut Vec<u8>, id: ObjectId, class: u32) {
+    let n = wire_props(class)
+        .unwrap_or_else(|| panic!("class {class:08x} is not in the registry"))
+        .len();
+    // Presence bit `i` (MSB first) is wire prop `i`; bit 0 is never set.
+    let mut mask = vec![0u8; (n + 1).div_ceil(8)];
+    for i in 1..=n {
+        let (byte, bit) = ObjectHeader::mask_bit(i);
+        mask[byte] |= bit;
+    }
+    encode_object(
+        &ObjectHeader {
+            id,
+            class,
+            prop_count: u8::try_from(n + 1).expect("a class's props fit the count byte"),
+            mask: mask.into(),
+            heap: false,
+        },
+        out,
+    );
+}
+
+impl Reference {
+    /// Tag, class crc and id.
+    const LEN: usize = ObjectId::TAG + CRC + ID;
+
+    fn encode(&self, out: &mut Vec<u8>) {
+        out.push(ObjectId::REFERENCE);
+        out.extend_from_slice(&self.class.to_le_bytes());
+        out.extend_from_slice(&self.id.0);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1967,15 +2231,6 @@ fn merge_opaque(spans: &mut Vec<Span>) {
     spans.truncate(kept);
 }
 
-const PROP_UNIQUE_ID: u32 = name_crc(b"UniqueId");
-const PROP_PROPERTY_TYPE: u32 = name_crc(b"PropertyType");
-const PROP_DEFAULT_VALUE: u32 = name_crc(b"DefaultValue");
-const PROP_OBJECT_TEMPLATE: u32 = name_crc(b"ObjectTemplate");
-const PROP_ENUM_ASSET: u32 = name_crc(b"EnumAsset");
-// The name string of named objects (widgets, custom properties); its
-// `NameCrc` u32 sits right before it.
-const PROP_NAME: u32 = name_crc(b"PhoenixDebugName");
-
 // Schema-driven body decode: the root object, then every property value in
 // wire order, recursing through pointers. All-or-nothing: None means some
 // class or value shape is not covered and the caller falls back to Body.
@@ -1984,7 +2239,7 @@ struct Wire<'a> {
     schema: &'a HashMap<u32, Vec<&'static Prop>>,
     // Classes the class table counts heap instances for, with the count.
     heap: HashMap<u32, u32>,
-    // Rebuilding after a splice: heap-ness comes from VALUE_CLASSES and the
+    // Rebuilding after a splice: heap-ness comes from Class::BY_VALUE and the
     // counts are whatever the body holds (`seen`), not checked.
     recount: bool,
     seen: HashMap<u32, u32>,
@@ -2028,11 +2283,11 @@ impl<'a> Wire<'a> {
 
     fn parse(&mut self, start: usize) -> Option<()> {
         let b = self.b;
-        if *b.get(start)? != 2 {
+        if *b.get(start)? != ObjectId::OWNED {
             return None;
         }
-        let id = ObjectId::Root(guid_at(b, start + 1)?);
-        let end = self.object_at(start, start + 17, id, None)?;
+        let id = ObjectId::Root(guid_at(b, start + ObjectId::TAG)?);
+        let end = self.object_at(start, start + id.len(), id, None)?;
         // Heap objects must match the class table counts one for one.
         (end == b.len() && (self.recount || self.seen == self.heap)).then_some(())
     }
@@ -2047,9 +2302,9 @@ impl<'a> Wire<'a> {
         field: Option<Field>,
     ) -> Option<usize> {
         let class = u32_at(self.b, c)?;
-        let (prop_count, mask, e) = read_counts(self.b, c + 4)?;
+        let (prop_count, mask, e) = read_counts(self.b, c + CRC)?;
         let heap = if self.recount {
-            !VALUE_CLASSES.contains(&class)
+            !Class::BY_VALUE.contains(&class)
         } else {
             self.heap.contains_key(&class)
         };
@@ -2073,18 +2328,18 @@ impl<'a> Wire<'a> {
             .collect();
         let obj = self.push(start..e, Record::Object(header), field);
         let mut p = e;
-        if class == CLASS_COLOR && present == [1, 2, 3] {
+        if class == Class::COLOR && present.len() == Class::COLOR_BYTES {
             // One span for R, G, B so a color edit is one record.
-            let rgb = self.b.get(p..p + 3)?.try_into().unwrap();
+            let rgb = self.b.get(p..p + Class::COLOR_BYTES)?.try_into().unwrap();
             self.push(
-                p..p + 3,
+                p..p + Class::COLOR_BYTES,
                 Record::Color(rgb),
                 Some(Field {
                     object: obj,
                     prop: 1,
                 }),
             );
-            return Some(p + 3);
+            return Some(p + Class::COLOR_BYTES);
         }
         for i in present {
             let field = Field {
@@ -2093,22 +2348,24 @@ impl<'a> Wire<'a> {
             };
             p = self.value(p, field, props[i - 1])?;
         }
-        if class == CLASS_CUSTOM_PROPERTY {
+        if class == Class::CUSTOM_PROPERTY {
             self.custom_property(obj, props);
         }
         Some(p)
     }
 
     fn value(&mut self, p: usize, field: Field, prop: &Prop) -> Option<usize> {
-        if prop.ty & 1 == 0 {
-            return self.element(p, field, prop.ty, prop);
+        let ty = prop.wire_type()?;
+        if !prop.is_array() {
+            return self.element(p, field, ty, prop);
         }
-        let (n, mut q) = read_varint(self.b, p)?;
+        let (n, mut q) = varint::read(self.b, p)?;
         if n as usize > self.b.len() - q {
             return None;
         }
         self.push(p..q, Record::Count(n), Some(field));
-        if prop.ty & !1 == 0x0400 {
+        // Byte arrays are one span.
+        if ty == WireType::U8 {
             let end = q + n as usize;
             if n > 0 {
                 self.push(q..end, Record::Bytes, Some(field));
@@ -2116,51 +2373,40 @@ impl<'a> Wire<'a> {
             return Some(end);
         }
         for _ in 0..n {
-            q = self.element(q, field, prop.ty & !1, prop)?;
+            q = self.element(q, field, ty, prop)?;
         }
         Some(q)
     }
 
-    fn element(&mut self, p: usize, field: Field, ty: u16, prop: &Prop) -> Option<usize> {
+    fn element(&mut self, p: usize, field: Field, ty: WireType, prop: &Prop) -> Option<usize> {
         let b = self.b;
         let f32_at = |i: usize| u32_at(b, p + 4 * i).map(f32::from_bits);
-        let (value, width) = match ty {
-            0x0100 => match *b.get(p)? {
-                v @ (0 | 1) => (Value::Bool(v == 1), 1),
-                v => (Value::U8(v), 1),
+        let value = match ty {
+            WireType::Bool => match *b.get(p)? {
+                v @ (0 | 1) => Value::Bool(v == 1),
+                v => Value::U8(v),
             },
-            0x0400 => (Value::U8(*b.get(p)?), 1),
-            0x0600 => (
-                Value::U16(u16::from_le_bytes(b.get(p..p + 2)?.try_into().unwrap())),
-                2,
-            ),
-            0x0700 => (Value::S32(u32_at(b, p)? as i32), 4),
-            0x0800 => (Value::U32(u32_at(b, p)?), 4),
-            0x0a00 => (
-                Value::U64(u64::from_le_bytes(b.get(p..p + 8)?.try_into().unwrap())),
-                8,
-            ),
-            0x0b00 => (
-                Value::Enum {
-                    ty: prop.type_crc,
-                    value: u32_at(b, p)?,
-                },
-                4,
-            ),
-            0x1000 => (Value::F32(f32_at(0)?), 4),
-            0x1100 => (Value::Vec2([f32_at(0)?, f32_at(1)?]), 8),
-            0x1200 => (Value::Vec3([f32_at(0)?, f32_at(1)?, f32_at(2)?]), 12),
-            0x1300 => (
-                Value::Vec4([f32_at(0)?, f32_at(1)?, f32_at(2)?, f32_at(3)?]),
-                16,
-            ),
-            0x1900 => (Value::Guid(guid_at(b, p)?), 16),
-            0x1700 => return self.string(p, field),
-            0x1f00 => return self.variant(p, field),
-            0x4000 | 0x4200 => return self.pointer(p, field),
-            0x4300 | 0x4400 => return self.asset_ref(p, field),
-            _ => return None,
+            WireType::U8 => Value::U8(*b.get(p)?),
+            WireType::U16 => Value::U16(u16::from_le_bytes(b.get(p..p + 2)?.try_into().unwrap())),
+            WireType::S32 => Value::S32(u32_at(b, p)? as i32),
+            WireType::U32 => Value::U32(u32_at(b, p)?),
+            WireType::U64 => Value::U64(u64::from_le_bytes(b.get(p..p + 8)?.try_into().unwrap())),
+            WireType::Enum => Value::Enum {
+                ty: prop.type_crc,
+                value: u32_at(b, p)?,
+            },
+            WireType::F32 => Value::F32(f32_at(0)?),
+            WireType::Vec2 => Value::Vec2([f32_at(0)?, f32_at(1)?]),
+            WireType::Vec3 => Value::Vec3([f32_at(0)?, f32_at(1)?, f32_at(2)?]),
+            WireType::Vec4 => Value::Vec4([f32_at(0)?, f32_at(1)?, f32_at(2)?, f32_at(3)?]),
+            WireType::Id => Value::Guid(guid_at(b, p)?),
+            WireType::Str => return self.string(p, field),
+            WireType::Variant => return self.variant(p, field),
+            WireType::Pointer | WireType::OwnedPointer => return self.pointer(p, field),
+            WireType::AssetRef | WireType::AssetRef2 => return self.asset_ref(p, field),
+            WireType::None => return None,
         };
+        let width = ty.width()?;
         self.push(p..p + width, Record::Value(value), Some(field));
         Some(p + width)
     }
@@ -2199,23 +2445,28 @@ impl<'a> Wire<'a> {
             return None;
         }
         let q = p + 2;
-        let (value, end) = match *b.get(p + 1)? {
-            0x00 => (DefaultValue::None, q),
-            0x01 => (DefaultValue::Bool(*b.get(q)?), q + 1),
-            0x07 => (DefaultValue::S32(u32_at(b, q)? as i32), q + 4),
-            0x08 => (DefaultValue::U32(u32_at(b, q)?), q + 4),
-            0x10 => (DefaultValue::F32(u32_at(b, q)?), q + 4),
-            t @ 0x11..=0x13 => {
-                let n = (t - 0x0f) as usize;
-                let v: Option<Vec<u32>> = (0..n).map(|i| u32_at(b, q + 4 * i)).collect();
-                (DefaultValue::Vec(v?), q + 4 * n)
+        let ty = WireType::of(*b.get(p + 1)?)?;
+        let value = match ty {
+            WireType::None => DefaultValue::None,
+            WireType::Bool => DefaultValue::Bool(*b.get(q)?),
+            WireType::S32 => DefaultValue::S32(u32_at(b, q)? as i32),
+            WireType::U32 => DefaultValue::U32(u32_at(b, q)?),
+            WireType::F32 => DefaultValue::F32(u32_at(b, q)?),
+            WireType::Vec2 | WireType::Vec3 | WireType::Vec4 => {
+                let v: Option<Vec<u32>> = (0..ty.lanes()?).map(|i| u32_at(b, q + 4 * i)).collect();
+                DefaultValue::Vec(v?)
             }
-            0x17 => {
+            WireType::Str => {
                 let (text, end) = read_str(b, q)?;
-                (DefaultValue::Str(text), end)
+                self.push(
+                    p..end,
+                    Record::Default(DefaultValue::Str(text)),
+                    Some(field),
+                );
+                return Some(end);
             }
-            0x19 => (DefaultValue::ObjectId(guid_at(b, q)?), q + 16),
-            0x40 => {
+            WireType::Id => DefaultValue::ObjectId(guid_at(b, q)?),
+            WireType::Pointer => {
                 let class = u32_at(b, q)?;
                 self.push(
                     p..q + 4,
@@ -2226,6 +2477,8 @@ impl<'a> Wire<'a> {
             }
             _ => return None,
         };
+        // No payload is `None`'s width.
+        let end = q + ty.width().unwrap_or(0);
         self.push(p..end, Record::Default(value), Some(field));
         Some(end)
     }
@@ -2234,11 +2487,14 @@ impl<'a> Wire<'a> {
     fn pointer(&mut self, p: usize, field: Field) -> Option<usize> {
         let b = self.b;
         match *b.get(p)? {
-            2 => match *b.get(p + 1)? {
-                0 => self.object_at(p, p + 2, ObjectId::None, Some(field)),
-                2 => self.object_at(p, p + 18, ObjectId::Id(guid_at(b, p + 2)?), Some(field)),
-                _ => None,
-            },
+            ObjectId::OWNED => {
+                let id = match *b.get(p + 1)? {
+                    ObjectId::NO_ID => ObjectId::None,
+                    ObjectId::WITH_ID => ObjectId::Id(guid_at(b, p + 2)?),
+                    _ => return None,
+                };
+                self.object_at(p, p + id.len(), id, Some(field))
+            }
             _ => self.asset_ref(p, field),
         }
     }
@@ -2246,17 +2502,18 @@ impl<'a> Wire<'a> {
     fn asset_ref(&mut self, p: usize, field: Field) -> Option<usize> {
         let b = self.b;
         match *b.get(p)? {
-            0 => {
+            ObjectId::NULL => {
                 self.push(p..p + 1, Record::Null, Some(field));
                 Some(p + 1)
             }
-            1 => {
+            ObjectId::REFERENCE => {
                 let r = Reference {
                     class: u32_at(b, p + 1)?,
                     id: guid_at(b, p + 5)?,
                 };
-                self.push(p..p + 21, Record::Ref(r), Some(field));
-                Some(p + 21)
+                let end = p + Reference::LEN;
+                self.push(p..end, Record::Ref(r), Some(field));
+                Some(end)
             }
             _ => None,
         }
@@ -2273,16 +2530,16 @@ impl<'a> Wire<'a> {
             };
             let idx = obj + 1 + k;
             match (props[f.prop as usize - 1].name_crc, &s.record) {
-                (PROP_UNIQUE_ID, Record::Value(Value::U32(v))) => uid = Some(*v),
-                (PROP_PROPERTY_TYPE, Record::Value(Value::Enum { value, .. })) => {
+                (Prop::UNIQUE_ID, Record::Value(Value::U32(v))) => uid = Some(*v),
+                (Prop::PROPERTY_TYPE, Record::Value(Value::Enum { value, .. })) => {
                     kind = Some(*value)
                 }
-                (PROP_DEFAULT_VALUE, Record::Default(_)) if default.is_none() => {
+                (Prop::DEFAULT_VALUE, Record::Default(_)) if default.is_none() => {
                     default = Some(idx)
                 }
-                (PROP_OBJECT_TEMPLATE, Record::Ref(r)) => object_asset = Some(*r),
-                (PROP_ENUM_ASSET, Record::Ref(r)) => enum_asset = Some(*r),
-                (PROP_NAME, Record::Str(_)) => name = Some(idx),
+                (Prop::OBJECT_TEMPLATE, Record::Ref(r)) => object_asset = Some(*r),
+                (Prop::ENUM_ASSET, Record::Ref(r)) => enum_asset = Some(*r),
+                (Prop::NAME, Record::Str(_)) => name = Some(idx),
                 _ => {}
             }
         }
@@ -2301,7 +2558,7 @@ impl<'a> Wire<'a> {
 }
 
 // Fallback for assets that use a class the schema table lacks: heap objects
-// are anchored through the layout tokens, and between them the scan claims
+// are anchored through the allocations, and between them the scan claims
 // what proves itself (crc-checked strings, references, embedded objects,
 // colors); everything else stays opaque.
 struct Body<'a> {
@@ -2319,7 +2576,7 @@ impl<'a> Body<'a> {
     fn new(b: &'a [u8], types: &'a [TypeEntry]) -> Body<'a> {
         let classes: HashSet<u32> = types.iter().map(|t| t.class).collect();
         let mut ref_classes = classes.clone();
-        ref_classes.extend(KINDS.iter().map(|k| k.2));
+        ref_classes.extend(Header::KINDS.iter().map(|k| k.2));
         Body {
             b,
             types,
@@ -2333,17 +2590,17 @@ impl<'a> Body<'a> {
         self.spans.push(Span::new(range, record));
     }
 
-    fn parse(&mut self, start: usize, layout: &Layout) -> Result<()> {
-        // Heap objects: one per 0x40 token, in the same pre-order as the body.
+    fn parse(&mut self, start: usize, heap: &Heap) -> Result<()> {
+        // Heap objects: one per 0x40 allocation, in the same pre-order as the body.
         let mut anchors: Vec<(usize, usize, ObjectHeader)> = Vec::new();
         let mut cursor = start;
-        for (k, tok) in layout
-            .tokens
+        for (k, a) in heap
+            .allocations
             .iter()
-            .filter(|t| t.kind == TOKEN_OBJECT)
+            .filter(|t| t.kind == AllocKind::OBJECT)
             .enumerate()
         {
-            let class = self.types[tok.class_index.unwrap() as usize].class;
+            let class = self.types[a.class_index.unwrap() as usize].class;
             let found = if k == 0 {
                 self.root_at(cursor, class)
             } else {
@@ -2355,7 +2612,7 @@ impl<'a> Body<'a> {
             anchors.push((s, e, header));
             cursor = e;
         }
-        ensure!(!anchors.is_empty(), "layout has no root object");
+        ensure!(!anchors.is_empty(), "heap section has no root object");
 
         let mut pos = start;
         for i in 0..anchors.len() {
@@ -2373,11 +2630,14 @@ impl<'a> Body<'a> {
     // The root sits exactly at the body start: `02 <file guid> <root class>`.
     fn root_at(&self, p: usize, class: u32) -> Option<(usize, usize, ObjectHeader)> {
         let b = self.b;
-        if *b.get(p)? != 2 || u32_at(b, p + 17)? != class {
+        if *b.get(p)? != ObjectId::OWNED {
             return None;
         }
-        let id = ObjectId::Root(guid_at(b, p + 1)?);
-        let (prop_count, mask, end) = read_counts(b, p + 21)?;
+        let id = ObjectId::Root(guid_at(b, p + ObjectId::TAG)?);
+        if u32_at(b, p + id.len())? != class {
+            return None;
+        }
+        let (prop_count, mask, end) = read_counts(b, p + id.len() + CRC)?;
         Some((
             p,
             end,
@@ -2395,8 +2655,8 @@ impl<'a> Body<'a> {
     fn find_heap(&self, from: usize, class: u32) -> Option<(usize, usize, ObjectHeader)> {
         let b = self.b;
         let needle = class.to_le_bytes();
-        (from + 2..b.len().saturating_sub(3))
-            .filter(|&c| b[c..c + 4] == needle)
+        (from + ObjectId::None.len()..b.len().saturating_sub(CRC - 1))
+            .filter(|&c| b[c..c + CRC] == needle)
             .find_map(|c| self.header_ending_at(from, c, true))
     }
 
@@ -2409,12 +2669,18 @@ impl<'a> Body<'a> {
     ) -> Option<(usize, usize, ObjectHeader)> {
         let b = self.b;
         let class = u32_at(b, c)?;
-        let (start, id) = if c >= from + 2 && b[c - 2] == 2 && b[c - 1] == 0 {
-            (c - 2, ObjectId::None)
-        } else if c >= from + 18 && b[c - 18] == 2 && b[c - 17] == 2 {
-            (c - 18, ObjectId::Id(guid_at(b, c - 16)?))
+        // The id form sits `len` bytes before the crc; an id is the 16
+        // bytes right before it.
+        let form = |id: ObjectId, f: u8| {
+            let n = id.len();
+            (c >= from + n && b[c - n] == ObjectId::OWNED && b[c - n + 1] == f).then_some(c - n)
+        };
+        let any_id = ObjectId::Id(Guid([0; 16]));
+        let (start, id) = if let Some(start) = form(ObjectId::None, ObjectId::NO_ID) {
+            (start, ObjectId::None)
         } else {
-            return None;
+            let start = form(any_id, ObjectId::WITH_ID)?;
+            (start, ObjectId::Id(guid_at(b, c - ID)?))
         };
         let (prop_count, mask, end) = read_counts(b, c + 4)?;
         Some((
@@ -2433,16 +2699,17 @@ impl<'a> Body<'a> {
     // Emits the header span and whatever values we can decode for its class.
     // Returns where generic scanning resumes.
     fn object_values(&mut self, s: usize, e: usize, header: ObjectHeader, limit: usize) -> usize {
-        let is_color = header.class == CLASS_COLOR
-            && header.prop_count == COLOR_PROPS
-            && *header.mask == [COLOR_MASK];
+        let is_color = header.class == Class::COLOR
+            && header.prop_count == Class::COLOR_PROPS
+            && *header.mask == [Class::COLOR_MASK];
         self.push(s..e, Record::Object(header));
-        if is_color && e + 3 <= limit {
+        let rgb = e..e + Class::COLOR_BYTES;
+        if is_color && rgb.end <= limit {
             self.push(
-                e..e + 3,
-                Record::Color(self.b[e..e + 3].try_into().unwrap()),
+                rgb.clone(),
+                Record::Color(self.b[rgb.clone()].try_into().unwrap()),
             );
-            return e + 3;
+            return rgb.end;
         }
         e
     }
@@ -2450,8 +2717,9 @@ impl<'a> Body<'a> {
     fn crc_string(&self, p: usize, limit: usize) -> Option<(usize, StrRecord)> {
         let b = &self.b[..limit];
         let crc = u32_at(b, p)?;
-        let (text, end) = read_str(b, p + 4)?;
-        if crc32(text.as_bytes()) != crc || end > p + 7 + text.len() {
+        let (text, end) = read_str(b, p + CRC)?;
+        let longest = p + CRC + MAX_SCAN_LEN_VARINT + ObjectId::TAG + text.len();
+        if crc32(text.as_bytes()) != crc || end > longest {
             return None;
         }
         valid_crc_text(&text).then_some((
@@ -2465,12 +2733,15 @@ impl<'a> Body<'a> {
 
     fn bare_string(&self, p: usize, limit: usize) -> Option<(usize, StrRecord)> {
         let b = &self.b[..limit];
-        let (n, q) = read_varint(b, p)?;
-        if !(4..=MAX_SCAN_STR as u32).contains(&n) || q > p + 2 || *b.get(q)? != 1 {
+        let (n, q) = varint::read(b, p)?;
+        if !(MIN_SCAN_STR..=MAX_SCAN_STR as u32).contains(&n)
+            || q > p + MAX_SCAN_LEN_VARINT
+            || *b.get(q)? != StrRecord::ASCII
+        {
             return None;
         }
-        let end = q + 1 + n as usize;
-        let text = std::str::from_utf8(b.get(q + 1..end)?).ok()?;
+        let end = q + ObjectId::TAG + n as usize;
+        let text = std::str::from_utf8(b.get(q + ObjectId::TAG..end)?).ok()?;
         valid_bare_text(text).then(|| {
             (
                 end,
@@ -2512,8 +2783,8 @@ impl<'a> Body<'a> {
             self.push(p..end, Record::Str(rec));
             return Some(end);
         }
-        if b[p] == 2 {
-            for c in [p + 2, p + 18] {
+        if b[p] == ObjectId::OWNED {
+            for c in [ObjectId::None, ObjectId::Id(Guid([0; 16]))].map(|id| p + id.len()) {
                 let Some(class) = u32_at(&b[..to], c) else {
                     continue;
                 };
@@ -2523,23 +2794,23 @@ impl<'a> Body<'a> {
                 if let Some((s, e, header)) = self.header_ending_at(p, c, false) {
                     // Embedded objects in the shipped files never set mask bit
                     // 0 and always have some property present.
-                    if s == p && e <= to && header.mask[0] & 0x80 == 0 && header.present_count() > 0
-                    {
+                    if s == p && e <= to && !header.bit(0) && header.present_count() > 0 {
                         return Some(self.object_values(s, e, header, to));
                     }
                 }
             }
         }
-        if b[p] == 1
-            && p + 21 <= to
-            && let Some(class) = u32_at(b, p + 1).filter(|c| self.ref_classes.contains(c))
+        if b[p] == ObjectId::REFERENCE
+            && p + Reference::LEN <= to
+            && let Some(class) =
+                u32_at(b, p + ObjectId::TAG).filter(|c| self.ref_classes.contains(c))
         {
             let r = Reference {
                 class,
-                id: guid_at(b, p + 5)?,
+                id: guid_at(b, p + ObjectId::TAG + CRC)?,
             };
-            self.push(p..p + 21, Record::Ref(r));
-            return Some(p + 21);
+            self.push(p..p + Reference::LEN, Record::Ref(r));
+            return Some(p + Reference::LEN);
         }
         if let Some((end, rec)) = self.bare_string(p, to) {
             self.push(p..end, Record::Str(rec));
@@ -2547,73 +2818,6 @@ impl<'a> Body<'a> {
         }
         None
     }
-}
-
-// ---------------------------------------------------------------------------
-// Directory summary (the `phx.py objects` equivalent)
-
-#[derive(Debug, Clone, Default)]
-pub struct KindSummary {
-    pub files: usize,
-    pub bytes: usize,
-    pub objects: usize,
-    pub strings: usize,
-    pub references: usize,
-    pub properties: usize,
-    pub opaque_bytes: usize,
-    /// Object headers whose class crc resolves to a name.
-    pub classes_named: usize,
-    /// Files whose encode is byte-identical to the input.
-    pub roundtrip: usize,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct Summary {
-    /// Keyed by the two kind letters, e.g. `WI`.
-    pub kinds: BTreeMap<String, KindSummary>,
-    pub failed: Vec<(PathBuf, String)>,
-}
-
-/// Parses every `PHX*` file directly in `dir`; other files are skipped.
-pub fn summarize(dir: &Path, names: &Names) -> Result<Summary> {
-    let mut summary = Summary::default();
-    let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
-        .with_context(|| format!("reading {}", dir.display()))?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.is_file())
-        .collect();
-    paths.sort();
-    for path in paths {
-        let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-        if !bytes.starts_with(b"PHX") {
-            continue;
-        }
-        let asset = match Asset::parse(bytes) {
-            Ok(a) => a,
-            Err(e) => {
-                summary.failed.push((path, format!("{e:#}")));
-                continue;
-            }
-        };
-        let k = summary.kinds.entry(asset.header.kind_str()).or_default();
-        k.files += 1;
-        k.bytes += asset.bytes.len();
-        for (_, o) in asset.objects() {
-            k.objects += 1;
-            k.classes_named += usize::from(asset.name(names, o.class).is_some());
-        }
-        k.strings += asset.strings().count();
-        k.references += asset.references().count();
-        k.properties += asset.properties.len();
-        k.opaque_bytes += asset
-            .spans
-            .iter()
-            .filter(|s| s.record == Record::Opaque)
-            .map(|s| s.range.len())
-            .sum::<usize>();
-        k.roundtrip += usize::from(asset.encode() == asset.bytes);
-    }
-    Ok(summary)
 }
 
 #[cfg(test)]

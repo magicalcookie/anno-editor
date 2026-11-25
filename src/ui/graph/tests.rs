@@ -3,12 +3,13 @@ use super::wiring::Drop;
 use super::{Graph, Kind, Node};
 use crate::ui::UiEditor;
 use crate::ui::bindings::{T_BOOL, T_EVENT, T_FLOAT, Target, Transform};
+use crate::ui::evaluate::Builtin;
 use crate::ui::test_support::{
     BUTTON, ICON_ROW, QUEST_TRACKER, bindings, event_ending, install, key, labels, node, open,
     path, reopen, select, slot_ending,
 };
 use anno_formats::phx::Asset;
-use anno_formats::phx::binding::{Bindings, Slot, builtin};
+use anno_formats::phx::binding::{Bindings, Slot};
 use gpui_editor_kit::gpui::{Bounds, Pixels, point, px, size};
 use std::sync::Arc;
 
@@ -117,7 +118,7 @@ fn size_x(ui: &UiEditor, widget: usize) -> usize {
     (0..t.slots.len())
         .find(|&s| {
             matches!(&t.slots[s], Slot::Widget { widget: Some(w), path }
-                if *w == widget && path[..] == [(2, 0x8000_0000 | builtin::SIZE)])
+                if *w == widget && path[..] == [(2, Builtin::Size.uid())])
         })
         .expect("the widget's Size.x slot")
 }
@@ -264,7 +265,12 @@ fn places_share_values_by_axis() {
 #[test]
 fn an_axis_of_an_input_is_a_number() {
     let Some(install) = install() else { return };
-    let mut ui = UiEditor::load(install.clone(), &path(ICON_ROW)).unwrap();
+    let mut ui = UiEditor::load(
+        crate::ui::test_support::shared(&install),
+        install.clone(),
+        &path(ICON_ROW),
+    )
+    .unwrap();
     let ft = ui.file_table(0).unwrap();
     assert_eq!(
         ft.kind(slot_ending(&ft, "Layout.TextPlane.x")),
@@ -275,7 +281,7 @@ fn an_axis_of_an_input_is_a_number() {
         .into_iter()
         .find(|f| f.contains("0027a4b3"))
         .expect("0027a4b3");
-    let mut ui = UiEditor::load(install, &file).unwrap();
+    let mut ui = UiEditor::load(crate::ui::test_support::shared(&install), install, &file).unwrap();
     let ft = ui.file_table(0).unwrap();
     let size_x = (0..ft.table.slots.len())
         .find(|&s| ft.label(s).starts_with("Label · ") && ft.label(s).ends_with("SizeIn.x"))
@@ -558,7 +564,12 @@ fn all_in_file_lays_out_one_band_per_chain() {
 #[test]
 fn events_and_values_flow_apart_and_refusals_name_the_bridge() {
     let Some(install) = install() else { return };
-    let mut ui = UiEditor::load(install.clone(), &path("minimapscene")).unwrap();
+    let mut ui = UiEditor::load(
+        crate::ui::test_support::shared(&install),
+        install.clone(),
+        &path("minimapscene"),
+    )
+    .unwrap();
     // The screen and its templates, each once, as All in file shows it.
     let (mut files, mut tables) = (Vec::new(), Vec::new());
     for n in 0..ui.nodes.len() {
@@ -649,7 +660,12 @@ fn events_and_values_flow_apart_and_refusals_name_the_bridge() {
         }
     }
     let verdict = |(file, from, to): (anno_formats::phx::Guid, usize, Drop)| {
-        let mut t = UiEditor::load(install.clone(), &path(&file.to_string())).unwrap();
+        let mut t = UiEditor::load(
+            crate::ui::test_support::shared(&install),
+            install.clone(),
+            &path(&file.to_string()),
+        )
+        .unwrap();
         t.wire_verdicts(from, None, &[to]).remove(0)
     };
     let said = verdict(or.expect("a template with both")).unwrap_err();
@@ -964,7 +980,10 @@ fn enum_values_read_and_take_their_names() {
         .find(|p| ui.asset.property_name(p) == "-Alignment_IconToText")
         .unwrap()
         .clone();
-    assert_eq!(crate::ui::property_default_text(&ui.asset, &p), "Begin");
+    assert_eq!(
+        crate::ui::property_default_text(ui.sources(), &ui.asset, &p),
+        "Begin"
+    );
 }
 
 // Wheel steps from an overview Fit (below the readable zoom) go the way
@@ -1175,10 +1194,11 @@ fn the_type_check_takes_what_the_game_writes() {
     let Some(install) = install() else { return };
     // Templates as the editor loads them, once each.
     let mut cache: HashMap<Guid, Option<Arc<Asset>>> = HashMap::new();
+    let shared = crate::ui::test_support::shared(&install);
     let mut load = |g: Guid| {
         cache
             .entry(g)
-            .or_insert_with(|| crate::ui::scene::read_asset(&install, g).map(Arc::new))
+            .or_insert_with(|| crate::ui::scene::read_asset(&shared, &install, g).map(Arc::new))
             .clone()
     };
     let (mut copies, mut args) = (0, 0);
@@ -1197,7 +1217,7 @@ fn the_type_check_takes_what_the_game_writes() {
         let mut inputs: HashMap<usize, Arc<Asset>> = HashMap::new();
         let mut components: HashMap<(usize, u32), Arc<Asset>> = HashMap::new();
         for (w, wd) in widgets.iter().enumerate() {
-            let container = a.container_template(wd).and_then(|r| load(r.id));
+            let container = wd.container_template().and_then(|r| load(r.id));
             let root = container.as_ref().and_then(|c| {
                 let cw = c.widgets();
                 let r = cw.first()?;
@@ -1229,7 +1249,8 @@ fn the_type_check_takes_what_the_game_writes() {
             };
             t.properties().iter().find(|p| p.uid == uid).map(|p| p.kind)
         };
-        let kind = |s: usize| crate::ui::bindings::defined_kind(&a, &t.slots, s, &defined);
+        let fields = crate::ui::test_support::screens().data_fields;
+        let kind = |s: usize| crate::ui::bindings::defined_kind(&a, fields, &t.slots, s, &defined);
         for b in &t.bindings {
             let Some(c) = Converter::of(b.converter) else {
                 continue;
@@ -2021,7 +2042,8 @@ fn a_drag_shows_what_its_drop_does() {
             if super::Converter::of(t.bindings[*binding].converter)
                 == Some(super::Converter::IfTrueFalseAssign)
                 && t.bindings[*binding].targets.iter().any(|&x| {
-                    crate::ui::bindings::slot_kind(&ui.asset, &t.slots, x) == Some(0x12)
+                    crate::ui::bindings::slot_kind(&ui.asset, ui.screens().data_fields, &t.slots, x)
+                        == Some(0x12)
                 }))
         })
         .map(|(_, v)| v.clone())
@@ -2254,8 +2276,8 @@ fn the_screen_showing_starts_a_clip() {
     ui.wire_up(Source::New(shown_pin), None, start).unwrap();
     let t = bindings(&reopen(&ui.asset));
     assert!(t.bindings.iter().any(|b| {
-        matches!(&t.slots[b.sources[0]], Slot::Widget { widget: Some(0), path } if path[..] == [(1, 0x8000_003c)])
-            && matches!(&t.slots[b.targets[0]], Slot::Clip { path, .. } if path[..] == [(1, 0x8000_001f)])
+        matches!(&t.slots[b.sources[0]], Slot::Widget { widget: Some(0), path } if path[..] == [(1, Builtin::Shown.uid())])
+            && matches!(&t.slots[b.targets[0]], Slot::Clip { path, .. } if path[..] == [(1, Builtin::Start.uid())])
     }));
     // Read now: the pin is the root's Shown, no longer a +.
     let g = shown(&mut ui);
@@ -2287,22 +2309,25 @@ fn a_new_buttons_press_starts_a_clip() {
         .iter()
         .position(|w| w.name.as_deref() == Some("AnnoButtonWT"))
         .unwrap();
-    let template = ui.asset.container_template(&widgets[button]).unwrap().id;
+    let template = widgets[button].container_template().unwrap().id;
     let nothing = ui
         .asset
         .clips()
         .iter()
         .position(|c| c.name == "Nothing")
         .unwrap();
-    let index = Index::of(vec![Entry {
-        file: template.to_string(),
-        kind: "WI".into(),
-        name: "AnnoButtonWT".into(),
-        widgets: 3,
-        used_by: 1,
-        example: Some((BUTTON.into(), button as u32)),
-        widget_type: None,
-    }]);
+    let index = Index::of(
+        vec![Entry {
+            file: template.to_string(),
+            kind: "WI".into(),
+            name: "AnnoButtonWT".into(),
+            widgets: 3,
+            used_by: 1,
+            example: Some((BUTTON.into(), button as u32)),
+            widget_type: None,
+        }],
+        ui.sources(),
+    );
     let r = ui.nodes[0].rect;
     let at = [r[0] + r[2] / 2., r[1] + r[3] / 2.];
     ui.add_from_library(Pick::Template(0), &index, Place::Canvas(at))
@@ -2366,7 +2391,7 @@ fn a_new_buttons_press_starts_a_clip() {
     };
     assert!(t.bindings.iter().any(|b| {
         matches!(&t.slots[b.sources[0]], Slot::Widget { widget: Some(x), path } if *x == w && path[..] == [(1, uid)])
-            && matches!(&t.slots[b.targets[0]], Slot::Clip { clip, path } if *clip == nothing && path[..] == [(1, 0x8000_001f)])
+            && matches!(&t.slots[b.targets[0]], Slot::Clip { clip, path } if *clip == nothing && path[..] == [(1, Builtin::Start.uid())])
     }));
     // A clip's Completed nothing reads, with the whole file.
     ui.canvas.selected = None;
@@ -2441,7 +2466,7 @@ fn events_wire_onto_clips_start_and_stop() {
                 && b.sources.first().map(|&x| &t.slots[x]) == Some(&from)
         })
     };
-    let start = [(1, 0x8000_001f)];
+    let start = [(1, Builtin::Start.uid())];
     let own =
         |s: &Slot| matches!(s, Slot::Clip { clip, path } if *clip == nothing && path[..] == start);
     assert!(starts(&reopen(&ui.asset), &own), "saved and opened again");
@@ -2493,7 +2518,7 @@ fn events_wire_onto_clips_start_and_stop() {
     let (slots, set) = (&ft.table.slots, &ft.table.bindings);
     let stop = (0..slots.len())
         .find(|&s| {
-            matches!(&slots[s], Slot::Clip { path, .. } if path.last().is_some_and(|&(_, id)| id == 0x8000_0020))
+            matches!(&slots[s], Slot::Clip { path, .. } if path.last().is_some_and(|&(_, id)| id == Builtin::Stop.uid()))
                 && set.iter().any(|b| b.targets.contains(&s))
         })
         .expect("a clip's Stop that is set");
@@ -2557,7 +2582,12 @@ fn events_wire_onto_clips_start_and_stop() {
 fn a_loop_through_an_axis_is_refused_and_siblings_are_none() {
     let Some(install) = install() else { return };
     let xicon = path("027cffcb-adec-48e2-a715-d815a12e32ea");
-    let mut ui = UiEditor::load(install.clone(), &xicon).unwrap();
+    let mut ui = UiEditor::load(
+        crate::ui::test_support::shared(&install),
+        install.clone(),
+        &xicon,
+    )
+    .unwrap();
     let ft = ui.file_table(0).unwrap();
     let labelled = |name: &str| {
         (0..ft.table.slots.len())
@@ -2587,7 +2617,12 @@ fn a_loop_through_an_axis_is_refused_and_siblings_are_none() {
     assert!(ui.wire_up(size_x, None, drop).is_err());
     assert_eq!(ui.asset.encode(), bytes);
 
-    let mut ui = UiEditor::load(install, &path(BUTTON)).unwrap();
+    let mut ui = UiEditor::load(
+        crate::ui::test_support::shared(&install),
+        install,
+        &path(BUTTON),
+    )
+    .unwrap();
     let ft = ui.file_table(0).unwrap();
     let labelled = |name: &str| {
         (0..ft.table.slots.len())
@@ -2621,7 +2656,12 @@ fn a_loop_through_an_axis_is_refused_and_siblings_are_none() {
 fn whole_screens_have_no_wire_into_itself_or_backward() {
     let Some(install) = install() else { return };
     for name in ["constructionmenuscene", "minimapscene", "questtrackerscene"] {
-        let mut ui = UiEditor::load(install.clone(), &path(name)).unwrap();
+        let mut ui = UiEditor::load(
+            crate::ui::test_support::shared(&install),
+            install.clone(),
+            &path(name),
+        )
+        .unwrap();
         let g = file_graph(&mut ui, 0);
         for w in &g.wires {
             assert_ne!(
@@ -2773,7 +2813,12 @@ mod layout_probe {
             "minimapscene",
             "questtrackerscene",
         ] {
-            let mut ui = UiEditor::load(install.clone(), &path(screen)).unwrap();
+            let mut ui = UiEditor::load(
+                crate::ui::test_support::shared(&install),
+                install.clone(),
+                &path(screen),
+            )
+            .unwrap();
             let mut files = std::collections::HashMap::new();
             for n in 0..ui.nodes.len() {
                 files.entry(ui.node_file(n)).or_insert(n);

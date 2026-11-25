@@ -3,11 +3,13 @@
 // (pass silently) when ANNO117_DIR or ANNO1800_DIR is unset.
 use super::{IslandEditor, Skeleton, Spec, Start, doc::Doc, harbour::Library, skeletons};
 use crate::project::Project;
+use anno_core::island::objects::{Object, Objects};
 use anno_formats::{
+    a7m::{
+        grids::{Kind, Layer},
+        island::Island,
+    },
     assets::Assets,
-    grids::{Kind, Layer},
-    island::Island,
-    objects::{Object, Objects},
     rda,
     vfs::Install,
 };
@@ -24,18 +26,32 @@ pub const MODERATE_M_01: &str =
 
 /// The installed Anno 117, or None without ANNO117_DIR.
 pub fn install() -> Option<Install> {
-    Some(Install::open(std::env::var_os("ANNO117_DIR")?).unwrap())
+    let families = crate::games::profile(anno_core::game::Game::Anno117).archive_families;
+    Some(Install::open(anno_formats::vfs::install_dir("ANNO117_DIR")?, families).unwrap())
 }
 
 /// The installed Anno 1800, or None without ANNO1800_DIR.
 pub fn install_1800() -> Option<Install> {
-    Some(Install::open(std::env::var_os("ANNO1800_DIR")?).unwrap())
+    let families = crate::games::profile(anno_core::game::Game::Anno1800).archive_families;
+    Some(Install::open(anno_formats::vfs::install_dir("ANNO1800_DIR")?, families).unwrap())
+}
+
+/// The installed Anno 2070, or None without ANNO2070_DIR: its archives in
+/// the game's own order, which later patches override by.
+pub fn install_2070() -> Option<Install> {
+    let families = crate::games::profile(anno_core::game::Game::Anno2070).archive_families;
+    Some(Install::open(anno_formats::vfs::install_dir("ANNO2070_DIR")?, families).unwrap())
 }
 
 /// Shipped Anno 117 island `path` open in the editor, with its install.
 pub fn open(path: &str) -> Option<(Install, IslandEditor)> {
     let install = install()?;
-    let editor = IslandEditor::load(&install, path).unwrap();
+    let editor = IslandEditor::load(
+        crate::games::module(crate::games::of(&install)),
+        &install,
+        path,
+    )
+    .unwrap();
     Some((install, editor))
 }
 
@@ -47,7 +63,12 @@ pub fn create(install: &Install, skeleton: Skeleton, start: Start, name: &str) -
         start,
         listing: Default::default(),
     };
-    IslandEditor::create(install, &spec).unwrap()
+    IslandEditor::create(
+        crate::games::module(crate::games::of(&install)),
+        install,
+        &spec,
+    )
+    .unwrap()
 }
 
 /// A new `side` m island of `region` called `name`, started as `start`,
@@ -59,21 +80,36 @@ pub fn new_island(
     start: Start,
     name: &str,
 ) -> IslandEditor {
-    let skeleton = (skeletons(install, None).into_iter())
-        .find(|s| s.region == region && s.world[0] == side)
-        .unwrap_or_else(|| panic!("no {side} m {region} template"));
+    let skeleton = (skeletons(
+        crate::games::module(crate::games::of(&install)),
+        install,
+        None,
+    )
+    .into_iter())
+    .find(|s| s.region == region && s.world[0] == side)
+    .unwrap_or_else(|| panic!("no {side} m {region} template"));
     create(install, skeleton, start, name)
 }
 
 /// The game's asset registry.
 pub fn assets(install: &Install) -> Arc<Assets> {
-    Arc::new(Assets::load(install).unwrap())
+    Arc::new(
+        crate::games::assets(crate::games::module(crate::games::of(install)), install).unwrap(),
+    )
 }
 
 /// The harbour, slot and river pieces of the editor's region, as the
 /// Harbour and River tools load them.
 pub fn harbour_library(install: &Install, assets: &Assets, editor: &IslandEditor) -> Arc<Library> {
-    Arc::new(Library::load(install, assets, &editor.region()).unwrap())
+    Arc::new(
+        Library::load(
+            crate::games::module(crate::games::of(&install)),
+            install,
+            assets,
+            &editor.region(),
+        )
+        .unwrap(),
+    )
 }
 
 /// Grid layer `kind` of `doc`.
@@ -84,7 +120,11 @@ pub fn layer(doc: &Doc, kind: Kind) -> &Layer {
 /// `editor` staged into a project of its own (kept while the TempDir lives).
 pub fn staged(install: &Install, editor: &mut IslandEditor) -> (tempfile::TempDir, Project) {
     let config = tempfile::tempdir().unwrap();
-    let mut project = Project::load(config.path(), install.game());
+    let mut project = Project::load(
+        config.path(),
+        crate::games::module(crate::games::of(&install)),
+    )
+    .unwrap();
     (editor.stage(install, &mut project))
         .unwrap_or_else(|e| panic!("staging {}: {e:#}", editor.path));
     (config, project)
@@ -93,13 +133,14 @@ pub fn staged(install: &Install, editor: &mut IslandEditor) -> (tempfile::TempDi
 /// Writes `project`, mounts it over the install and opens `path` again.
 pub fn reopen(install: &Install, project: &mut Project, path: &str) -> IslandEditor {
     project.write().unwrap();
-    install.mount_mod(&project.folder()).unwrap();
-    IslandEditor::load(install, path).unwrap()
+    let module = crate::games::module(crate::games::of(install));
+    (install.mount_mods(&[project.folder().as_path()], module.project_roots())).unwrap();
+    IslandEditor::load(module, install, path).unwrap()
 }
 
 /// Island `path` as staged in `project`.
 pub fn saved(project: &Project, path: &str) -> Island {
-    let archive = rda::Archive::from_bytes(project.files[path].clone(), path).unwrap();
+    let archive = rda::Archive::parse(project.files[path].clone(), path).unwrap();
     Island::parse(
         &archive.read_path("gamedata.data").unwrap(),
         &archive.read_path("rd3d.data").unwrap(),

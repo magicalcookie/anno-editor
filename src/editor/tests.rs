@@ -2,7 +2,7 @@
 // modder would, each with a config folder of its own. They need the game
 // (ANNO117_DIR).
 
-use super::{Editor, Game, Pane};
+use super::{Editor, Pane};
 use crate::ui::Keys;
 use gpui::{MouseButton, TestApp, TestAppWindow, point, px};
 use gpui_editor_kit::dock::{close_pane, fold_pane};
@@ -16,13 +16,20 @@ type Window = TestAppWindow<Editor>;
 /// modder's and never another test's: kept until the test ends (round 13:
 /// one shared folder, wiped by every test process, broke concurrent runs).
 fn icon_row() -> Option<(TestApp, Window, tempfile::TempDir)> {
-    let game = std::env::var_os("ANNO117_DIR")?;
+    let game = anno_formats::vfs::install_dir("ANNO117_DIR")?;
     let mut app = TestApp::new();
     let config = tempfile::tempdir().unwrap();
     let dir = config.path().to_path_buf();
     let mut w = app.open_window(|window, cx| {
         let open = Some(ICON_ROW.into());
-        Editor::new(Game::Anno117, dir, Some(game.into()), open, window, cx)
+        Editor::new(
+            crate::project::Project::load(&dir, &anno117::MODULE).unwrap(),
+            dir,
+            Some(game.into()),
+            open,
+            window,
+            cx,
+        )
     });
     app.run_until_parked();
     w.update(|ed, _, _| ed.ui.as_mut().unwrap().select_named("Icon"));
@@ -373,7 +380,7 @@ fn a_right_click_on_a_gate_pairs_then_removes_that_half() {
 // an empty Widgets tab until UI files was clicked).
 #[test]
 fn the_ui_index_loads_without_the_files_tab() {
-    let Some(game) = std::env::var_os("ANNO117_DIR") else {
+    let Some(game) = anno_formats::vfs::install_dir("ANNO117_DIR") else {
         return;
     };
     let mut app = TestApp::new();
@@ -381,7 +388,14 @@ fn the_ui_index_loads_without_the_files_tab() {
     let dir = config.path().to_path_buf();
     let w = app.open_window(|window, cx| {
         let open = Some(ICON_ROW.into());
-        let mut ed = Editor::new(Game::Anno117, dir, Some(game.into()), open, window, cx);
+        let mut ed = Editor::new(
+            crate::project::Project::load(&dir, &anno117::MODULE).unwrap(),
+            dir,
+            Some(game.into()),
+            open,
+            window,
+            cx,
+        );
         // The left dock on the widget tree: UI files never draws.
         ed.show_pane(Pane::UiTree);
         ed
@@ -392,5 +406,138 @@ fn the_ui_index_loads_without_the_files_tab() {
         let mut library = crate::ui::library::Library::default();
         let found = library.search("button", &index);
         assert!(found.contains(&"# Buttons".to_owned()));
+    });
+}
+
+// An island's renderer, and with it all its video memory, goes once
+// another island starts loading in its place, though its panes painted and
+// still wanted frames (waves animate for good): the kit's present chain
+// held each pane, and every island opened stayed on the GPU until the
+// editor quit.
+#[test]
+fn opening_another_island_drops_the_last_ones_renderer() {
+    const FIRST: &str =
+        "data/base/provinces/roman/islands/pool/roman_island_small_02/roman_island_small_02.a7m";
+    const NEXT: &str =
+        "data/base/provinces/roman/islands/pool/roman_island_small_07/roman_island_small_07.a7m";
+    let Some(game) = anno_formats::vfs::install_dir("ANNO117_DIR") else {
+        return;
+    };
+    let mut app = TestApp::new();
+    let config = tempfile::tempdir().unwrap();
+    let dir = config.path().to_path_buf();
+    let mut w = app.open_window(|window, cx| {
+        Editor::new(
+            crate::project::Project::load(&dir, &anno117::MODULE).unwrap(),
+            dir,
+            Some(game.into()),
+            Some(FIRST.into()),
+            window,
+            cx,
+        )
+    });
+    draw(&mut app, &mut w);
+    let first = w.read(|ed, _| {
+        let island = ed.island.as_ref().expect("the first island opened");
+        std::sync::Arc::downgrade(island.renderer())
+    });
+    w.update(|ed, _, cx| {
+        ed.open_island(NEXT, cx);
+        // Closed while the next loads: both open at once peaked together.
+        assert!(
+            ed.island.is_none(),
+            "the first island stays open while the next loads"
+        );
+    });
+    draw(&mut app, &mut w);
+    w.read(|ed, _| assert_eq!(ed.island.as_ref().map(|i| i.path.as_str()), Some(NEXT)));
+    assert_eq!(
+        first.strong_count(),
+        0,
+        "the first island's renderer is still held"
+    );
+}
+
+// Opening another screen over one with edits asks, a half-typed value
+// counting as one; Cancel keeps it, the same screen just shows, Discard
+// opens the other once it loads.
+#[test]
+fn opening_another_screen_over_an_edited_one_asks() {
+    use super::{Answer, Leave};
+    let Some((app, mut w, _config)) = icon_row() else {
+        return;
+    };
+    let other = w.read(|ed, _| {
+        let index = ed.ui_find.index.clone().expect("the index loaded");
+        let e = (index.entries.iter())
+            .find(|e| e.kind == "SC" && e.name.eq_ignore_ascii_case("HUDGovernorsBarScene"))
+            .expect("a second screen");
+        index.path(&e.file)
+    });
+    w.update(|ed, _, cx| {
+        ed.keys_to(Keys::Canvas);
+        ed.ui.as_mut().unwrap().type_position_x("123");
+        ed.open_ui_asset(&other, cx);
+        assert_eq!(ed.leaving, Some(Leave::Screen(other.clone())));
+        assert!(ed.ui.as_ref().unwrap().dirty(), "the typed value applied");
+        ed.answer_leave(Answer::Cancel, cx);
+        ed.open_ui_asset(ICON_ROW, cx);
+        assert_eq!(ed.leaving, None, "the same screen just shows");
+        ed.open_ui_asset(&other, cx);
+        ed.answer_leave(Answer::Discard, cx);
+        assert_eq!(
+            ed.ui.as_ref().unwrap().path,
+            ICON_ROW,
+            "kept while it loads"
+        );
+    });
+    app.run_until_parked();
+    w.read(|ed, _| {
+        let ui = ed.ui.as_ref().unwrap();
+        assert_eq!(ui.path, other, "{}", ed.status);
+        assert!(!ui.dirty());
+    });
+}
+
+// The island's Discard before New island keeps it until the wizard makes
+// the new one: cancelling the wizard leaves it open with its edits.
+#[test]
+fn cancelling_the_wizard_after_discard_keeps_the_island() {
+    use super::{Answer, Leave};
+    const ISLAND: &str =
+        "data/base/provinces/roman/islands/pool/roman_island_small_02/roman_island_small_02.a7m";
+    let Some(game) = anno_formats::vfs::install_dir("ANNO117_DIR") else {
+        return;
+    };
+    let mut app = TestApp::new();
+    let config = tempfile::tempdir().unwrap();
+    let dir = config.path().to_path_buf();
+    let mut w = app.open_window(|window, cx| {
+        Editor::new(
+            crate::project::Project::load(&dir, &anno117::MODULE).unwrap(),
+            dir,
+            Some(game),
+            Some(ISLAND.into()),
+            window,
+            cx,
+        )
+    });
+    draw(&mut app, &mut w);
+    w.update(|ed, _, cx| {
+        ed.island.as_mut().expect("the island opened").want_in_mod();
+        ed.open_wizard(cx);
+        assert_eq!(ed.leaving, Some(Leave::NewIsland));
+        ed.answer_leave(Answer::Discard, cx);
+        assert!(ed.wizard.is_some(), "the wizard opened");
+        assert!(
+            ed.island.as_ref().is_some_and(|i| i.dirty()),
+            "kept until made"
+        );
+    });
+    w.simulate_keystrokes("escape");
+    w.read(|ed, _| {
+        assert!(ed.wizard.is_none());
+        let island = ed.island.as_ref().expect("still open");
+        assert!(island.path == ISLAND && island.dirty(), "with its edits");
     });
 }

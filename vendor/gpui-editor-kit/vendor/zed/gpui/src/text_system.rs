@@ -52,6 +52,20 @@ pub const SUBPIXEL_VARIANTS_X: u8 = 4;
 /// Number of subpixel glyph variants along the Y axis.
 pub const SUBPIXEL_VARIANTS_Y: u8 = 1;
 
+/// How GPUI's renderers correct a grayscale glyph's coverage before blending
+/// it: the gamma ratios and the enhanced contrast, from `ZED_FONTS_GAMMA`
+/// (1.8) and `ZED_FONTS_GRAYSCALE_ENHANCED_CONTRAST` (1.0). For text drawn
+/// outside GPUI's scene that must match its labels (added for
+/// gpui-editor-kit; see `vendor/zed/PATCH.md`).
+pub fn grayscale_glyph_correction() -> ([f32; 4], f32) {
+    let var = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<f32>().ok());
+    let gamma = var("ZED_FONTS_GAMMA").unwrap_or(1.8).clamp(1.0, 2.2);
+    let contrast = var("ZED_FONTS_GRAYSCALE_ENHANCED_CONTRAST")
+        .unwrap_or(1.0)
+        .max(0.0);
+    (crate::get_gamma_correction_ratios(gamma), contrast)
+}
+
 // Leave enough room below the underline for its stroke while keeping it below the baseline.
 const UNDERLINE_DESCENT_OFFSET_FACTOR: f32 = 0.618;
 
@@ -528,8 +542,10 @@ impl TextSystem {
         }
     }
 
-    /// Get the rasterized size and location of a specific, rendered glyph.
-    pub(crate) fn raster_bounds(&self, params: &RenderGlyphParams) -> Result<Bounds<DevicePixels>> {
+    /// Get the rasterized size and location of a specific, rendered glyph,
+    /// relative to the device pixel it is placed at
+    /// ([`crate::Window::glyph_raster`]).
+    pub fn raster_bounds(&self, params: &RenderGlyphParams) -> Result<Bounds<DevicePixels>> {
         let raster_bounds = self.raster_bounds.upgradable_read();
         if let Some(bounds) = raster_bounds.get(params) {
             Ok(*bounds)
@@ -541,7 +557,12 @@ impl TextSystem {
         }
     }
 
-    pub(crate) fn rasterize_glyph(
+    /// Rasterizes a glyph as GPUI's own text draws it: its size, and its
+    /// coverage as one byte a pixel, row by row (four for an emoji or
+    /// subpixel glyph). Callable from any thread, for text drawn into an
+    /// application's own texture (added for gpui-editor-kit; see
+    /// `vendor/zed/PATCH.md`).
+    pub fn rasterize_glyph(
         &self,
         params: &RenderGlyphParams,
     ) -> Result<(Size<DevicePixels>, Vec<u8>)> {

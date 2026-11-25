@@ -6,7 +6,7 @@
 # prop	name_crc	name	ty	type_crc	mode	offset
 #   One descriptor row of the class above.
 # legacy	hash	props
-#   An older version of the class above, found in installed assets: its own serialized props by name crc in wire order, comma-separated; 0 is a bool the class no longer has. Solved by parsing every installed asset to the last byte; where two lists both parse (dropping one of two null asset references), the one that keeps the earlier rows is used.
+#   An older version of the class above, found in installed assets: its own serialized props by name crc in wire order, comma-separated. A prop the class no longer has follows as a prop row with no offset (FallbackFont's unnamed bool, listed as 0x00000000). Solved by parsing every installed asset to the last byte; where two lists both parse (dropping one of two null asset references), the one that keeps the earlier rows is used.
 # removed	crc	base
 #   A class the exe no longer has, decoded as its base (no own props); its legacy rows follow.
 class	0x0019dd69	ImageAtlasAsset	0xc36e7558	56	95d6912f53b62a5d7698afc7314d76ce
@@ -503,7 +503,9 @@ prop	0x1c2c57ba	PhoenixInternalId	0x1900	0x00000000	0x2001	0x8
 prop	0x619e4928	FontDescriptor	0x4300	0x5fa8c936	0x2001	0x20
 prop	0x763d7ee3	ScalingType	0x0b00	0xcfa64d2e	0x2001	0x2c
 legacy	25e39527ed23617ec6032561554e6baa	0x70a6a7ec,0x00000000,0x9e9fb14b,0x1c2c57ba,0x619e4928
+prop	0x00000000		0x0100	0x00000000	0x2001	
 legacy	a8ab8bb8d60f0f52c9070760b5dc754b	0x70a6a7ec,0x00000000,0x9e9fb14b,0x1c2c57ba,0x619e4928
+prop	0x00000000		0x0100	0x00000000	0x2001	
 class	0xca83747e	OneTimeAssignConverterInstance	0x6fd1ffc4	32	14d885f9ff3e105c1ca25be52ae24dae
 class	0xcede9435		0x1bb72d66	48	d6691ff9c1e19b4e81eba461fc65566c
 prop	0x8f8600a5	GameObjectTemplate	0x4300	0x8f8600a5	0x2001	0x20

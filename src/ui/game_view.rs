@@ -11,7 +11,7 @@
 // those rectangles are the screen, so screens stack at identity, which is
 // what this view does.
 // TODO(alex): other window sizes need the per-screen viewport types.
-use super::{GENERATED, UiEditor, canvas::Node, scene, states};
+use super::{UiEditor, canvas::Node, scene, states};
 use crate::editor::Editor;
 use anno_formats::phx::Asset;
 use anyhow::{Context as _, Result};
@@ -22,28 +22,6 @@ use gpui_editor_kit::{
     widgets::{Tooltip, button, section},
 };
 use std::sync::Arc;
-
-/// The in-game shot the view compares against: 1920×1080, HUD only.
-const REFERENCE: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../docs/reference/ingame-hud-1920x1080.png"
-);
-
-/// Screens on top of the island in the reference shot. Their contents that
-/// game code spawns (resource and construction bar items, notifications)
-/// are not in the files and stay empty. QuickNavigation (the province
-/// overlay) and QuickTools (the gamepad radial) are not open there.
-pub const HUD: [&str; 7] = [
-    "hudgovernorsbarscene",
-    "resourcebarscene",
-    "questtrackerscene",
-    // The left button column (the archives' button panel).
-    "hudarchivesscene",
-    "minimapscene",
-    "constructionbarscene",
-    // The bottom bar: category tabs, building buttons and tools.
-    "constructionmenuscene",
-];
 
 /// Opacities the reference button steps through.
 const OPACITIES: [f32; 4] = [0.25, 0.5, 0.75, 1.];
@@ -58,30 +36,51 @@ pub struct Screen {
 pub struct GameView {
     /// Other screens, bottom to top; drawn under the open file.
     pub screens: Vec<Screen>,
-    reference: Option<Arc<RenderImage>>,
+    reference: Option<Reference>,
+    /// Whether the game's reference shot is on disk, checked once.
+    reference_on_disk: std::cell::OnceCell<bool>,
     pub show_reference: bool,
     pub opacity: f32,
 }
 
-/// The shot lives in the source tree's docs/, not in shipped builds (it is
-/// game art), so the button only shows where the file exists. Checked once.
-fn reference_available() -> bool {
-    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *AVAILABLE.get_or_init(|| std::path::Path::new(REFERENCE).is_file())
+/// The reference shot, as the canvas draws it: an image GPUI draws, or a
+/// texture for the GPU canvas (`gpu::enabled`).
+enum Reference {
+    Image(Arc<RenderImage>),
+    Texture(Arc<super::gpu::Source>),
 }
 
-fn load_reference() -> Result<Arc<RenderImage>> {
-    let image = image::open(REFERENCE)
-        .with_context(|| format!("reading {REFERENCE}"))?
+fn load_reference(path: &str) -> Result<Reference> {
+    let image = image::open(path)
+        .with_context(|| format!("reading {path}"))?
         .to_rgba8();
     let (w, h) = image.dimensions();
-    Ok(Texture::from_rgba(w, h, image.into_raw())?.render_image())
+    let texture = Texture::from_rgba(w, h, image.into_raw())?;
+    Ok(match super::gpu::enabled() {
+        true => Reference::Texture(Arc::new(super::gpu::Source {
+            rgba: Arc::new(texture),
+            bc: None,
+        })),
+        false => Reference::Image(texture.render_image()),
+    })
 }
 
 impl UiEditor {
+    /// The game's in-game HUD shot, where the file exists: it lives in the
+    /// source tree's docs/, not in shipped builds (it is game art).
+    fn reference(&self) -> Option<&'static str> {
+        let path = self.screens().hud_reference?;
+        let on_disk =
+            *(self.game.reference_on_disk).get_or_init(|| std::path::Path::new(path).is_file());
+        on_disk.then_some(path)
+    }
+
     /// Lays out another screen for the game view.
     fn layout_screen(&mut self, path: &str) -> Result<Screen> {
         let asset = Asset::parse(self.install.read(path)?)?;
+        if self.sample {
+            self.images.shared.sample(&self.install);
+        }
         let (mut nodes, _) = scene::layout(
             &asset,
             &self.install,
@@ -140,8 +139,9 @@ impl UiEditor {
     /// Stacks the screens of the in-game HUD around the open file.
     pub fn add_hud(&mut self) -> Result<String> {
         let mut added = 0;
-        for name in HUD {
-            let path = format!("{GENERATED}{name}");
+        let screens = self.screens();
+        for name in screens.hud {
+            let path = format!("{}{name}", screens.generated);
             if path == self.path || self.game.screens.iter().any(|s| s.path == path) {
                 continue;
             }
@@ -164,7 +164,10 @@ impl UiEditor {
 
     pub fn toggle_reference(&mut self) -> Result<String> {
         if self.game.reference.is_none() {
-            self.game.reference = Some(load_reference()?);
+            let path = self
+                .reference()
+                .context("this game has no reference shot")?;
+            self.game.reference = Some(load_reference(path)?);
         }
         if self.game.opacity == 0. {
             self.game.opacity = 0.5;
@@ -173,25 +176,57 @@ impl UiEditor {
         Ok(String::new())
     }
 
-    /// The reference screenshot over the page, then the other screens.
-    pub(super) fn game_view_elements(&self) -> Vec<AnyElement> {
+    /// The reference screenshot over the page, then the other screens: into
+    /// `scene` when the canvas draws on the GPU, else as elements.
+    pub(super) fn game_view_elements(
+        &self,
+        mut scene: Option<&mut super::gpu::Scene>,
+    ) -> Vec<AnyElement> {
         let view = &self.canvas.view;
         let mut out = Vec::new();
-        if self.game.show_reference
-            && let Some(image) = &self.game.reference
-        {
-            let p = view.to_screen(0., 0.);
-            out.push(
-                img(image.clone())
-                    .absolute()
-                    .left(p.x)
-                    .top(p.y)
-                    .w(px(1920. * view.zoom))
-                    .h(px(1080. * view.zoom))
-                    .opacity(self.game.opacity)
-                    .object_fit(ObjectFit::Fill)
-                    .into_any_element(),
-            );
+        match (&self.game.reference, scene.as_deref_mut()) {
+            (Some(_), _) if !self.game.show_reference => {}
+            (Some(Reference::Image(image)), _) => {
+                let p = view.to_screen(0., 0.);
+                out.push(
+                    img(image.clone())
+                        .absolute()
+                        .left(p.x)
+                        .top(p.y)
+                        .w(px(1920. * view.zoom))
+                        .h(px(1080. * view.zoom))
+                        .opacity(self.game.opacity)
+                        .object_fit(ObjectFit::Fill)
+                        .into_any_element(),
+                );
+            }
+            (Some(Reference::Texture(texture)), Some(scene)) => {
+                // Stretched over the page as the image element was.
+                let t = &texture.rgba;
+                let identity = [1., 0., 0., 1., 0., 0.];
+                scene.sprite(Arc::new(super::gpu::Sprite {
+                    texture: texture.clone(),
+                    transform: identity,
+                    local: [0., 0., 1920., 1080.],
+                    quad: super::gpu::Quad {
+                        inv: identity,
+                        min: [0.; 2],
+                        scale: [1.; 2],
+                        size: [1920., 1080.],
+                        px: [t.width as f32, t.height as f32],
+                        uv_offset: [0.; 2],
+                        uv_scale: [1.; 2],
+                        rotation: [1., 0.],
+                        nine: None,
+                        clamp: true,
+                    },
+                    tint: [255; 3],
+                    alpha: self.game.opacity,
+                    blend: 0,
+                    masks: Vec::new(),
+                }));
+            }
+            _ => {}
         }
         // The game draws nothing outside the window: other screens are cut
         // to the page.
@@ -213,7 +248,7 @@ impl UiEditor {
                     &super::Bits::default(),
                     None,
                     region,
-                    &self.gpu,
+                    scene.as_deref_mut(),
                     None::<fn(usize, _, _, &mut Window, &mut App)>,
                 )
                 .0,
@@ -240,6 +275,7 @@ impl UiEditor {
             })
         };
         let hud_on = !self.game.screens.is_empty();
+        let has_hud = !self.screens().hud.is_empty();
         div()
             .id("game-view-bar")
             .absolute()
@@ -260,7 +296,7 @@ impl UiEditor {
                     cx.stop_propagation();
                 }),
             )
-            .child(
+            .when(has_hud, |d| d.child(
                 gpui_editor_kit::widgets::overlay_toggle("gv-hud", "Game HUD", hud_on)
                     .tooltip(Tooltip::text(
                         "Game view",
@@ -275,8 +311,8 @@ impl UiEditor {
                             Ok(String::new())
                         }
                     })),
-            )
-            .when(reference_available(), |d| {
+            ))
+            .when(self.reference().is_some(), |d| {
                 d.child(
                     gpui_editor_kit::widgets::overlay_toggle(
                         "gv-reference",

@@ -17,10 +17,17 @@ pub const BUTTON: &str = "ed33b8d5-9c91-4e74-9ab7-35c85be4491b";
 /// The QuestTracker template: clips with eased keys.
 pub const QUEST_TRACKER: &str = "005e6a6d-92f9-41f4-9951-029bbe1d6f9a";
 
+/// Anno 117's UI facts: the tests' install is 117's.
+pub fn screens() -> &'static anno_core::ui::Screens {
+    use anno_core::game::Module;
+    anno117::MODULE.ui().expect("117 has UI screens").screens()
+}
+
 /// The installed game, or None without ANNO117_DIR.
 pub fn install() -> Option<Arc<Install>> {
-    let dir = std::env::var_os("ANNO117_DIR")?;
-    Some(Arc::new(Install::open(dir).unwrap()))
+    let dir = anno_formats::vfs::install_dir("ANNO117_DIR")?;
+    let families = crate::games::profile(anno_core::game::Game::Anno117).archive_families;
+    Some(Arc::new(Install::open(dir, families).unwrap()))
 }
 
 /// The archive path of generated UI file `file` ("questtrackerscene", a
@@ -33,9 +40,15 @@ pub fn path(file: &str) -> String {
     }
 }
 
+/// Fresh shared caches for `install`'s game, as a new editor has.
+pub fn shared(install: &Install) -> Arc<super::Shared> {
+    super::Shared::new(crate::games::module(crate::games::of(install)))
+}
+
 /// `file` (see [`path`]) open in the editor, or None without the game.
 pub fn open(file: &str) -> Option<UiEditor> {
-    Some(UiEditor::load(install()?, &path(file)).unwrap())
+    let install = install()?;
+    Some(UiEditor::load(shared(&install), install, &path(file)).unwrap())
 }
 
 /// The canvas node of the file's own widget called `name` (not one inside
@@ -132,17 +145,17 @@ pub fn one_template(ui: &UiEditor, widget: &str) -> super::files::Index {
     let w = (0..widgets.len())
         .find(|&w| widgets[w].name.as_deref() == Some(widget))
         .unwrap_or_else(|| panic!("no widget {widget}"));
-    let template = ui
-        .asset
-        .container_template(&widgets[w])
-        .expect("a container");
-    Index::of(vec![Entry {
-        file: template.id.to_string(),
-        kind: "WI".into(),
-        name: "AnnoButtonWT".into(),
-        widgets: 3,
-        used_by: 1,
-        example: Some((ui.path.rsplit('/').next().unwrap().into(), w as u32)),
-        widget_type: None,
-    }])
+    let template = widgets[w].container_template().expect("a container");
+    Index::of(
+        vec![Entry {
+            file: template.id.to_string(),
+            kind: "WI".into(),
+            name: "AnnoButtonWT".into(),
+            widgets: 3,
+            used_by: 1,
+            example: Some((ui.path.rsplit('/').next().unwrap().into(), w as u32)),
+            widget_type: None,
+        }],
+        ui.sources(),
+    )
 }

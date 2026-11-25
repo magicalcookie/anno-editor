@@ -1,9 +1,20 @@
 // Behavioural tests of the PHX reader and editor over synthetic data, the
 // extracted samples and the installed game; each skips what is absent.
-use super::binding::{Bindings, NewBinding, NewSlot, Slot, builtin};
+use super::binding::{Bindings, NewBinding, NewSlot, Slot};
 use super::*;
 use crate::vfs::Install;
+use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::Arc;
+
+/// The built-in property ids these tests write; the codec treats them as
+/// any other id (the shell's `Builtin` names them).
+mod builtin {
+    pub const ALPHA: u32 = 0x06;
+    pub const VISIBLE: u32 = 0x07;
+    pub const START: u32 = 0x1f;
+    pub const SHOWN: u32 = 0x3c;
+}
 
 // Extracted samples and reference tools from a local checkout.
 const GENERATED: &str = concat!(
@@ -64,44 +75,31 @@ fn load(prefix: &str) -> Option<Asset> {
 
 /// The installed Anno 117, or None (the test skips) without ANNO117_DIR.
 fn install() -> Option<Install> {
-    let Ok(dir) = std::env::var("ANNO117_DIR") else {
+    let Some(dir) = crate::vfs::install_dir("ANNO117_DIR") else {
         eprintln!("skipping: ANNO117_DIR unset");
         return None;
     };
-    Some(Install::open(dir).unwrap())
+    Some(Install::open(dir, crate::vfs::Install::DATA_FIRST).unwrap())
 }
 
 fn install_1800() -> Option<Install> {
-    Some(Install::open(std::env::var_os("ANNO1800_DIR")?).unwrap())
+    Some(
+        Install::open(
+            crate::vfs::install_dir("ANNO1800_DIR")?,
+            crate::vfs::Install::DATA_FIRST,
+        )
+        .unwrap(),
+    )
 }
 
 /// Generated UI file `file` (a scene name or a guid) as the install ships it.
 fn open(install: &Install, file: &str) -> Asset {
     Asset::parse(
         install
-            .read(&format!("data/ui/studio/generated/{file}"))
+            .read(format!("data/ui/studio/generated/{file}"))
             .unwrap(),
     )
     .unwrap()
-}
-
-/// What layout trees load nested templates with: the install's file of
-/// that guid, None where none ships.
-fn loader(install: &Install) -> impl FnMut(Guid) -> Option<Arc<Asset>> + '_ {
-    |g| {
-        let b = install
-            .read(&format!("data/ui/studio/generated/{g}"))
-            .ok()?;
-        Asset::parse(b).ok().map(Arc::new)
-    }
-}
-
-/// The tree node of widget `w` of the file itself (not of a template).
-fn own_node(tree: &layout::Tree, w: usize) -> usize {
-    tree.source
-        .iter()
-        .position(|&(f, k)| f == 0 && k == w)
-        .unwrap()
 }
 
 /// Each binding as the slots it reads and writes and its converter: what
@@ -127,7 +125,7 @@ fn assign(from: NewSlot, to: NewSlot) -> NewBinding {
 fn builtin_prop(widget: usize, id: u32) -> NewSlot {
     NewSlot::Widget {
         widget,
-        path: vec![(1, 0x8000_0000 | id)],
+        path: vec![(1, Slot::BUILTIN | id)],
     }
 }
 
@@ -242,16 +240,6 @@ fn text_exports_accept_1800_guids() {
 }
 
 #[test]
-fn varint_roundtrip() {
-    for v in [0u32, 1, 127, 128, 232, 300, 16383, 16384, u32::MAX] {
-        let mut out = Vec::new();
-        write_varint(&mut out, v);
-        assert_eq!(read_varint(&out, 0), Some((v, out.len())));
-    }
-    assert_eq!(read_varint(&[0xe8, 0x01], 0), Some((232, 2)));
-}
-
-#[test]
 fn guid_text_form() {
     let g = Guid::parse("00214CE2-8775-4F96-99FB-24289941DCD0").unwrap();
     assert_eq!(g.0[..4], [0xe2, 0x4c, 0x21, 0x00]);
@@ -260,35 +248,83 @@ fn guid_text_form() {
     assert_eq!(Guid::from_const("00214ce2-8775-4f96-99fb-24289941dcd0"), g);
 }
 
-// Hand-built from the shape of the Input component: two classes, layout
-// `40 1 0`, a root whose values hold one U32 custom property.
+// A ComponentTemplate with one U32 custom property (the shape of the Input
+// component), written through the codec's own writers: class table, heap section,
+// object headers from the classes' current versions, then each wire prop's
+// value in order.
 fn synthetic_component() -> Vec<u8> {
-    let mut b = b"PHXCP\x1c\x09\x01\x09\x01\xce\xf4\xb1\xba\xf0\x1c".to_vec();
-    b.push(2);
-    b.extend_from_slice(&0x84f1_2f7bu32.to_le_bytes());
-    b.extend_from_slice(&class_info(0x84f1_2f7b).unwrap().hash);
-    b.push(1);
-    b.extend_from_slice(&CLASS_CUSTOM_PROPERTY.to_le_bytes());
-    b.extend_from_slice(&class_info(CLASS_CUSTOM_PROPERTY).unwrap().hash);
-    b.push(0);
-    b.extend_from_slice(&[0, 0, 1, 3, 0x40, 1, 0]);
-    b.push(2);
-    b.extend_from_slice(
-        &Guid::parse("00214ce2-8775-4f96-99fb-24289941dcd0")
-            .unwrap()
-            .0,
+    const COMPONENT_TEMPLATE: u32 = name_crc(b"ComponentTemplate");
+    // A shipped ComponentTemplate's header: magic, kind letters, then the
+    // bytes every shipped file carries and nothing decodes.
+    let mut b = Header::MAGIC.to_vec();
+    b.extend_from_slice(b"CP\x1c\x09\x01\x09\x01\xce\xf4\xb1\xba\xf0\x1c");
+    let entry = |class, instances| TypeEntry {
+        class,
+        schema: class_info(class).unwrap().hash,
+        instances,
+    };
+    encode_types(
+        &[
+            entry(COMPONENT_TEMPLATE, 1),
+            entry(Class::CUSTOM_PROPERTY, 0),
+        ],
+        &mut b,
     );
-    b.extend_from_slice(&0x84f1_2f7bu32.to_le_bytes());
-    b.extend_from_slice(&[5, 0x78, 0x12, 0, 0, 0, 1]);
-    b.extend_from_slice(&[2, 0]);
-    b.extend_from_slice(&CLASS_CUSTOM_PROPERTY.to_le_bytes());
-    b.extend_from_slice(&[11, 0x7f, 0xe0]);
-    b.extend_from_slice(&7u32.to_le_bytes());
-    b.push(0x02);
-    b.extend_from_slice(&[0, 0, 0, 0, 0x08, 30, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
-    b.extend_from_slice(&crc32(b"FrameRate").to_le_bytes());
-    b.extend_from_slice(b"\x09\x01FrameRate\x00\x00\x01\x00");
+    // The root is the one heap object.
+    let root = Allocation {
+        kind: AllocKind::OBJECT,
+        count: 1,
+        class_index: Some(0),
+    };
+    encode_heap(
+        &Heap {
+            counts: Vec::new(),
+            reserved: 0,
+            allocations: vec![root],
+        },
+        &mut b,
+    );
+    let guid = Guid::parse("00214ce2-8775-4f96-99fb-24289941dcd0").unwrap();
+    let kind = Header::KINDS.iter().find(|k| k.0 == *b"CP").unwrap().1;
+    let enum_value = |value| Value::Enum { ty: 0, value };
+    new_object(&mut b, ObjectId::Root(guid), COMPONENT_TEMPLATE);
+    // AssetType, then CustomProperties: one instance.
+    enum_value(u32::from(kind)).encode(&mut b);
+    crate::varint::write(&mut b, 1);
+    new_object(&mut b, ObjectId::None, Class::CUSTOM_PROPERTY);
+    // UniqueId, PropertyType (UInt32), DefaultValue, no ObjectTemplate or
+    // EnumAsset, PropertyAccessibility.
+    Value::U32(7).encode(&mut b);
+    enum_value(2).encode(&mut b);
+    DefaultValue::U32(30).encode(&mut b);
+    b.extend_from_slice(&[ObjectId::NULL, ObjectId::NULL]);
+    enum_value(0).encode(&mut b);
+    // PropertyNameCrc and PhoenixDebugName, then two flags.
+    Value::U32(crc32(b"FrameRate")).encode(&mut b);
+    write_str_payload(&mut b, "FrameRate");
+    Value::Bool(false).encode(&mut b);
+    Value::Bool(false).encode(&mut b);
+    // The root's AllowMultipleInstances and no ParentComponentTemplate.
+    Value::Bool(true).encode(&mut b);
+    b.push(ObjectId::NULL);
     b
+}
+
+// A class count padded to two bytes reads as the same count but would not
+// encode back to its bytes, so the asset is refused.
+#[test]
+fn padded_class_count_is_refused() {
+    let b = synthetic_component();
+    assert_eq!(
+        b[Header::LEN],
+        2,
+        "the synthetic class table has two classes"
+    );
+    let mut padded = b.clone();
+    padded.splice(Header::LEN..Header::LEN + 1, [0x82, 0x00]);
+    let err = format!("{:#}", Asset::parse(padded).unwrap_err());
+    assert!(err.contains("class table count"), "{err}");
+    Asset::parse(b).unwrap();
 }
 
 // The synthetic component round-trips and takes typed edits; garbage and a
@@ -370,8 +406,9 @@ fn corrupt_input_never_panics() {
 #[test]
 fn every_sample_roundtrips_and_reads_whole() {
     let Some(dir) = sample_dir() else { return };
-    let stack_cp =
-        Asset::parse(std::fs::read(dir.join(layout::templates::STACK_LAYOUT)).unwrap()).unwrap();
+    // The StackLayout ComponentTemplate.
+    const STACK_LAYOUT: &str = "d5481210-2f09-4e19-91f0-f98e3633a6b7";
+    let stack_cp = Asset::parse(std::fs::read(dir.join(STACK_LAYOUT)).unwrap()).unwrap();
     let (mut files, mut opaque, mut total) = (0, 0, 0);
     let (mut trees, mut atlases, mut labels, mut texts, mut images) = (0, 0, 0, 0, 0);
     let (mut stacks, mut overridden) = (0, 0);
@@ -380,7 +417,7 @@ fn every_sample_roundtrips_and_reads_whole() {
         files += 1;
         check_cover(&a);
         assert!(a.encode() == a.bytes(), "{name} does not roundtrip");
-        // The class counts and layout section follow from the body.
+        // The class counts and heap section follow from the body.
         let rebuilt = a
             .rebuild(&[], &[])
             .unwrap_or_else(|e| panic!("{name}: {e:#}"));
@@ -390,18 +427,21 @@ fn every_sample_roundtrips_and_reads_whole() {
         assert_eq!(a.guid(), Guid::parse(&name), "{name}: root guid");
         assert_eq!(
             Some(a.root_class()),
-            a.header().kind_info().map(|k| k.1),
+            Header::KINDS
+                .iter()
+                .find(|k| k.0 == [a.header().0[3], a.header().0[4]])
+                .map(|k| k.2),
             "{name}"
         );
         for (i, t) in a.types().iter().enumerate() {
-            let tokens = a
-                .layout()
-                .tokens
+            let allocations = a
+                .heap()
+                .allocations
                 .iter()
                 .filter(|tk| tk.class_index == Some(i as u32))
                 .count();
             assert_eq!(
-                tokens, t.instances as usize,
+                allocations, t.instances as usize,
                 "{name}: class {i} instance count"
             );
         }
@@ -417,17 +457,12 @@ fn every_sample_roundtrips_and_reads_whole() {
                 let i = image_info(&a).unwrap();
                 assert!(!i.path.is_empty() && i.size[0] > 0.0, "{name}");
             }
-            "TA" => {
-                atlases += 1;
-                let r = atlas_regions(&a);
-                assert_eq!(r.len(), 1);
-                assert_eq!(r[0].0, "Default");
-            }
+            "TA" => atlases += 1,
             _ => {}
         }
 
         // Each WidgetInstance object is in the tree exactly once, and the
-        // root's child count matches the layout.
+        // root's child count matches the heap section.
         let ws = a.widgets();
         if !ws.is_empty() {
             trees += 1;
@@ -440,30 +475,30 @@ fn every_sample_roundtrips_and_reads_whole() {
             assert_eq!(seen.len(), ws.len());
             for (i, x) in ws.iter().enumerate().skip(1) {
                 assert!(ws[x.parent.unwrap()].children.contains(&i));
-                assert!(a.geometry(x).is_some());
+                assert!(x.geometry().is_some());
             }
             assert_eq!(Some(ws[0].children.len() as u32), a.root_children());
         }
         for w in ws.iter() {
-            if let Some(l) = a.label(w) {
+            if let Some(l) = w.label() {
                 labels += 1;
-                assert!(a.widget_image(w).is_none());
+                assert!(w.image().is_none());
                 texts += usize::from(!l.text.is_empty() || !l.localization_id.is_empty());
             }
-            if let Some(i) = a.widget_image(w) {
+            if let Some(i) = w.image() {
                 images += usize::from(i.asset.is_some_and(|r| r.class == name_crc(b"ImageAsset")));
             }
             // Stack layout components and their overrides: the StackLayout
             // ComponentTemplate in the extract resolves names and defaults.
             for c in a.components(w) {
-                if c.template.map(|g| g.to_string()).as_deref()
-                    != Some(layout::templates::STACK_LAYOUT)
-                {
+                if c.template.map(|g| g.to_string()).as_deref() != Some(STACK_LAYOUT) {
                     continue;
                 }
                 stacks += 1;
-                let props = layout::component_props(&stack_cp, &c);
-                let names: Vec<&str> = props.iter().map(|p| p.name.as_str()).collect();
+                // The template's defaults name the properties; the widget
+                // overrides some of them.
+                let props = stack_cp.properties();
+                let names: Vec<&str> = props.iter().map(|p| stack_cp.property_name(p)).collect();
                 assert_eq!(
                     names,
                     [
@@ -474,8 +509,7 @@ fn every_sample_roundtrips_and_reads_whole() {
                         "GroupMargin"
                     ]
                 );
-                overridden += usize::from(props.iter().any(|p| p.overridden));
-                assert!(layout::LayoutComponent::from_component(&c).is_some());
+                overridden += usize::from(props.iter().any(|p| c.get(p.uid).is_some()));
             }
         }
         // Shipped files keep a GroupInstance's template in the Groups array
@@ -549,7 +583,7 @@ fn every_sample_roundtrips_and_reads_whole() {
 #[test]
 fn builtin_names_embed_the_corpus() {
     let names = Names::builtin();
-    assert!(names.len() > 22_000, "{} names", names.len());
+    assert!(names.map.len() > 22_000, "{} names", names.map.len());
     // Corpus-only names, absent from the class tables.
     for name in ["HeightConfig", "cDisplacementCeil"] {
         assert_eq!(names.get(crc32(name.as_bytes())), Some(name));
@@ -585,7 +619,7 @@ fn summary_counts_kinds() {
 fn names_resolve() {
     let names = Names::builtin();
     assert_eq!(names.get(0xda06_bd6e), Some("ContainerWidgetTemplate"));
-    assert_eq!(names.get(CLASS_COLOR_TYPE), Some("ColorType"));
+    assert_eq!(names.get(Class::COLOR_TYPE), Some("ColorType"));
     let Some(a) = load("00214ce2") else { return };
     // PropertyNameCrc of OnPress resolves through the file's own strings.
     assert_eq!(a.name(&Names::default(), 0x67f6_1060), Some("OnPress"));
@@ -810,7 +844,7 @@ fn custom_properties_match_json() {
                         .unwrap();
                     let jc = &v["Object"]["Color"]["Object"];
                     let want = ["R", "G", "B"].map(|k| jc[k].as_u64().unwrap_or(0) as u8);
-                    *c == CLASS_COLOR_TYPE && rgb == want
+                    *c == Class::COLOR_TYPE && rgb == want
                 }
                 _ => false,
             };
@@ -818,7 +852,7 @@ fn custom_properties_match_json() {
             let enum_guid = cp["EnumAsset"].as_str().and_then(Guid::parse);
             assert_eq!(p.enum_asset.map(|r| r.id), enum_guid, "{stem} {name}");
             if let Some(r) = p.enum_asset {
-                assert_eq!(r.class, CLASS_ENUM_ASSET);
+                assert_eq!(r.class, name_crc(b"EnumAsset"));
             }
             checked += 1;
         }
@@ -920,11 +954,7 @@ fn schema_names_match_their_crcs() {
     for n in ["", "Position", "CustomPropertyInstance", "WidthResizing"] {
         assert_eq!(name_crc(n.as_bytes()), crc32(n.as_bytes()), "{n}");
     }
-    let classes = &tables::registry(Game::Anno117).classes;
-    for c in classes
-        .iter()
-        .chain(&tables::registry(Game::Anno1800).classes)
-    {
+    for c in tables::registries().flat_map(|r| &r.classes) {
         if let Some(n) = c.name {
             assert_eq!(crc32(n.as_bytes()), c.crc, "{n}");
         }
@@ -945,22 +975,19 @@ fn schema_names_match_their_crcs() {
     ));
 }
 
-// Rows of formats/data/*.tsv as the exes and the Lua stubs have them, sorted
-// for the lookups' binary search.
+// Rows of formats/data/*/classes.tsv as the exes have them, sorted for the
+// lookups' binary search.
 #[test]
 fn embedded_tables_read_known_rows() {
     // Run alone (`cargo test -p anno-formats embedded_tables_read -- --nocapture`)
     // this times the first access, which parses every file.
     let started = std::time::Instant::now();
-    let r117 = tables::registry(Game::Anno117);
-    let r1800 = tables::registry(Game::Anno1800);
-    let fields = tables::data_fields();
-    let named = tables::named_ids();
+    let [r117, r1800] = [0, 1].map(|i| tables::registries().nth(i).unwrap());
     eprintln!("tables parsed in {:?}", started.elapsed());
 
     let sub = class_info(0x072a_cb84).unwrap();
     assert_eq!(sub.name, Some("SubtractConverterInstance"));
-    assert_eq!((sub.base, sub.size, sub.props.len()), (0x0f7f_54d0, 24, 0));
+    assert_eq!((sub.base, sub.props.len()), (0x0f7f_54d0, 0));
     assert_eq!(
         sub.hash,
         *b"\x3f\x62\x8d\x09\xd3\x03\xd1\x4d\x8e\xc0\xba\xba\x3b\x4a\x20\xcf"
@@ -971,58 +998,49 @@ fn embedded_tables_read_known_rows() {
     let anchor = anchor.unwrap();
     assert_eq!(anchor.name, None);
     assert_eq!(
-        (anchor.ty, anchor.type_crc, anchor.mode, anchor.offset),
-        (0x0b00, 0xdc42_28cb, 0x2001, 0xa4)
+        (anchor.ty, anchor.type_crc, anchor.mode),
+        (0x0b00, 0xdc42_28cb, 0x2001)
     );
     assert_eq!(widget.props[0].name, Some("Position"));
     // The old font binding keeps the bool the class dropped (0); the class
     // the exe dropped decodes as its base and has one prop-less old version.
-    let font = r117.legacy.iter().find(|l| l.class == 0xca32_a806).unwrap();
+    let font = r117.older.iter().find(|l| l.crc == 0xca32_a806).unwrap();
+    let names: Vec<u32> = font.props.iter().map(|p| p.name_crc).collect();
     assert_eq!(
-        font.props,
+        names,
         [0x70a6_a7ec, 0, 0x9e9f_b14b, 0x1c2c_57ba, 0x619e_4928]
     );
+    assert_eq!((font.props[1].ty, font.props[1].mode), (0x0100, 0x2001));
+    assert_eq!(font.base, r117.class(0xca32_a806).unwrap().base);
     assert_eq!(r117.removed, [(0xd251_ac32, 0xc346_a1bd)]);
-    let dropped = r117.legacy.iter().find(|l| l.class == 0xd251_ac32).unwrap();
+    let dropped = r117.older.iter().find(|l| l.crc == 0xd251_ac32).unwrap();
     assert!(dropped.props.is_empty());
-    assert_eq!(r117.legacy.len(), 23);
+    assert_eq!(dropped.base, 0xc346_a1bd);
+    assert_eq!(r117.older.len(), 23);
     // Anno 1800's WidgetInstance is an older version than 117's.
     let old_widget = r1800.class(widget.crc).unwrap();
-    assert_eq!(old_widget.size, 232);
     assert_ne!(old_widget.hash, widget.hash);
-    assert!(r1800.legacy.is_empty() && r1800.removed.is_empty());
-
-    assert_eq!(
-        tables::data_field(0x2001_e6c7),
-        Some((0x2001_e6c7, "AlreadyAdded", 0))
-    );
-    assert_eq!(data_field_type(0x2001_e6c7), Some(0));
-    // An object field: the type column is empty.
-    assert_eq!(
-        tables::data_field(0x20bd_1a05),
-        Some((0x20bd_1a05, "DisplayedSize", u32::MAX))
-    );
-    assert_eq!(data_field_type(0x20bd_1a05), None);
-    // Click is an event row, past the property rows.
-    assert_eq!(tables::data_field(0x2003_2db3), None);
-    assert_eq!(data_field_name(0x2003_2db3), Some("Click"));
-    assert_eq!(
-        component_property_name(0x7c10_1933),
-        Some(("Tween", "Looped"))
-    );
-    assert_eq!(data_field_name(0x1234_5678), None);
+    assert!(r1800.older.is_empty() && r1800.removed.is_empty());
+    // A file's class table names the version it was written with, found in
+    // whichever registry has it; a class without a hash to go by takes the
+    // first registry's.
+    // 117's own older rows hold that version too: same hash, same props.
+    let named = tables::class_version(widget.crc, &old_widget.hash).unwrap();
+    let wire = |c: &Class| -> Vec<(u32, u16)> {
+        (c.props.iter().filter(|p| p.serialized()))
+            .map(|p| (p.name_crc, p.ty))
+            .collect()
+    };
+    assert_eq!(wire(named), wire(old_widget));
+    assert!(std::ptr::eq(tables::class(widget.crc).unwrap(), widget));
 
     // Every lookup binary-searches these.
-    for game in Game::ALL {
-        let classes = &tables::registry(game).classes;
+    for (i, r) in tables::registries().enumerate() {
         assert!(
-            classes.windows(2).all(|w| w[0].crc < w[1].crc),
-            "{game:?} classes"
+            r.classes.windows(2).all(|w| w[0].crc < w[1].crc),
+            "registry {i}'s classes"
         );
     }
-    assert!(fields.windows(2).all(|w| w[0].0 < w[1].0));
-    assert!(named.objects.windows(2).all(|w| w[0].0 < w[1].0));
-    assert!(named.components.windows(2).all(|w| w[0].0 < w[1].0));
 }
 
 // The star (`8d4a8dec`): three image widgets under the root. A Position
@@ -1036,7 +1054,7 @@ fn star_widgets_decode_and_move_in_place() {
     assert_eq!(w[0].children.len() as u32, a.root_children().unwrap());
     assert_eq!(w[1].name.as_deref(), Some("DropShadow"));
     assert_eq!(w[1].parent, Some(0));
-    let g = a.geometry(&w[1]).unwrap();
+    let g = w[1].geometry().unwrap();
     assert_eq!(g.position, [11.0, 11.0, 0.0]);
     assert_eq!(g.pivot, [64.0, 64.0, 0.0]);
     assert_eq!(g.rotation, 0.0);
@@ -1070,7 +1088,7 @@ fn star_widgets_decode_and_move_in_place() {
         e.asset.bytes(),
         a.spans()[pos.span].range.clone(),
     );
-    let g = e.asset.geometry(&e.asset.widgets()[1]).unwrap();
+    let g = e.asset.widgets()[1].geometry().unwrap();
     assert_eq!(g.position, [100.0, -5.5, 0.0]);
     // Same type only.
     let wrong = Edit::Value {
@@ -1137,13 +1155,13 @@ fn install_scene_widgets() {
     assert_eq!(a.reference_size(), Some([1920.0, 1080.0]));
     let w = a.widgets();
     assert!(w.len() > 1);
-    let containers: Vec<Reference> = w.iter().filter_map(|x| a.container_template(x)).collect();
+    let containers: Vec<Reference> = w.iter().filter_map(|x| x.container_template()).collect();
     assert!(!containers.is_empty());
     // Referenced templates are widget roots in the same folder. Not all
     // exist: `PauseMenu` points at 1d45b9de…, which no archive ships.
     let mut found = 0;
     for r in &containers {
-        let Ok(bytes) = install.read(&format!("data/ui/studio/generated/{}", r.id)) else {
+        let Ok(bytes) = install.read(format!("data/ui/studio/generated/{}", r.id)) else {
             continue;
         };
         assert!(
@@ -1157,31 +1175,19 @@ fn install_scene_widgets() {
 }
 
 #[test]
-fn install_text_style_atlas_and_texts() {
+fn install_text_styles_and_texts() {
     let Some(install) = install() else { return };
     let folder = install.folder("data/ui/studio/generated").unwrap();
-    let (mut styles, mut regions) = (0, 0);
+    let mut styles = 0;
     for &f in install.folder_files(folder) {
         let b = install.read_file(f).unwrap();
-        match &b[..5] {
-            b"PHXTS" => {
-                let t = text_style(&Asset::parse(b).unwrap()).unwrap();
-                assert!(t.size > 0.0 && t.font.is_some(), "{t:?}");
-                styles += 1;
-            }
-            b"PHXTA" => {
-                for (_, r) in atlas_regions(&Asset::parse(b).unwrap()) {
-                    regions += r.len();
-                    assert!(
-                        r.iter()
-                            .all(|x| x.image.ends_with(".png") && x.size[0] > 0.0)
-                    );
-                }
-            }
-            _ => {}
+        if b.starts_with(b"PHXTS") {
+            let t = text_style(&Asset::parse(b).unwrap()).unwrap();
+            assert!(t.size > 0.0 && t.font.is_some(), "{t:?}");
+            styles += 1;
         }
     }
-    assert!(styles >= 30 && regions > 0);
+    assert!(styles >= 30);
 
     let xml = install
         .read("data/base/config/gui/texts_english.xml")
@@ -1191,242 +1197,6 @@ fn install_text_style_atlas_and_texts() {
     let id = localization_line_id("A01A 9EEC 1DD0 3236").unwrap();
     assert_eq!(id, -6_910_035_941_296_950_730);
     assert_eq!(texts[&id], "Reload required!");
-}
-
-// A scene's cross-file layout tree, evaluated at 1920×1080, with the
-// widget names per node.
-fn install_scene(
-    install: &Install,
-    scene: &str,
-) -> (layout::Tree, Vec<layout::Placed>, Vec<String>) {
-    let root = open(install, scene);
-    let t = layout::Tree::build(&root, &mut loader(install));
-    let out = layout::evaluate(&t.nodes, 0, [1920.0, 1080.0]);
-    let names = t
-        .source
-        .iter()
-        .map(|&(file, k)| {
-            let a = if file == 0 {
-                &root
-            } else {
-                &*t.templates[file - 1]
-            };
-            a.widgets()[k].name.clone().unwrap_or_default()
-        })
-        .collect();
-    (t, out, names)
-}
-
-fn find(names: &[String], name: &str) -> usize {
-    names
-        .iter()
-        .position(|n| n == name)
-        .unwrap_or_else(|| panic!("no widget {name}"))
-}
-
-fn node(intrinsic: [f32; 2], pos: [f32; 2]) -> layout::LayoutNode {
-    layout::LayoutNode {
-        geometry: Geometry {
-            position: [pos[0], pos[1], 0.0],
-            ..Geometry::default()
-        },
-        intrinsic: Some(intrinsic),
-        ..Default::default()
-    }
-}
-
-/// A plain group of `children`: no size, no components.
-fn group(children: Vec<usize>) -> layout::LayoutNode {
-    layout::LayoutNode {
-        children,
-        ..Default::default()
-    }
-}
-
-// A vertical stack: items in reverse array order, spacing between visible
-// items, cross-axis Middle alignment. Items start at the group's origin;
-// the margins grow its box outward (origin −left/−top).
-#[test]
-fn layout_stack() {
-    use layout::{Align, LayoutComponent, evaluate};
-    let mut stack = group(vec![1, 2, 3]);
-    stack.components = vec![LayoutComponent::Stack {
-        horizontal: false,
-        align: Align::Middle,
-        invert: false,
-        spacing: 10.0,
-        margin: [5.0, 5.0, 5.0, 5.0],
-    }];
-    stack.geometry.position = [100.0, 50.0, 0.0];
-    let mut hidden = node([50.0, 50.0], [0.0, 0.0]);
-    hidden.geometry.visible = false;
-    let nodes = vec![
-        group(vec![4]),
-        node([40.0, 20.0], [300.0, 300.0]),
-        hidden,
-        node([80.0, 30.0], [-7.0, 9.0]),
-        stack,
-    ];
-    let out = evaluate(&nodes, 0, [1920.0, 1080.0]);
-    // Last array item first: node 3 (80×30) at top, then node 1 (40×20).
-    assert_eq!(out[3].rect.min, [100.0, 50.0]);
-    assert_eq!(out[1].rect.min, [120.0, 90.0]);
-    assert_eq!(out[4].local.size(), [90.0, 70.0]);
-    assert_eq!(out[4].rect.min, [95.0, 45.0]);
-}
-
-#[test]
-fn layout_pivot_anchor_background() {
-    use layout::{LayoutComponent, evaluate};
-    let mut child = node([100.0, 40.0], [-10.0, -20.0]);
-    child.geometry.anchor = 8; // bottom-right
-    child.components = vec![LayoutComponent::ProportionalPivot([1.0, 1.0, 0.0])];
-    let mut boxed = group(vec![3, 4]);
-    boxed.components = vec![LayoutComponent::Background {
-        margin: [4.0, 4.0, 4.0, 4.0],
-    }];
-    boxed.geometry.position = [10.0, 10.0, 0.0];
-    let nodes = vec![
-        group(vec![1, 2]),
-        child,
-        boxed,
-        node([8.0, 8.0], [0.0, 0.0]),
-        node([30.0, 10.0], [5.0, 5.0]),
-    ];
-    let out = evaluate(&nodes, 0, [1920.0, 1080.0]);
-    // Bottom-right anchor, pivot at the child's bottom-right corner.
-    assert_eq!(out[1].rect.max, [1910.0, 1060.0]);
-    assert_eq!(out[1].rect.min, [1810.0, 1020.0]);
-    // Background spans the other child grown by the margin.
-    assert_eq!(out[3].rect.min, [11.0, 11.0]);
-    assert_eq!(out[3].rect.max, [49.0, 29.0]);
-}
-
-// Containers anchor their children in the template's ReferenceSize even
-// when their bounds are the children's union; plain groups have no Size,
-// so an anchor inside one adds nothing.
-#[test]
-fn layout_anchor_in_parent_size() {
-    let mut corner = node([10.0, 10.0], [-10.0, -10.0]);
-    corner.geometry.anchor = 8;
-    let mut in_group = node([10.0, 10.0], [5.0, 5.0]);
-    in_group.geometry.anchor = 8;
-    // A container without the fixed-size flag: no intrinsic box.
-    let mut container = group(vec![2]);
-    container.size = Some([400.0, 300.0]);
-    container.geometry.position = [100.0, 100.0, 0.0];
-    let nodes = vec![
-        group(vec![1, 3]),
-        container,
-        corner,
-        group(vec![4]),
-        in_group,
-    ];
-    let out = layout::evaluate(&nodes, 0, [1920.0, 1080.0]);
-    assert_eq!(out[2].rect.min, [490.0, 390.0]);
-    assert_eq!(out[1].rect.max, [500.0, 400.0]);
-    assert_eq!(out[4].rect.min, [5.0, 5.0]);
-}
-
-// Metrics cancel ancestor scale: anchor metric 1 divides Position by the
-// ancestors' scale, resize metric 2 the parent's, AspectRatio 1 makes the
-// widget uniform at the smaller axis.
-#[test]
-fn layout_metrics_cancel_ancestor_scale() {
-    let mut scaled = group(vec![2, 3, 4]);
-    scaled.geometry.scale = [2.0, 4.0, 1.0];
-    let mut pinned = node([10.0, 10.0], [100.0, 100.0]);
-    pinned.geometry.anchor_metrics = [1, 1];
-    pinned.geometry.resize_metrics = [2, 2];
-    let mut uniform = node([10.0, 10.0], [0.0, 0.0]);
-    uniform.geometry.aspect_ratio = 1;
-    let plain = node([10.0, 10.0], [10.0, 10.0]);
-    let nodes = vec![group(vec![1]), scaled, pinned, uniform, plain];
-    let out = layout::evaluate(&nodes, 0, [1920.0, 1080.0]);
-    assert_eq!(out[2].rect.min, [100.0, 100.0]);
-    assert_eq!(out[2].rect.size(), [10.0, 10.0]);
-    assert_eq!(out[3].rect.size(), [20.0, 20.0]);
-    assert_eq!(out[4].rect.min, [20.0, 40.0]);
-    assert_eq!(out[4].rect.size(), [20.0, 40.0]);
-}
-
-// The main title menu: bottom-left once ConsiderSize-off pattern layers
-// stay out of the bounds that ProportionalPivotPoint (0,1) measures. Its
-// full-screen pieces: the scene container takes its template's 1920×1080,
-// and the title video (VideoAsset 160×160 × Scale 12 × 6.75, centre anchor,
-// proportional pivot) covers the screen.
-#[test]
-fn install_layout_main_title() {
-    let Some(install) = install() else { return };
-    let (_, out, names) = install_scene(&install, "maintitlescene");
-    let r = out[find(&names, "MainTitle_BtnContainer")].rect;
-    assert!((r.max[1] - 1080.0).abs() < 1.0, "{r:?}");
-    assert!(r.min[0] < 0.0 && r.max[0] < 960.0, "{r:?}");
-    let screen = layout::Rect {
-        min: [0.0, 0.0],
-        max: [1920.0, 1080.0],
-    };
-    assert_eq!(out[find(&names, "MainTitleSceneContainer")].rect, screen);
-    let video = out[find(&names, "title")].rect;
-    assert!(
-        (video.min[0]).abs() < 1.0 && (video.max[0] - 1920.0).abs() < 1.0,
-        "{video:?}"
-    );
-    assert!(
-        (video.min[1]).abs() < 1.0 && (video.max[1] - 1080.0).abs() < 1.0,
-        "{video:?}"
-    );
-}
-
-// HUD scenes against a 1920×1080 in-game screenshot: minimap ring bottom-left,
-// governors' top bar centred on the top edge, quest tracker on the left
-// below it, the resource bar's right element pinned to the top-right
-// corner (its template is not shipped, so only the anchor point is known).
-#[test]
-fn install_layout_hud() {
-    let Some(install) = install() else { return };
-    let (_, out, names) = install_scene(&install, "minimapscene");
-    let map = out[find(&names, "Marble")].rect;
-    assert!(map.min[0] > 0.0 && map.max[0] < 400.0, "{map:?}");
-    assert!(map.min[1] > 700.0 && map.max[1] < 1080.0, "{map:?}");
-
-    let (_, out, names) = install_scene(&install, "hudgovernorsbarscene");
-    let bar = out[find(&names, "HUDGovernorsBarSceneContainer")].rect;
-    // Hangs from the top edge (the band starts at y 0).
-    assert!(bar.min[1] <= 0.5 && bar.max[1] < 400.0, "{bar:?}");
-    let mid = (bar.min[0] + bar.max[0]) * 0.5;
-    assert!((mid - 960.0).abs() < 100.0, "{bar:?}");
-
-    let (_, out, names) = install_scene(&install, "questtrackerscene");
-    let quest = out[find(&names, "TrackedQuest_Entry")].rect;
-    assert!(quest.min[0] >= 0.0 && quest.max[0] < 700.0, "{quest:?}");
-    assert!(quest.min[1] > 150.0 && quest.max[1] < 600.0, "{quest:?}");
-
-    let (_, out, names) = install_scene(&install, "resourcebarscene");
-    let right = out[find(&names, "GlobalRightBarElement")].transform;
-    assert_eq!([right[4], right[5]], [1919.0, -2.0]);
-}
-
-// The build panel places its header glow through two Positioning
-// components: the header's turns its centre (a binding feeds it half the
-// header's size) global, the glow group's turns that local again, and a
-// binding sets the glow there. Native code does the conversions;
-// unconverted, the glow sat at its group's origin, a dark disc beside the
-// panel.
-#[test]
-fn install_positioning_converts_through_the_layout() {
-    let Some(install) = install() else { return };
-    let (t, out, names) = install_scene(&install, "dc58f534-a08e-409b-bf0d-63ece3ac0194");
-    let group = find(&names, "G_gradiant_Image_Header");
-    let glow = out[t.nodes[group].children[0]].rect;
-    let header = out[find(&names, "G_Header")].rect;
-    let mid = |r: layout::Rect| [(r.min[0] + r.max[0]) * 0.5, (r.min[1] + r.max[1]) * 0.5];
-    let (a, b) = (mid(glow), mid(header));
-    assert!(
-        // The header's box has its stack margin around the size it reads.
-        (a[0] - b[0]).abs() < 8. && (a[1] - b[1]).abs() < 8.,
-        "glow {glow:?}, header {header:?}"
-    );
 }
 
 // Names of `w`'s subtree in pre-order, `w` first.
@@ -1472,7 +1242,7 @@ fn tree_edits_keep_subtrees_order_and_ids() {
     let subtree = subtree_names(&ws, g);
 
     // Deleting a group removes exactly its subtree; the rest keeps its order,
-    // and the result re-parses with consistent class counts and layout.
+    // and the result re-parses with consistent class counts and heap section.
     let mut siblings = child_names(&ws, parent);
     siblings.retain(|n| *n != subtree[0]);
     let b = a.remove_widget(&ws, g).unwrap().asset;
@@ -1497,23 +1267,6 @@ fn tree_edits_keep_subtrees_order_and_ids() {
     assert_eq!(subtree_names(&wb, kids[at]), subtree);
     assert_eq!(subtree_names(&wb, kids[at + 1]), subtree);
     ids_unique(&b);
-
-    // A batch of copies lands as the last children, in order, with fresh ids
-    // and a single rebuild that re-parses and round-trips.
-    let copy = a.widget_copy(&ws, label).unwrap();
-    let root_kids = ws[0].children.len();
-    let b = a
-        .insert_widgets_batch(&ws, 0, &[copy.clone(), copy.clone(), copy.clone()], true)
-        .unwrap();
-    let wb = b.widgets();
-    assert_eq!(wb.len(), ws.len() + 3);
-    assert_eq!(wb[0].children.len(), root_kids + 3);
-    for kid in &wb[0].children[root_kids..] {
-        assert_eq!(wb[*kid].name, ws[label].name);
-    }
-    ids_unique(&b);
-    assert_eq!(b.encode(), b.bytes());
-    assert!(b.typed());
 
     // Moving reorders siblings and reparents into another group.
     let last = *ws[0].children.last().unwrap();
@@ -1548,6 +1301,7 @@ fn tree_edits_keep_subtrees_order_and_ids() {
                 .any(|e| e.class == name_crc(b"LabelWidgetInstance"))
     });
     let Some(t) = target else { return };
+    let copy = a.widget_copy(&ws, label).unwrap();
     let tw = t.widgets();
     let b = t.insert_widget(&tw, 0, 0, &copy, true).unwrap();
     let wb = b.widgets();
@@ -1585,14 +1339,16 @@ fn palette_entries_override_embedded_colours() {
     let Some(palette) = load("c63efd8b") else {
         return;
     };
+    let palettes = Arc::new(Palettes::default());
     assert!(
-        register_palette(&palette) > 100,
+        palettes.register(&palette) > 100,
         "the shared palette has 124 colours"
     );
     let mut checked = 0;
     for (name, a) in samples() {
+        a.use_palettes(&palettes);
         for (i, o) in a.objects() {
-            if o.class != CLASS_COLOR_TYPE {
+            if o.class != Class::COLOR_TYPE {
                 continue;
             }
             let (Some(Record::Ref(r)), Some(Record::Value(Value::U32(e)))) = (
@@ -1601,7 +1357,7 @@ fn palette_entries_override_embedded_colours() {
             ) else {
                 continue;
             };
-            let Some(want) = widget::palette_color(r.id, *e) else {
+            let Some(want) = palettes.color(r.id, *e) else {
                 continue;
             };
             let embedded = a.spans()[i..(i + 8).min(a.spans().len())]
@@ -1616,12 +1372,64 @@ fn palette_entries_override_embedded_colours() {
             // A widget's ColorTint reads through the palette.
             let ws = a.widgets();
             if let Some(w) = ws.iter().find(|w| w.props.iter().any(|p| p.span == i)) {
-                assert_eq!(a.geometry(w).unwrap().tint, Some(want), "{name}");
+                assert_eq!(w.geometry().unwrap().tint, Some(want), "{name}");
                 checked += 1;
             }
         }
     }
     eprintln!("{checked} palette tints checked");
+}
+
+// Needs 1800 (117's side is the samples): both games ship palette
+// c63efd8b… with colours of their own. An asset resolves through its own
+// install's palettes, and the other install registering its palette
+// (another screen laid out in the same process) leaves it alone.
+#[test]
+fn each_install_resolves_its_own_palette() {
+    let (Some(palette), Some(i1800)) = (load("c63efd8b"), install_1800()) else {
+        return;
+    };
+    let g = palette.guid().unwrap();
+    let theirs = ["data/ui/studio/generated", "data/ui/studio/images"]
+        .iter()
+        .find_map(|d| i1800.read(format!("{d}/{g}")).ok())
+        .map(|b| Asset::parse(b).unwrap())
+        .expect("1800's palette");
+    let [p117, p1800] = [&palette, &theirs].map(|p| {
+        let palettes = Arc::new(Palettes::default());
+        assert!(palettes.register(p) > 0);
+        palettes
+    });
+    // A 117 widget tinted through an entry the two palettes disagree on.
+    let (name, tinted, entry) = samples()
+        .find_map(|(name, a)| {
+            a.objects()
+                .filter(|(_, o)| o.class == Class::COLOR_TYPE)
+                .find_map(|(i, _)| match a.spans().get(i + 2).map(|s| &s.record) {
+                    Some(Record::Value(Value::U32(e)))
+                        if p117.color(g, *e).is_some()
+                            && p117.color(g, *e) != p1800.color(g, *e) =>
+                    {
+                        let ws = a.widgets();
+                        let w = ws
+                            .iter()
+                            .position(|w| w.props.iter().any(|p| p.span == i))?;
+                        Some((name.clone(), w, *e))
+                    }
+                    _ => None,
+                })
+        })
+        .expect("a widget tinted through an entry 117 and 1800 colour differently");
+    let tint = |a: &Asset| a.widgets()[tinted].geometry().unwrap().tint;
+    let ours = load(&name).unwrap();
+    ours.use_palettes(&p117);
+    assert_eq!(tint(&ours), p117.color(g, entry));
+    let other = load(&name).unwrap();
+    other.use_palettes(&p1800);
+    assert_eq!(tint(&other), p1800.color(g, entry));
+    // 1800's palette registered again, as its next layout does.
+    p1800.register(&theirs);
+    assert_eq!(tint(&ours), p117.color(g, entry), "{name}");
 }
 
 // Needs the game: an EnumAsset maps an enum entry to a value per
@@ -1637,49 +1445,14 @@ fn enum_asset_rules_map_entries_to_values() {
     assert_eq!(a.enum_rule(1_679_288_549, 1), None);
 }
 
-// Needs the game: the quest tracker's clips. Its ScrollbarAppear fades the
-// scroll bar in: played from start to end, some widget's alpha rises.
-// Timeline keys are added and removed in place, and a new clip with a new
-// AlphaTint track plays in a layout while the file's bindings keep their
-// slots.
+// Needs the game: the quest tracker's clips. Timeline keys are added and
+// removed in place, and a new clip with a new AlphaTint track keeps the
+// file's bindings on their slots (src/ui/layout/tests.rs plays them).
 #[test]
 fn quest_tracker_clips_play_and_are_authored() {
     use super::animation::{NewKey, TrackKind};
     let Some(install) = install() else { return };
     let asset = open(&install, QUEST_TRACKER);
-    let play = |a: &Asset, clip: usize, time: f32, bindings: bool| {
-        let opts = layout::Options {
-            bindings,
-            play: Some(layout::Play {
-                file: None,
-                clip,
-                time,
-            }),
-            ..Default::default()
-        };
-        layout::Tree::build_opts(a, &mut loader(&install), &mut |_, _| None, &opts)
-    };
-    let alphas = |t: layout::Tree| {
-        t.nodes
-            .iter()
-            .map(|n| n.geometry.alpha)
-            .collect::<Vec<f32>>()
-    };
-    let scroll = asset
-        .clips()
-        .iter()
-        .position(|c| c.name == "ScrollbarAppear")
-        .unwrap();
-    let start = alphas(play(&asset, scroll, 0.0, false));
-    let end = alphas(play(&asset, scroll, 1.0, false));
-    assert!(
-        start
-            .iter()
-            .zip(&end)
-            .any(|(s, e)| *s < 0.01 && (*e - 1.0).abs() < 0.01),
-        "no widget faded in"
-    );
-
     // A duplicated key shows up as a second key at the same time, a time
     // edit moves it, and removing it again gives back the original bytes.
     let clip = asset
@@ -1744,7 +1517,7 @@ fn quest_tracker_clips_play_and_are_authored() {
         after.slots[track.target],
         Slot::Widget {
             widget: Some(w),
-            path: vec![(1, 0x8000_0000 | builtin::ALPHA)]
+            path: vec![(1, Slot::BUILTIN | builtin::ALPHA)]
         }
     );
     assert_eq!(resolved(&after), resolved(&before));
@@ -1755,16 +1528,12 @@ fn quest_tracker_clips_play_and_are_authored() {
         keys.iter().map(|k| k.time).collect::<Vec<_>>(),
         [0., 0.25, 0.5]
     );
-    // Played at its end, the widget is transparent.
-    let tree = play(&a, n, 0.5, true);
-    let faded = tree.nodes[own_node(&tree, w)].geometry.alpha;
-    assert!(faded < 0.01, "{faded}");
 }
 
 // Needs the game: a binding added to a shipped template keeps every
 // existing binding reading and writing the same slots (indices past the
-// new containers are renumbered), takes effect in a layout, and removing
-// it gives the template's behaviour back.
+// new containers are renumbered), and removing it gives the template's
+// table back (src/ui/layout/tests.rs lays the edits out).
 #[test]
 fn installed_bindings_add_and_remove() {
     let Some(install) = install() else { return };
@@ -1777,15 +1546,10 @@ fn installed_bindings_add_and_remove() {
         .find(|&w| {
             !before.slots.contains(&Slot::Widget {
                 widget: Some(w),
-                path: vec![(1, 0x8000_0000 | builtin::VISIBLE)],
+                path: vec![(1, Slot::BUILTIN | builtin::VISIBLE)],
             })
         })
         .unwrap();
-    let visible = |a: &Asset| {
-        let tree = layout::Tree::build(a, &mut loader(&install));
-        tree.nodes[own_node(&tree, w)].geometry.visible
-    };
-    assert!(visible(&asset));
     // Constant false → the widget's Visible, plus a template property read
     // (a new template container, which moves every constant's index).
     let off = NewSlot::Constant {
@@ -1811,7 +1575,6 @@ fn installed_bindings_add_and_remove() {
             value: DefaultValue::Bool(0)
         }]
     );
-    assert!(!visible(&edited), "the new binding hides the widget");
     // A second one through a new template container renumbers constants.
     let prop = (0..edited.properties().len())
         .find(|&i| !after.slots.contains(&Slot::Template(i, 2)))
@@ -1828,7 +1591,6 @@ fn installed_bindings_add_and_remove() {
     let bw = back.widgets();
     let back = back.remove_binding(&bw, before.bindings.len()).unwrap();
     assert_eq!(resolved(&back.bindings(&back.widgets())), resolved(&before));
-    assert!(visible(&back));
 }
 
 // Needs the game: the root's Shown, read into a clip's Start for the
@@ -1838,9 +1600,9 @@ fn installed_bindings_add_and_remove() {
 // count swapped.
 #[test]
 fn a_root_shown_source_is_written_as_the_game_writes_it() {
-    use super::binding::{NewBinding, NewSlot, Slot, builtin};
+    use super::binding::{NewBinding, NewSlot, Slot};
     let Some(install) = install() else { return };
-    let shown = vec![(1, 0x8000_0000 | builtin::SHOWN)];
+    let shown = vec![(1, Slot::BUILTIN | builtin::SHOWN)];
     let is_shown = |s: &Slot| matches!(s, Slot::Widget { widget: Some(0), path } if *path == shown);
     let containers =
         |a: &Asset| a.values_of(a.widgets()[0].object, name_crc(b"PropertyContainers"));
@@ -1848,16 +1610,12 @@ fn a_root_shown_source_is_written_as_the_game_writes_it() {
     // A screen whose root's Shown starts its Default clip.
     let shipped = open(&install, "02901f45-5ee6-455a-9b54-7b1e68126cc2");
     let t = shipped.bindings(&shipped.widgets());
-    let at = t
-        .slots
-        .iter()
-        .position(|s| is_shown(s))
-        .expect("a shipped Shown");
+    let at = t.slots.iter().position(is_shown).expect("a shipped Shown");
     let expected = bytes(&shipped, containers(&shipped)[at]);
     // The quest button reads no Shown; its clip Nothing nothing starts.
     let asset = open(&install, "ed33b8d5-9c91-4e74-9ab7-35c85be4491b");
     let before = asset.bindings(&asset.widgets());
-    assert!(!before.slots.iter().any(|s| is_shown(s)));
+    assert!(!before.slots.iter().any(is_shown));
     let nothing = asset
         .clips()
         .iter()
@@ -1880,7 +1638,7 @@ fn a_root_shown_source_is_written_as_the_game_writes_it() {
                 }],
                 targets: vec![NewSlot::Clip {
                     clip: nothing,
-                    path: vec![(1, 0x8000_0000 | builtin::START)],
+                    path: vec![(1, Slot::BUILTIN | builtin::START)],
                 }],
             },
         )
@@ -1889,7 +1647,7 @@ fn a_root_shown_source_is_written_as_the_game_writes_it() {
     let at = after
         .slots
         .iter()
-        .position(|s| is_shown(s))
+        .position(is_shown)
         .expect("the new Shown");
     let written = bytes(&edited, containers(&edited)[at]);
     // The provider index and the use count end a container.
@@ -2119,7 +1877,7 @@ fn installed_binding_edits_share_existing_widget_providers() {
             after.slots[binding.targets[0]],
             Slot::Widget {
                 widget: Some(widget),
-                path: vec![(1, 0x8000_0000 | builtin::ALPHA)],
+                path: vec![(1, Slot::BUILTIN | builtin::ALPHA)],
             }
         );
     }
@@ -2133,59 +1891,69 @@ fn installed_binding_edits_share_existing_widget_providers() {
     );
 }
 
-// What the warm/fresh test's sampler answers for every IsVisible flag.
-static FLAGS_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+// ---------------------------------------------------------------------------
+// Directory summary (the `phx.py objects` equivalent), for the test above
 
-fn flag_sampler(name: &str, kind: u32, _: &DefaultValue) -> Option<DefaultValue> {
-    (kind == 0 && name.ends_with("IsVisible")).then(|| {
-        DefaultValue::Bool(u8::from(
-            FLAGS_ON.load(std::sync::atomic::Ordering::Relaxed),
-        ))
-    })
+#[derive(Debug, Clone, Default)]
+struct KindSummary {
+    files: usize,
+    bytes: usize,
+    objects: usize,
+    strings: usize,
+    references: usize,
+    properties: usize,
+    opaque_bytes: usize,
+    /// Object headers whose class crc resolves to a name.
+    classes_named: usize,
+    /// Files whose encode is byte-identical to the input.
+    roundtrip: usize,
 }
 
-// Needs the game: a warm layout after game data changes (a new sampling
-// generation) draws what a fresh one draws, through on, off and on again
-// (round 9: the minimap kept its tutorial content after Reset all, from
-// the previous layout's evaluations of nested instances).
-#[test]
-fn a_warm_layout_follows_changed_game_data() {
-    use std::sync::atomic::Ordering;
-    let Some(install) = install() else { return };
-    let root = open(&install, "minimapscene");
-    let mut load = loader(&install);
-    let mut cache = layout::Cache::default();
-    let shown = |t: &layout::Tree| {
-        t.nodes
-            .iter()
-            .map(|n| n.geometry.visible)
-            .collect::<Vec<_>>()
-    };
-    let mut seen = std::collections::BTreeSet::new();
-    for (generation, on) in [(1, false), (2, true), (3, false), (4, true), (5, false)] {
-        FLAGS_ON.store(on, Ordering::Relaxed);
-        let opts = layout::Options {
-            bindings: true,
-            sample: Some(flag_sampler),
-            sample_generation: generation,
-            ..Default::default()
+#[derive(Debug, Clone, Default)]
+struct Summary {
+    /// Keyed by the two kind letters, e.g. `WI`.
+    kinds: BTreeMap<String, KindSummary>,
+    failed: Vec<(PathBuf, String)>,
+}
+
+/// Parses every `PHX*` file directly in `dir`; other files are skipped.
+fn summarize(dir: &Path, names: &Names) -> Result<Summary> {
+    let mut summary = Summary::default();
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
+        .with_context(|| format!("reading {}", dir.display()))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.is_file())
+        .collect();
+    paths.sort();
+    for path in paths {
+        let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+        if !bytes.starts_with(b"PHX") {
+            continue;
+        }
+        let asset = match Asset::parse(bytes) {
+            Ok(a) => a,
+            Err(e) => {
+                summary.failed.push((path, format!("{e:#}")));
+                continue;
+            }
         };
-        let warm =
-            layout::Tree::build_cached(&root, &mut load, &mut |_, _| None, &opts, &mut cache);
-        let fresh = layout::Tree::build_cached(
-            &root,
-            &mut load,
-            &mut |_, _| None,
-            &opts,
-            &mut layout::Cache::default(),
-        );
-        assert_eq!(
-            shown(&warm),
-            shown(&fresh),
-            "generation {generation}, flags {on}"
-        );
-        seen.insert(shown(&fresh));
-        cache.keep(warm);
+        let k = summary.kinds.entry(asset.header.kind_str()).or_default();
+        k.files += 1;
+        k.bytes += asset.bytes.len();
+        for (_, o) in asset.objects() {
+            k.objects += 1;
+            k.classes_named += usize::from(asset.name(names, o.class).is_some());
+        }
+        k.strings += asset.strings().count();
+        k.references += asset.references().count();
+        k.properties += asset.properties.len();
+        k.opaque_bytes += asset
+            .spans
+            .iter()
+            .filter(|s| s.record == Record::Opaque)
+            .map(|s| s.range.len())
+            .sum::<usize>();
+        k.roundtrip += usize::from(asset.encode() == asset.bytes);
     }
-    assert!(seen.len() > 1, "the flags change what the minimap shows");
+    Ok(summary)
 }

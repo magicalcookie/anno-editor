@@ -1,0 +1,14 @@
+[package]
+name = "anno-render"
+version = "0.1.0"
+edition = "2024"
+description = "How Anno games draw on the kit: their grounds, and later their surface families"
+
+[dependencies]
+anno-core = { path = "../core" }
+anno-formats = { path = "../formats" }
+anyhow = "1"
+bytemuck = { version = "1", features = ["derive"] }
+gpui-editor-kit = { path = "../vendor/gpui-editor-kit" }
+# The grounds' own bind groups, on GPUI's device: the kit's revision.
+wgpu = { git = "https://github.com/gfx-rs/wgpu", rev = "cddb2f5d80dc0009b2ef6767635140cacf90a007", default-features = false, features = ["wgsl", "std"] }

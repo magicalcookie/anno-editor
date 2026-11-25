@@ -2,7 +2,7 @@
 // `theme::appearance()`, so one switch flips both. The consts at the bottom
 // sit on game content (backdrops, marks in the 3D view and on the UI
 // canvas): that content looks the same in every theme, so they do too.
-use anno_formats::game::Game;
+use anno_core::game::Game;
 use gpui_editor_kit::gpui::{App, Rgba, Window};
 use gpui_editor_kit::{platform, theme, theme::Appearance};
 use serde::{Deserialize, Serialize};
@@ -41,17 +41,15 @@ pub struct Launcher {
     pub found: Rgba,
     pub missing: Rgba,
     pub error: Rgba,
-    /// Each game's card accent: Roman gold, industrial steel.
-    pub anno117: Rgba,
-    pub anno1800: Rgba,
+    /// Which of a game's two card accents this palette takes.
+    pub dark: bool,
 }
 
 impl Launcher {
+    /// `game`'s card accent, from its crate.
     pub fn accent(&self, game: Game) -> Rgba {
-        match game {
-            Game::Anno117 => self.anno117,
-            Game::Anno1800 => self.anno1800,
-        }
+        let [dark, light] = crate::games::module(game).accent();
+        hex(if self.dark { dark } else { light })
     }
 }
 
@@ -192,8 +190,7 @@ static DARK: Colors = Colors {
         found: hex(0xa7c8b0),
         missing: hex(0xb8a798),
         error: hex(0xf0b0a0),
-        anno117: hex(0xe0c49c),
-        anno1800: hex(0xadc9d1),
+        dark: true,
     },
     graph: Graph {
         canvas: hex(0x16191e),
@@ -247,8 +244,7 @@ static LIGHT: Colors = Colors {
         found: hex(0x377349),
         missing: hex(0x85603c),
         error: hex(0xb03c2c),
-        anno117: hex(0x94702f),
-        anno1800: hex(0x3b6a7b),
+        dark: false,
     },
     graph: Graph {
         canvas: hex(0xeef1f4),
@@ -335,6 +331,12 @@ pub const AREA_SQUARE: u32 = 0xff5a5a;
 pub const AREA_ROUND: u32 = 0xc08cff;
 pub const PROP_MARKER: u32 = 0xd9c7a0;
 pub const OBJECT_MARKER: u32 = 0x7fc4ff;
+/// Resource slot markers, one hue per kind so a mine row along a ridge
+/// reads apart from the river slots below it.
+pub const SLOT_MINE: u32 = 0xffb04d;
+pub const SLOT_RIVER: u32 = 0x4fc3ff;
+pub const SLOT_MARSH: u32 = 0x8fd14f;
+pub const SLOT_OTHER: u32 = 0xe08cff;
 /// Behind labels in the 3D view: dark in every theme, since their text is
 /// one of the marks above.
 pub const LABEL_BG: u32 = 0x10141add;
@@ -345,9 +347,10 @@ pub const LAYER_ACTIVE_MAP: u32 = 0xffd84d;
 pub const LAYER_WATER: u32 = 0x3fae5a;
 pub const LAYER_RIVER: u32 = 0x1fb8ff;
 pub const LAYER_FORD: u32 = 0xff9a2e;
-pub const LAYER_TREES: u32 = 0x1d7f34;
+// Light enough to read over grass once the overlay covers the texture.
+pub const LAYER_TREES: u32 = 0x2fe070;
 pub const LAYER_HERDS: u32 = 0xc66bff;
-pub const LAYER_MARSH: u32 = 0x5c7a2e;
+pub const LAYER_MARSH: u32 = 0x3fe0d0;
 /// Environment types without a debug color in assets.xml still need to show.
 pub const LAYER_UNCOLORED: u32 = 0xff00ff;
 /// Area ids: construction green, base amber, anything else magenta.

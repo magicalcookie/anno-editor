@@ -31,6 +31,8 @@ pub enum Filter {
 pub enum Source {
     Ported,
     Custom,
+    /// A game model the mod replaces: edited in the Model workspace.
+    Edited,
     /// A dependency's name.
     Mod(String),
 }
@@ -40,6 +42,7 @@ impl Source {
         match self {
             Self::Ported => "ported",
             Self::Custom => "custom",
+            Self::Edited => "edited",
             Self::Mod(name) => name,
         }
     }
@@ -48,6 +51,7 @@ impl Source {
         match self {
             Self::Ported => crate::colors::get().ported,
             Self::Custom => theme::get().accent,
+            Self::Edited => theme::get().highlight,
             Self::Mod(_) => theme::get().ok,
         }
     }
@@ -61,10 +65,7 @@ pub struct Entry {
 
 /// Model files (cfg, prp) staged in the project.
 pub fn project_cfg_files(project: &Project) -> Vec<String> {
-    port::project_models(&project.files)
-        .into_iter()
-        .flat_map(|m| m.files)
-        .collect()
+    project.models().into_iter().flat_map(|m| m.files).collect()
 }
 
 /// The model's name: its file name without extension.
@@ -108,11 +109,7 @@ impl Editor {
         // "From disk": beside Browse game models, a bare "Add model" could
         // mean adding one of the game's.
         let add = action("Add model from disk…", Tone::Primary)
-            .tooltip(Tooltip::text(
-                "Add model",
-                "",
-                crate::game_text::of(self.game).add_model,
-            ))
+            .tooltip(Tooltip::text("Add model", "", self.module.text().add_model))
             // Its own click only: inside a tile that takes clicks too, the
             // picker would open twice.
             .on_click(cx.listener(|this, _, _, cx| {
@@ -176,7 +173,7 @@ impl Editor {
                     .child(choice(
                         "models-add-tile",
                         add,
-                        crate::game_text::of(self.game).model_formats,
+                        self.module.text().model_formats,
                         |this, cx| this.add_model(cx),
                     ))
                     .child(choice(
@@ -199,17 +196,26 @@ impl Editor {
 
     /// Project models, then each dependency's, in dependency order.
     pub fn model_entries(&self) -> Vec<Entry> {
-        let mut out: Vec<Entry> = port::project_models(&self.project.files)
+        let mut out: Vec<Entry> = self
+            .project
+            .models()
             .into_iter()
+            // The source first: it reads the cfg's path before it moves.
             .map(|m| Entry {
-                cfg: m.cfg,
                 source: match m.kind {
                     port::ModelKind::Ported => Source::Ported,
+                    // The game ships one at the path: the mod replaces it.
+                    port::ModelKind::Custom
+                        if (self.install.as_ref()).is_some_and(|i| i.file(&m.cfg).is_some()) =>
+                    {
+                        Source::Edited
+                    }
                     port::ModelKind::Custom => Source::Custom,
                 },
+                cfg: m.cfg,
             })
             .collect();
-        let suffix = self.game.profile().prop_ext;
+        let suffix = self.module.ports().prop_ext;
         if let Some(install) = &self.install {
             for (layer, id) in self.mounted.iter().enumerate() {
                 let name = (self.mods.iter())
@@ -303,11 +309,11 @@ impl Editor {
         let Some(install) = self.install.clone() else {
             return self.message("No install is open", true);
         };
-        let imported = match port::import(path, self.project.mod_id(), &install) {
+        let imported = match port::import(self.module, path, self.project.mod_id(), &install) {
             Ok(m) => m,
             Err(e) => return self.message(format!("Model not added: {e:#}"), true),
         };
-        let replaced = self.project.files.contains_key(&imported.cfg);
+        let replaced = self.project.has_file(&imported.cfg);
         let count = imported.files.len();
         for (p, bytes) in imported.files {
             self.project.stage(&p, bytes);
@@ -329,7 +335,7 @@ impl Editor {
     }
 
     fn remove_model(&mut self, cfg: &str) {
-        let models = port::project_models(&self.project.files);
+        let models = self.project.models();
         let Some(model) = models.iter().find(|m| m.cfg == cfg) else {
             return;
         };
@@ -346,7 +352,7 @@ impl Editor {
         }
         let files = port::removable(&models, model);
         for f in &files {
-            self.project.files.remove(f);
+            self.project.remove_file(f);
         }
         self.project_ui.model = None;
         self.finish_project_edit(format!(
@@ -376,12 +382,7 @@ impl Editor {
             return empty_state("Indexing the install…").into_any_element();
         }
         self.ensure_usage(cx);
-        if self.thumbs.is_none()
-            && let Some(install) = self.install.clone()
-        {
-            let dir = self.config.join("thumbnails");
-            self.thumbs = Some(catalog::Thumbs::start(install, dir));
-        }
+        self.start_thumbs();
         let all = self.model_entries();
         let filter = self.project_ui.model_filter;
         // As typed, as the Library's search filters: by shown name or path.
@@ -419,7 +420,7 @@ impl Editor {
             .filter(|e| {
                 query.is_empty()
                     || e.cfg.to_lowercase().contains(&query)
-                    || crate::island::pretty(model_name(&e.cfg))
+                    || crate::island::pretty(self.asset_words(), model_name(&e.cfg))
                         .to_lowercase()
                         .contains(&query)
             })
@@ -431,7 +432,7 @@ impl Editor {
         shown.sort_by_cached_key(|e| {
             (
                 matches!(e.source, Source::Mod(_)),
-                crate::island::pretty(model_name(&e.cfg)).to_lowercase(),
+                crate::island::pretty(self.asset_words(), model_name(&e.cfg)).to_lowercase(),
             )
         });
         if let Some(thumbs) = &mut self.thumbs {
@@ -562,6 +563,7 @@ impl Editor {
             let entity = cx.entity().downgrade();
             let count = cards.len();
             let card_query = query.clone();
+            let words = self.asset_words();
             widgets::card_grid(
                 "project-models",
                 count,
@@ -578,7 +580,7 @@ impl Editor {
                         thumb,
                         // The Library's names: "Tree dead jungle 02", not the
                         // file name broken mid-word across two lines.
-                        crate::island::pretty(model_name(&entry.cfg)),
+                        crate::island::pretty(words, model_name(&entry.cfg)),
                         &card_query,
                         if *missing { "No preview" } else { "…" },
                         selected.as_deref() == Some(entry.cfg.as_str()),
@@ -690,7 +692,7 @@ impl Editor {
         let entry = all.iter().find(|e| e.cfg == cfg)?;
         let ours = !matches!(entry.source, Source::Mod(_));
         let model = ours
-            .then(|| port::project_models(&self.project.files))
+            .then(|| self.project.models())
             .and_then(|m| m.into_iter().find(|m| m.cfg == cfg));
         let used = self.used_by(&cfg);
         let usage = if self.project_ui.usage.is_none() {
@@ -706,21 +708,33 @@ impl Editor {
                     .join(", ")
             )
         };
-        let (place_cfg, remove_cfg) = (cfg.clone(), cfg.clone());
-        let mut actions = div().flex().items_center().gap_2().child(
-            action(
-                "Place on island",
-                if self.island.is_some() {
-                    Tone::Primary
-                } else {
-                    Tone::Secondary
-                },
-            )
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.place_model(&place_cfg);
-                cx.notify();
-            })),
-        );
+        let (place_cfg, remove_cfg, edit_cfg) = (cfg.clone(), cfg.clone(), cfg.clone());
+        let mut actions = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .when(self.supports(Workspace::Model), |d| {
+                d.child(action("Edit model", Tone::Secondary).on_click(cx.listener(
+                    move |this, _, _, cx| {
+                        this.open_model(&edit_cfg, cx);
+                        cx.notify();
+                    },
+                )))
+            })
+            .child(
+                action(
+                    "Place on island",
+                    if self.island.is_some() {
+                        Tone::Primary
+                    } else {
+                        Tone::Secondary
+                    },
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.place_model(&place_cfg);
+                    cx.notify();
+                })),
+            );
         if ours && used.is_empty() {
             actions = actions.child(confirm_button(
                 "remove-model",

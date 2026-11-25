@@ -3,9 +3,20 @@
 use anyhow::Result;
 use std::path::PathBuf;
 
-/// `$XDG_CONFIG_HOME/<app>`, falling back to `~/.config/<app>`; on Windows,
+/// `$XDG_CONFIG_HOME/<app>`, falling back to `~/.config/<app>` on Linux and
+/// `~/Library/Application Support/<app>` on macOS. On Windows,
 /// `%APPDATA%\<app>`.
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "macos")]
+pub fn config_dir(app: &str) -> PathBuf {
+    if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME") {
+        return PathBuf::from(dir).join(app);
+    }
+    PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
+        .join("Library/Application Support")
+        .join(app)
+}
+
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 pub fn config_dir(app: &str) -> PathBuf {
     std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)

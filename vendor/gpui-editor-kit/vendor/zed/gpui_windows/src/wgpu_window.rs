@@ -1,6 +1,8 @@
-// A window's renderer: gpui_wgpu on a DX12 swap chain for the HWND, in
-// place of the DirectX 11 renderer, so application viewports (GpuCanvas)
-// draw with GPUI's own wgpu device on Windows as they do on Linux.
+// A window's renderer: gpui_wgpu on a swap chain for the HWND (DX12, or
+// the backend a context provider names), in
+// place of the DirectX 11 renderer, so application textures
+// (TextureHandoff) draw on GPUI's own wgpu device on Windows as they do on
+// Linux.
 
 use std::{num::NonZeroIsize, sync::Arc};
 

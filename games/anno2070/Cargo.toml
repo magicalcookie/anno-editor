@@ -1,0 +1,21 @@
+[package]
+name = "anno2070"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anno-core = { path = "../../core" }
+anno-formats = { path = "../../formats" }
+anno-render = { path = "../../render" }
+anyhow = "1"
+bytemuck = { version = "1", features = ["derive"] }
+gpui-editor-kit = { path = "../../vendor/gpui-editor-kit" }
+# The sea's own pipelines, on GPUI's device: the kit's revision.
+wgpu = { git = "https://github.com/gfx-rs/wgpu", rev = "cddb2f5d80dc0009b2ef6767635140cacf90a007", default-features = false, features = ["wgsl", "std"] }
+
+[dev-dependencies]
+# The coast digests draw the island with its own ground.
+anno-render = { path = "../../render" }
+image = { version = "0.25", default-features = false, features = ["png"] }
+# Readable shader errors in the module's own test.
+naga = { git = "https://github.com/gfx-rs/wgpu", rev = "cddb2f5d80dc0009b2ef6767635140cacf90a007", features = ["wgsl-in"] }

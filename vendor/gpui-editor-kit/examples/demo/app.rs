@@ -243,6 +243,7 @@ impl Demo {
             terrain: None,
             lines: Default::default(),
             markers: Arc::new(markers),
+            local_lights: Default::default(),
             light: Light {
                 sun: [0.5, 0.8, 0.3],
                 sun_color: [0.75; 3],
@@ -254,6 +255,15 @@ impl Demo {
             tone: None,
             sky: None,
             occlusion: None,
+            ground_tint: None,
+            cloud_shadows: None,
+            glow: Default::default(),
+            environment: None,
+            view_mode: 0,
+            host_texture: None,
+            reflection: None,
+            passes: Vec::new(),
+            ground: Default::default(),
         };
         for view in &self.views {
             view.renderer.renderer().set_scene(&scene);
@@ -448,7 +458,7 @@ impl Demo {
                 changed,
                 ..
             }) => {
-                if let Some(delta) = gesture.delta(event.position, snap.then_some(1.)) {
+                if let Some(delta) = gesture.delta(event.position, snap.then_some(1f32)) {
                     let pivot = gesture.frame.pivot();
                     for (id, start) in targets.iter() {
                         if let Some(o) = self.doc.objects.iter_mut().find(|o| o.id == *id) {
@@ -944,6 +954,8 @@ fn pond() -> Mesh {
             fade: 0.5,
             fresnel: 0.6,
             depth: 0.,
+            additive: false,
+            unlit: false,
         }),
         ..Default::default()
     })
@@ -952,6 +964,7 @@ fn pond() -> Mesh {
 
 pub fn main() -> anyhow::Result<()> {
     platform::configure_display("KIT_DEMO_DISPLAY_BACKEND")?;
+    gpui_editor_kit::gpu::install();
     gpui_platform::application().run(|cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(1280.), px(800.)), cx);
         cx.open_window(

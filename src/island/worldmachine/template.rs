@@ -40,78 +40,37 @@ const UNIT: f32 = 8000.;
 /// such as the radial gradient centre themselves.
 const CENTRE: f32 = 0.5;
 
-/// The templates' splatmap channels: five RGBA images of four, each image
-/// a theme, the same in every template so a channel always means one
-/// thing. Roles follow where retail islands put each material (measured
-/// over the roman and celtic pools); the names are
-/// palette files to use, best first, roman then celtic. 1-16 are ground
-/// channels sharing one weightmap; 17-20 overlay patches (see `world`).
-pub const CHANNELS: [(&str, &[&str]); 20] = [
+/// The templates' splatmap channels by role: five RGBA images of four,
+/// each image a theme, the same in every template so a channel always
+/// means one thing. 1-16 are ground channels sharing one weightmap; 17-20
+/// overlay patches (see `world`). Each game names the palette materials a
+/// role paints (`GroundNames::channels`).
+pub const CHANNELS: [&str; 20] = [
     // 1 rock
-    ("cliff", &["cliff_limestone", "celtic_cliffs_05", "cliff"]),
-    (
-        "sharp cliff",
-        &[
-            "roman_cliff_sharp",
-            "celtic_cliffs_06",
-            "cliff_blocky",
-            "cliff",
-        ],
-    ),
-    ("coastal rock", &["rock_limestone", "rocks_sharp", "rock"]),
-    ("gravel", &["gravel_01", "gravel_round", "gravel"]),
+    "cliff",
+    "sharp cliff",
+    "coastal rock",
+    "gravel",
     // 2 shore
-    (
-        "seagrass",
-        &[
-            "underwatergrass",
-            "mud_01_darker.",
-            "mud_01_darker_dummy",
-            "mud",
-        ],
-    ),
-    (
-        "beach & shelf",
-        &["beach_04", "beach_01.", "beach_01_dummy", "beach"],
-    ),
-    ("waterline", &["beach_02", "beach_01_b", "beach"]),
-    ("shore sand", &["sand_01", "gravel_round", "sand", "beach"]),
+    "seagrass",
+    "beach & shelf",
+    "waterline",
+    "shore sand",
     // 3 water
-    ("river bed", &["river_pebbles", "gravel_round", "gravel"]),
-    (
-        "river banks",
-        &["mud_01.", "mud_01_dummy", "mud_01_darker_wet", "mud"],
-    ),
-    (
-        "river shore",
-        &["beach_05", "mud_01_darker.", "mud_01_darker_dummy", "mud"],
-    ),
-    ("pebble beach", &["beach_03", "gravel_round", "beach"]),
+    "river bed",
+    "river banks",
+    "river shore",
+    "pebble beach",
     // 4 ground
-    ("dirt", &["dirt_01", "mud_01_darker_wet", "dirt", "mud"]),
-    ("dry grass", &["grass_01_h_dry", "grass_01_c_dry", "grass"]),
-    (
-        "lush grass",
-        &["grass_01_f_dark", "grass_01.", "grass_01_dummy", "grass"],
-    ),
-    (
-        "grass",
-        &["grass_01_e", "grass_01.", "grass_01_dummy", "grass"],
-    ),
+    "dirt",
+    "dry grass",
+    "lush grass",
+    "grass",
     // 5 overlays
-    (
-        "upland grass",
-        &["grass_01_g_dry", "grass_01_c_dry", "grass"],
-    ),
-    (
-        "flowers",
-        &["grass_01_d_lavender", "grass_01_b_light", "grass"],
-    ),
-    ("marsh", &["marshfloor", "mud_01.", "mud_01_dummy", "mud"]),
-    (
-        "bare earth",
-        &["dirt_01", "mud_01_darker.", "mud_01_darker_dummy", "mud"],
-    ),
+    "upland grass",
+    "flowers",
+    "marsh",
+    "bare earth",
 ];
 
 /// The theme of each splatmap image, in order.
@@ -127,46 +86,16 @@ const SPLATMAPS: [&str; 5] = [
 ];
 
 /// The palette material for each channel: the first file name (without
-/// its folder) that starts with one of the channel's preferences.
+/// its folder and region prefix) that starts with one of the game's names
+/// for the channel's role.
 pub fn channel_materials(
-    game: anno_formats::game::Game,
+    names: &anno_core::game::GroundNames,
     materials: &[(u8, String)],
 ) -> Vec<[Option<u8>; 4]> {
-    let pick = |prefs: &[&str]| {
-        prefs.iter().find_map(|want| {
-            materials.iter().find_map(|(id, file)| {
-                let stem = super::material_name(file);
-                stem.starts_with(want).then_some(*id)
-            })
-        })
-    };
+    let files = materials.iter().map(|(id, f)| (*id, f.as_str()));
     CHANNELS
         .chunks(4)
-        .map(|four| {
-            std::array::from_fn(|c| {
-                pick(four[c].1).or_else(|| {
-                    // 1800 uses regional prefixes and a smaller set of ground
-                    // roles. Every WM channel still needs usable material weight.
-                    if !game.profile().regional_materials {
-                        return None;
-                    }
-                    let fallback: &[&str] = match four[c].0 {
-                        "cliff" | "sharp cliff" => &["mountain", "rock", "stone"],
-                        "coastal rock" => &["rock", "stone", "mountain"],
-                        "gravel" | "river bed" => &["gravle", "gravel", "stone", "beach"],
-                        "seagrass" => &["underwater", "mud", "snow", "stone", "rock", "beach"],
-                        "beach & shelf" | "waterline" | "shore sand" | "pebble beach" => {
-                            &["beach", "snow", "stone"]
-                        }
-                        "river banks" | "river shore" | "dirt" | "marsh" | "bare earth" => {
-                            &["mud", "roots", "snow", "stone", "gras"]
-                        }
-                        _ => &["grass", "gras", "snow", "mud"],
-                    };
-                    pick(fallback)
-                })
-            })
-        })
+        .map(|four| std::array::from_fn(|c| names.pick(names.channel(four[c]), files.clone())))
         .collect()
 }
 
@@ -1254,7 +1183,10 @@ mod tests {
         ]
         .map(|(id, f)| (id, f.to_owned()))
         .into();
-        let c = super::channel_materials(anno_formats::game::Game::Anno117, &palette);
+        let c = super::channel_materials(
+            &crate::games::rules(anno_core::game::Game::Anno117).ground_names,
+            &palette,
+        );
         assert_eq!(c.len(), 5);
         // Rock: cliff twice (no sharp cliff in this palette), rock, no gravel.
         assert_eq!(c[0], [Some(2), Some(2), Some(9), None]);
@@ -1287,7 +1219,10 @@ mod tests {
                 .enumerate()
                 .map(|(i, name)| (i as u8, format!("terrain/{name}.xml")))
                 .collect();
-            let channels = super::channel_materials(anno_formats::game::Game::Anno1800, &palette);
+            let channels = super::channel_materials(
+                &crate::games::rules(anno_core::game::Game::Anno1800).ground_names,
+                &palette,
+            );
             assert_eq!(channels.len(), 5);
             assert!(
                 channels.iter().flatten().all(Option::is_some),

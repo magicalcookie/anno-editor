@@ -38,11 +38,11 @@ impl DeviceErrorState {
         let errors = Arc::new(Self::default());
         device.set_device_lost_callback({
             let errors = Arc::clone(&errors);
+            // Destroyed too: GPUI never destroys its device, so whoever
+            // did (a test of recovery) left the windows nothing to draw on.
             move |reason, message| {
                 log::error!("wgpu device lost: reason={reason:?}, message={message}");
-                if reason != wgpu::DeviceLostReason::Destroyed {
-                    errors.lost.store(true, Ordering::Relaxed);
-                }
+                errors.lost.store(true, Ordering::Relaxed);
             }
         });
         device.on_uncaptured_error(Arc::new({
@@ -131,6 +131,44 @@ pub struct CompositorGpuHint {
     pub device_id: u32,
 }
 
+/// The wgpu setup an application supplies for GPUI's windows, when its own
+/// rendering draws on GPUI's device and needs instance flags, backends,
+/// features or limits GPUI doesn't ask for. GPUI still picks the adapter
+/// that can present to the window, rejects software adapters where it
+/// would, and asks again after a device loss. Install it with
+/// [`set_context_provider`] before the first window opens.
+#[cfg(not(target_family = "wasm"))]
+pub trait WgpuContextProvider: Send + Sync {
+    /// Instances to try, best first, each made only if the ones before it
+    /// had no adapter that can present to the window. GPUI sets `display`.
+    fn instances(&self) -> Vec<wgpu::InstanceDescriptor>;
+
+    /// The device to request on `adapter`. GPUI adds the optional features
+    /// its own pipelines use where the adapter offers them; the limits must
+    /// cover `wgpu::Limits::downlevel_defaults()`.
+    fn device(&self, adapter: &wgpu::Adapter) -> wgpu::DeviceDescriptor<'static>;
+
+    /// Called with each device GPUI makes for its windows, the first and
+    /// each one after a device loss, once a window's surface accepted it
+    /// and before anything draws with it: for work an application starts
+    /// before its first frame there, such as building its pipelines. Runs
+    /// on GPUI's thread while a window opens or recovers, so start work
+    /// here rather than do it.
+    fn made(&self, _device: &wgpu::Device, _queue: &wgpu::Queue) {}
+}
+
+#[cfg(not(target_family = "wasm"))]
+static PROVIDER: std::sync::OnceLock<Box<dyn WgpuContextProvider>> = std::sync::OnceLock::new();
+
+/// Has every context GPUI makes from now on, for windows, after a device
+/// loss and headless, come from `provider`. Once per process.
+#[cfg(not(target_family = "wasm"))]
+pub fn set_context_provider(provider: Box<dyn WgpuContextProvider>) -> anyhow::Result<()> {
+    PROVIDER
+        .set(provider)
+        .map_err(|_| anyhow::anyhow!("a wgpu context provider is already set"))
+}
+
 impl WgpuContext {
     #[cfg(not(target_family = "wasm"))]
     pub fn new(
@@ -150,6 +188,49 @@ impl WgpuContext {
         compositor_gpu: Option<CompositorGpuHint>,
     ) -> anyhow::Result<Self> {
         Self::new_with_options(instance, surface, config, compositor_gpu, true)
+    }
+
+    /// A context for a window and its surface on the context's instance:
+    /// GPUI's own instance, or the provider's instances in turn.
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn for_window(
+        display: impl Fn() -> Box<dyn wgpu::wgt::WgpuHasDisplayHandle>,
+        create_surface: impl Fn(&wgpu::Instance) -> anyhow::Result<wgpu::Surface<'static>>,
+        config: &WgpuSurfaceConfig,
+        compositor_gpu: Option<CompositorGpuHint>,
+        reject_software: bool,
+    ) -> anyhow::Result<(Self, wgpu::Surface<'static>)> {
+        let attempt = |instance: wgpu::Instance| -> anyhow::Result<(Self, wgpu::Surface<'static>)> {
+            let surface = create_surface(&instance)
+                .map_err(|e| anyhow::anyhow!("Failed to create surface: {e}"))?;
+            let context = Self::new_with_options(
+                instance,
+                &surface,
+                config,
+                compositor_gpu,
+                reject_software,
+            )?;
+            Ok((context, surface))
+        };
+        let Some(provider) = PROVIDER.get() else {
+            return attempt(Self::instance(Some(display())));
+        };
+        let mut failed = anyhow::anyhow!("The wgpu context provider offered no instances");
+        for mut descriptor in provider.instances() {
+            let backends = descriptor.backends;
+            descriptor.display = Some(display());
+            match attempt(wgpu::Instance::new(descriptor)) {
+                Ok(made) => {
+                    provider.made(&made.0.device, &made.0.queue);
+                    return Ok(made);
+                }
+                Err(error) => {
+                    log::info!("No usable adapter on {backends:?}: {error:#}");
+                    failed = error;
+                }
+            }
+        }
+        Err(failed)
     }
 
     #[cfg(not(target_family = "wasm"))]
@@ -211,10 +292,25 @@ impl WgpuContext {
         any(test, feature = "bench-support", feature = "test-support")
     ))]
     fn create_headless() -> anyhow::Result<(Self, wgpu::TextureFormat)> {
-        let instance = Self::instance(None);
+        let instances = match PROVIDER.get() {
+            Some(provider) => provider
+                .instances()
+                .into_iter()
+                .map(wgpu::Instance::new)
+                .collect(),
+            None => vec![Self::instance(None)],
+        };
         let device_id_filter = Self::device_id_filter();
-        let (adapter, device, queue, dual_source_blending, color_texture_format, target_format) =
-            gpui::block_on(async {
+        let (
+            instance,
+            adapter,
+            device,
+            queue,
+            dual_source_blending,
+            color_texture_format,
+            target_format,
+        ) = gpui::block_on(async {
+            for instance in instances {
                 let mut adapters = instance.enumerate_adapters(wgpu::Backends::all()).await;
                 Self::sort_adapters(&mut adapters, device_id_filter, None);
 
@@ -239,6 +335,7 @@ impl WgpuContext {
                                 );
                             }
                             return Ok((
+                                instance,
                                 adapter,
                                 device,
                                 queue,
@@ -255,9 +352,10 @@ impl WgpuContext {
                         }
                     }
                 }
+            }
 
-                anyhow::bail!("No usable headless GPU adapter found")
-            })?;
+            anyhow::bail!("No usable headless GPU adapter found")
+        })?;
 
         Ok((
             Self::from_native_adapter_and_device(
@@ -453,32 +551,32 @@ impl WgpuContext {
                 .using_resolution(adapter.limits())
                 .using_alignment(adapter.limits())
         };
-        // Application viewports (GpuCanvas) bind more storage buffers and
-        // textures per stage than the downlevel defaults allow, sample BC
-        // textures and time their passes: take what the adapter offers.
         #[cfg(not(target_family = "wasm"))]
-        let required_limits = adapter.limits();
+        let required_limits = wgpu::Limits::downlevel_defaults()
+            .using_resolution(adapter.limits())
+            .using_alignment(adapter.limits());
+
+        let mut descriptor = wgpu::DeviceDescriptor {
+            label: Some("gpui_device"),
+            required_features,
+            required_limits,
+            memory_hints: wgpu::MemoryHints::MemoryUsage,
+            trace: wgpu::Trace::Off,
+            experimental_features: wgpu::ExperimentalFeatures::disabled(),
+            default_queue: wgpu::QueueDescriptor::default(),
+        };
+        // The application's device, plus the features GPUI's own pipelines use.
         #[cfg(not(target_family = "wasm"))]
-        {
-            required_features |= adapter.features()
-                & (wgpu::Features::TEXTURE_COMPRESSION_BC
-                    | wgpu::Features::TIMESTAMP_QUERY
-                    | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS
-                    | wgpu::Features::INDIRECT_FIRST_INSTANCE
-                    | wgpu::Features::TEXTURE_BINDING_ARRAY
-                    | wgpu::Features::SAMPLED_TEXTURE_AND_STORAGE_BUFFER_ARRAY_NON_UNIFORM_INDEXING);
+        if let Some(provider) = PROVIDER.get() {
+            let provided = provider.device(adapter);
+            descriptor = wgpu::DeviceDescriptor {
+                required_features: provided.required_features | required_features,
+                ..provided
+            };
         }
 
         let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor {
-                label: Some("gpui_device"),
-                required_features,
-                required_limits,
-                memory_hints: wgpu::MemoryHints::MemoryUsage,
-                trace: wgpu::Trace::Off,
-                experimental_features: wgpu::ExperimentalFeatures::disabled(),
-                default_queue: wgpu::QueueDescriptor::default(),
-            })
+            .request_device(&descriptor)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to create wgpu device: {e}"))?;
 
@@ -492,11 +590,14 @@ impl WgpuContext {
 
     #[cfg(not(target_family = "wasm"))]
     pub fn instance(display: Option<Box<dyn wgpu::wgt::WgpuHasDisplayHandle>>) -> wgpu::Instance {
-        // Windows windows draw through this crate too (vendored gpui_windows),
-        // on DX12: every Windows 10+ GPU has it, unlike a Vulkan driver.
+        // Windows windows draw through this crate on DX12: every Windows 10+
+        // GPU has it, unlike a Vulkan driver. macOS windows draw through it
+        // on Metal.
         #[cfg(target_os = "windows")]
         let backends = wgpu::Backends::DX12;
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(target_os = "macos")]
+        let backends = wgpu::Backends::METAL;
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         let backends = wgpu::Backends::VULKAN | wgpu::Backends::GL;
         wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends,

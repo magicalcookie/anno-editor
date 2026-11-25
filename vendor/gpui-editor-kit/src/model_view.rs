@@ -3,7 +3,10 @@
 // drive `gpu::Viewport` themselves.
 use crate::{
     camera::{Camera, Extent},
-    gpu::{Batch, Instances, Light, Line, Material, Mesh, MeshData, Renderer, Scene, Viewport},
+    gpu::{
+        Batch, Families, Glow, Instances, Light, Line, Material, Mesh, MeshData, Renderer, Scene,
+        Viewport,
+    },
     math::{self, Mat4},
 };
 use gpui::{prelude::*, *};
@@ -12,24 +15,47 @@ use std::{cell::Cell, rc::Rc, sync::Arc};
 /// Behind the model; the floor fades out to it.
 pub const BACKDROP: u32 = 0x2a3038;
 
-/// The floor under the model: a contact shadow under its base (`shadow`
-/// across) darkening into a disc a step lighter than the backdrop, which
-/// fades out to it at `radius`. A disc alone, barely lighter, read as a
-/// vignette and the model still floated.
-fn floor(center: [f32; 3], shadow: f32, radius: f32) -> Option<Arc<Mesh>> {
+/// The floor's colour `r` from its centre, as [`floor`] lays it: a contact
+/// shadow under the model's base (`shadow` across) darkening into a disc a
+/// step lighter than the backdrop, which fades out to it at `radius`. A
+/// disc alone, barely lighter, read as a vignette and the model still
+/// floated. For a host drawing over the floor in its colours.
+pub fn floor_color(r: f32, shadow: f32, radius: f32) -> u32 {
+    const MIDDLE: u32 = 0x1c2127;
+    const RING: u32 = 0x414955;
+    if r < shadow {
+        mix(MIDDLE, RING, r / shadow.max(1e-6))
+    } else {
+        mix(RING, BACKDROP, (r - shadow) / (radius - shadow).max(1e-6))
+    }
+}
+
+/// `a` toward `b` by `t`, per channel of 0xRRGGBB.
+fn mix(a: u32, b: u32, t: f32) -> u32 {
+    let t = t.clamp(0., 1.);
+    (0..3).fold(0, |out, k| {
+        let shift = 16 - k * 8;
+        let (x, y) = ((a >> shift & 0xff) as f32, (b >> shift & 0xff) as f32);
+        out | ((x + (y - x) * t).round() as u32) << shift
+    })
+}
+
+/// The floor under a model: a flat disc at `center`, taking no light, in
+/// [`floor_color`]'s rings.
+pub fn floor(center: [f32; 3], shadow: f32, radius: f32) -> Option<Arc<Mesh>> {
     const SIDES: u32 = 64;
     let mut data = MeshData {
         material: Material::Flat,
         ..Default::default()
     };
     data.positions.push(center);
-    data.colors.push(0x1c2127);
-    for (r, color) in [(shadow, 0x414955), (radius, BACKDROP)] {
+    data.colors.push(floor_color(0., shadow, radius));
+    for r in [shadow, radius] {
         for k in 0..SIDES {
             let a = k as f32 / SIDES as f32 * std::f32::consts::TAU;
             data.positions
                 .push([center[0] + r * a.cos(), center[1], center[2] + r * a.sin()]);
-            data.colors.push(color);
+            data.colors.push(floor_color(r, shadow, radius));
         }
     }
     data.normals = vec![[0., 1., 0.]; data.positions.len()];
@@ -94,11 +120,20 @@ pub struct ModelView {
     bounds: Rc<Cell<Bounds<Pixels>>>,
     /// The floor grid's spacing in metres, named on the view.
     step: f32,
+    /// What the next `show` gives emissive light and the host's families.
+    pub glow: Glow,
 }
 
 impl Default for ModelView {
     fn default() -> Self {
-        let renderer = Arc::new(Renderer::default());
+        Self::with_families(Families::kit())
+    }
+}
+
+impl ModelView {
+    /// A view whose meshes draw with `families` (`Renderer::with_families`).
+    pub fn with_families(families: Arc<Families>) -> Self {
+        let renderer = Arc::new(Renderer::with_families(families));
         Self {
             viewport: renderer.viewport(),
             renderer,
@@ -110,11 +145,15 @@ impl Default for ModelView {
             drag: None,
             bounds: Rc::default(),
             step: 1.,
+            glow: Glow::default(),
         }
     }
-}
 
-impl ModelView {
+    /// The family set the view draws with (`with_families`).
+    pub fn families(&self) -> Arc<Families> {
+        self.renderer.families()
+    }
+
     /// Shows `parts` (a mesh and where it sits in model space), framed.
     /// `mirror` as [`Camera::mirror`]: left-handed game data.
     pub fn show(&mut self, parts: Vec<(Arc<Mesh>, Mat4)>, mirror: bool) {
@@ -163,6 +202,7 @@ impl ModelView {
                 ..Default::default()
             },
             lines: Arc::new(lines),
+            glow: self.glow,
             ..Default::default()
         });
         // The largest side about fills the shorter viewport side: seen

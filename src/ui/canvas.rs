@@ -1,7 +1,7 @@
-// Owns the UI canvas: widgets laid out in design pixels, drawn as positioned
-// GPUI elements (labels, CPU-composited images) and runs of GPU sprites
-// (`gpu`), and pointer editing on it: picking, click versus drag, hover
-// outlines, snapping. Pan, zoom and move/resize handles come from the
+// Owns the UI canvas: widgets laid out in design pixels, drawn into one
+// texture on the GPU (`gpu`), or as positioned GPUI elements (labels,
+// CPU-composited images) without it, and pointer editing on it: picking,
+// click versus drag, hover outlines, snapping. Pan, zoom and move/resize handles come from the
 // kit's `design` surface. Layout input is the flat `Node` list built from
 // the decoded widget tree; edits come back out as rectangle changes.
 use super::UiEditor;
@@ -212,53 +212,6 @@ fn contains([x, y, w, h]: [f32; 4], p: [f32; 2]) -> bool {
 
 fn overlaps(a: [f32; 4], b: [f32; 4]) -> bool {
     a[0] < b[0] + b[2] && b[0] < a[0] + a[2] && a[1] < b[1] + b[3] && b[1] < a[1] + a[3]
-}
-
-/// The canvas's paint order: GPUI elements and runs of sprites. Each run
-/// is a render pass of its own between GPUI's (see `gpu::Batch`), so a
-/// sprite joins the open run unless something GPUI drew since that run
-/// began (a label) overlaps it; then it must draw after that, in a new run.
-/// Splitting at every label made a few hundred passes a frame.
-#[derive(Default)]
-struct Runs {
-    paint: Vec<Result<AnyElement, Vec<Arc<super::gpu::Sprite>>>>,
-    open: Option<usize>,
-    /// Design boxes of what GPUI draws after the open run.
-    since: Vec<[f32; 4]>,
-}
-
-impl Runs {
-    fn sprite(&mut self, sprite: Arc<super::gpu::Sprite>, covers: [f32; 4]) {
-        let clear = !self.since.iter().any(|&q| overlaps(q, covers));
-        if let Some(Err(run)) = self
-            .open
-            .filter(|_| clear)
-            .and_then(|b| self.paint.get_mut(b))
-        {
-            run.push(sprite);
-            return;
-        }
-        self.paint.push(Err(vec![sprite]));
-        self.open = Some(self.paint.len() - 1);
-        self.since.clear();
-    }
-
-    fn element(&mut self, el: AnyElement, covers: [f32; 4]) {
-        if self.open.is_some() {
-            self.since.push(covers);
-        }
-        self.paint.push(Ok(el));
-    }
-}
-
-/// The part of `a` inside `b`; empty (no overlaps) when they miss.
-fn intersect(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
-    let (x0, y0) = (a[0].max(b[0]), a[1].max(b[1]));
-    let (x1, y1) = (
-        (a[0] + a[2]).min(b[0] + b[2]),
-        (a[1] + a[3]).min(b[1] + b[3]),
-    );
-    [x0, y0, (x1 - x0).max(0.), (y1 - y0).max(0.)]
 }
 
 impl UiEditor {
@@ -792,6 +745,12 @@ impl UiEditor {
         ))
     }
 
+    /// Pans the canvas `dx` screen pixels, as a right drag does: for the
+    /// editor's UI bench (`ANNO_EDITOR_UI_BENCH`).
+    pub fn pan_by(&mut self, dx: f32) {
+        self.canvas.view.pan[0] += dx;
+    }
+
     /// The part of the page the canvas pane shows, in design pixels.
     pub(super) fn visible_region(&self) -> [f32; 4] {
         let s = self.canvas_bounds.size;
@@ -1038,7 +997,7 @@ impl crate::editor::Editor {
             ));
         let last = chain.len() - 1;
         for (k, (g, key)) in chain.into_iter().enumerate() {
-            let label = name_of(&format!("{}{g}", super::GENERATED));
+            let label = name_of(&format!("{}{g}", ui.screens().generated));
             bar = bar
                 .child(div().text_color(theme::get().muted).child("›"))
                 .child(
@@ -1094,13 +1053,13 @@ fn tag(p: Point<Pixels>, text: String, color: Rgba) -> AnyElement {
         .into_any_element()
 }
 
-/// Draws `nodes` as absolutely positioned elements of the canvas pane.
-/// `drag` is the rectangle a move or resize in progress shows for its node.
-/// `region` (design pixels) is what the pane shows; nodes outside it are
-/// skipped. `on_handle(node, handle, position)` starts a resize of the
-/// selection; without it the nodes are context only (other screens of the
-/// game view) and get no handles. Nodes with a sprite draw through `gpu`,
-/// in runs between GPUI's own elements. Returns the drawn widgets and the
+/// Draws `nodes` into `scene` when the canvas draws on the GPU, else as
+/// absolutely positioned elements of the canvas pane. `drag` is the
+/// rectangle a move or resize in progress shows for its node. `region`
+/// (design pixels) is what the pane shows; nodes outside it are skipped.
+/// `on_handle(node, handle, position)` starts a resize of the selection;
+/// without it the nodes are context only (other screens of the game view)
+/// and get no handles. Returns the drawn widgets' elements and the
 /// handles, which go over the page's clip. Picking is not done per
 /// element: the pane's own pointer handlers ask [`UiEditor::press`].
 pub fn render(
@@ -1109,7 +1068,7 @@ pub fn render(
     in_scope: &super::Bits,
     drag: Option<(usize, [f32; 4])>,
     region: [f32; 4],
-    gpu: &super::gpu::Renderer,
+    mut scene: Option<&mut super::gpu::Scene>,
     on_handle: Option<
         impl Fn(usize, Handle, Point<Pixels>, &mut Window, &mut App) + Clone + 'static,
     >,
@@ -1120,21 +1079,23 @@ pub fn render(
     // The game antialiases text in greyscale; GPUI's subpixel default
     // drew labels heavier, with colour fringes. The mode is read as glyphs
     // paint, so it is switched for the canvas's own elements only and
-    // put back before the frames and the rest of the editor.
+    // put back before the frames and the rest of the editor. The GPU
+    // canvas draws its glyphs in greyscale itself.
     let before = std::rc::Rc::new(std::cell::Cell::new(TextRenderingMode::PlatformDefault));
-    let set = before.clone();
-    out.push(
-        gpui_editor_kit::gpui::canvas(
-            |_, _, _| {},
-            move |_, _, _, cx| {
-                set.set(cx.text_rendering_mode());
-                cx.set_text_rendering_mode(TextRenderingMode::Grayscale);
-            },
-        )
-        .absolute()
-        .into_any_element(),
-    );
-    let mut runs = Runs::default();
+    if scene.is_none() {
+        let set = before.clone();
+        out.push(
+            gpui_editor_kit::gpui::canvas(
+                |_, _, _| {},
+                move |_, _, _, cx| {
+                    set.set(cx.text_rendering_mode());
+                    cx.set_text_rendering_mode(TextRenderingMode::Grayscale);
+                },
+            )
+            .absolute()
+            .into_any_element(),
+        );
+    }
     // A widget being moved takes everything under it along; masks stay
     // where they are until the relayout.
     let carried = drag.and_then(|(d, r)| {
@@ -1204,9 +1165,9 @@ pub fn render(
             None => None,
         };
         if let Some(sprite) = drawn {
-            // A pixel of slack for filtering at the edges.
-            let r = [x - 1., y - 1., w + 2., h + 2.];
-            runs.sprite(sprite, clip.map_or(r, |c| intersect(r, c)));
+            if let Some(scene) = scene.as_deref_mut() {
+                scene.sprite(sprite);
+            }
             continue;
         }
         // Groups draw nothing of their own: no element (picking is the
@@ -1218,7 +1179,6 @@ pub fn render(
         {
             continue;
         }
-        let covers = clip.map_or(reach, |c| intersect(reach, c));
         // Content and the frame/hit box are separate: a clip cuts the
         // content, never the selection outline.
         let clip = clip.map(|[cx, cy, cw, ch]| {
@@ -1236,13 +1196,51 @@ pub fn render(
         } else {
             1.
         };
+        let opacity = (node.opacity * dim).clamp(0., 1.);
+        if let Some(scene) = scene.as_deref_mut() {
+            // As the elements below place them; an image here has no
+            // texture, since one with a texture is a sprite.
+            let clip = clip.map(|(q, w, h)| (q, [w, h]));
+            if let Some(text) = &node.text {
+                scene.label(super::gpu::Label {
+                    at: p,
+                    size: [sw, sh],
+                    clip,
+                    text: text.clone(),
+                    font: node.font.clone(),
+                    font_size: (node.text_size * view.zoom).max(3.),
+                    line_height: (node.line_height > 0.)
+                        .then(|| (node.line_height * view.zoom).max(3.)),
+                    color: node.color.unwrap_or([235, 235, 235]),
+                    shadow: node.shadow.map(|sh| {
+                        let [x, y] = sh.offset;
+                        (sh.color, sh.alpha, [x * view.zoom, y * view.zoom])
+                    }),
+                    align: node.align,
+                    overflow: node.overflow,
+                    opacity,
+                });
+            } else if node.kind == Kind::Image && node.image.is_none() && node.slices.is_none() {
+                let [r, g, b] = node.color.unwrap_or([120, 130, 150]);
+                let color =
+                    rgba(u32::from(r) << 24 | u32::from(g) << 16 | u32::from(b) << 8 | 0x60);
+                scene.fill(super::gpu::Fill {
+                    at: p,
+                    size: [sw, sh],
+                    clip,
+                    color: Hsla::from(color).opacity(opacity).into(),
+                    border: None,
+                });
+            }
+            continue;
+        }
         let mut el = div()
             .absolute()
             .left(origin.x)
             .top(origin.y)
             .w(px(cw))
             .h(px(ch))
-            .opacity((node.opacity * dim).clamp(0., 1.))
+            .opacity(opacity)
             // Text with HorizontalOverflow Visible (and wrapped lines past
             // a short box) runs out of its box, as in game.
             .when(node.text.is_none() || matches!(node.overflow, 2..=4), |d| {
@@ -1360,7 +1358,7 @@ pub fn render(
             None => Some(el.left(p.x).top(p.y)),
         };
         if let Some(content) = content {
-            runs.element(content.into_any_element(), covers);
+            out.push(content.into_any_element());
         }
     }
     // Resize handles on the selection, drawn or not (a hidden widget picked
@@ -1377,33 +1375,16 @@ pub fn render(
             on(i, handle, at, window, cx)
         }));
     }
-    let o = view.to_screen(0., 0.);
-    let (origin, zoom) = ([f32::from(o.x), f32::from(o.y)], view.zoom);
-    out.extend(runs.paint.into_iter().map(|p| match p {
-        Ok(el) => el,
-        Err(sprites) => {
-            let gpu = gpu.clone();
+    if scene.is_none() {
+        out.push(
             gpui_editor_kit::gpui::canvas(
                 |_, _, _| {},
-                move |bounds, _, window, _| {
-                    super::gpu::Batch::paint(&gpu, sprites, origin, zoom, bounds, window)
-                },
+                move |_, _, _, cx| cx.set_text_rendering_mode(before.get()),
             )
             .absolute()
-            .top_0()
-            .left_0()
-            .size_full()
-            .into_any_element()
-        }
-    }));
-    out.push(
-        gpui_editor_kit::gpui::canvas(
-            |_, _, _| {},
-            move |_, _, _, cx| cx.set_text_rendering_mode(before.get()),
-        )
-        .absolute()
-        .into_any_element(),
-    );
+            .into_any_element(),
+        );
+    }
     (out, overlay)
 }
 
@@ -1723,7 +1704,7 @@ mod tests {
             assert_eq!(ui.nodes[node].rect, moved);
             let config = tempfile::tempdir().unwrap();
             let mut project =
-                crate::project::Project::load(config.path(), anno_formats::game::Game::Anno117);
+                crate::project::Project::load(config.path(), &anno117::MODULE).unwrap();
             assert_eq!(ui.stage(&mut project).unwrap(), 1);
             assert!(!ui.dirty());
             let folder = project.write().unwrap();
@@ -1841,8 +1822,7 @@ mod tests {
         assert_eq!(pos(&ui)[0], before[0] + 7.);
         // Saved: nothing left to list.
         let config = tempfile::tempdir().unwrap();
-        let mut project =
-            crate::project::Project::load(config.path(), anno_formats::game::Game::Anno117);
+        let mut project = crate::project::Project::load(config.path(), &anno117::MODULE).unwrap();
         assert_eq!(ui.stage(&mut project).unwrap(), 1);
         assert!(ui.unsaved().is_empty());
     }

@@ -1,7 +1,8 @@
 // Owns game selection and the editor's lifetime. Switching drops the old
 // editor entity, so its asynchronous loads cannot land in another game.
 use crate::editor::{Editor, SwitchGame};
-use anno_formats::game::Game;
+use crate::games::GameExt;
+use anno_core::game::Game;
 use gpui_editor_kit::{
     gpui::{prelude::*, *},
     platform, widgets,
@@ -85,7 +86,7 @@ enum Screen {
 }
 
 pub struct Launcher {
-    choices: [Choice; 2],
+    choices: [Choice; Game::ALL.len()],
     screen: Screen,
     selected: Game,
     open: Option<String>,
@@ -113,7 +114,7 @@ impl Launcher {
                 discovering: true,
             }),
             screen: Screen::Picker,
-            selected: game.or(settings.last_game).unwrap_or(Game::Anno1800),
+            selected: game.or(settings.last_game).unwrap_or(Game::ALL[0]),
             open,
             error: None,
             focus: cx.focus_handle(),
@@ -227,7 +228,20 @@ impl Launcher {
         self.error = None;
         let open = self.open.take();
         let config = platform::config_dir(game.profile().config_folder);
-        let editor = cx.new(|cx| Editor::new(game, config, Some(dir), open, window, cx));
+        let mut project = match crate::project::Project::load(&config, crate::games::module(game)) {
+            Ok(project) => project,
+            Err(e) => {
+                self.error = Some(format!("Could not open the project: {e:#}"));
+                self.open = open;
+                cx.notify();
+                return;
+            }
+        };
+        let reopen_failed = project.reopen_failed.take();
+        let editor = cx.new(|cx| Editor::new(project, config, Some(dir), open, window, cx));
+        if let Some(why) = reopen_failed {
+            editor.update(cx, |editor, _| editor.message(why, true));
+        }
         let subscription = cx.subscribe(&editor, |this, _, _: &SwitchGame, cx| {
             this.screen = Screen::Picker;
             cx.notify();
@@ -338,7 +352,7 @@ impl Launcher {
         let searching = choice.discovering && choice.preferred.is_none();
         // The selected card, the one Enter opens: its button leads.
         let lead = self.selected == game;
-        let text = crate::game_text::of(game);
+        let text = crate::games::text(game);
         let accent = l.accent(game);
         let image = div()
             .relative()
@@ -659,10 +673,12 @@ impl Render for Launcher {
                     }
                     return;
                 }
-                let game = match event.keystroke.key.as_str() {
-                    "1" => Game::Anno1800,
-                    "2" => Game::Anno117,
-                    "enter" => this.selected,
+                // Digits pick the card in that place.
+                let key = event.keystroke.key.as_str();
+                let card = key.parse::<usize>().ok().and_then(|n| n.checked_sub(1));
+                let game = match (key, card.and_then(|i| Game::ALL.get(i))) {
+                    ("enter", _) => this.selected,
+                    (_, Some(&game)) => game,
                     _ => return,
                 };
                 this.choose(game, window, cx);
@@ -729,10 +745,16 @@ impl Render for Launcher {
                                     .flex()
                                     .items_center()
                                     .gap_2()
-                                    .child(widgets::keycap("1"))
-                                    .child("Anno 1800")
-                                    .child(widgets::keycap("2"))
-                                    .child("Anno 117")
+                                    // Digits pick the card in that place.
+                                    .children(Game::ALL.iter().enumerate().flat_map(
+                                        |(k, game)| {
+                                            [
+                                                widgets::keycap((k + 1).to_string())
+                                                    .into_any_element(),
+                                                game.profile().title.into_any_element(),
+                                            ]
+                                        },
+                                    ))
                                     .child(widgets::keycap("Enter"))
                                     // What Enter opens, by name.
                                     .child(format!(
@@ -754,7 +776,7 @@ impl Launcher {
     fn recent_projects(&self, game: Game, cx: &mut Context<Self>) -> Div {
         let l = &crate::colors::get().launcher;
         let config = platform::config_dir(game.profile().config_folder);
-        let known = crate::project::known(&config, game);
+        let known = crate::project::known(&config, crate::games::module(game));
         // Room for two rows, so both cards end level: three left a band
         // under one project and none.
         let mut list = div().mt_3().min_h(px(76.)).flex().flex_col().gap_1();
@@ -820,36 +842,35 @@ impl Launcher {
     }
 }
 
-/// The card art, embedded so every machine shows it. Steam's library hero
-/// images (1920×620), re-encoded at JPEG quality 82; the cards are at most
-/// 280 px tall, 560 on a 2× display.
+/// The card art, embedded in each game's crate so every machine shows it,
+/// decoded once per game.
 fn artwork(game: Game) -> Arc<Image> {
-    static ART: [OnceLock<Arc<Image>>; 2] = [OnceLock::new(), OnceLock::new()];
-    let (slot, bytes): (_, &'static [u8]) = match game {
-        Game::Anno117 => (&ART[0], include_bytes!("launcher/anno117.jpg")),
-        Game::Anno1800 => (&ART[1], include_bytes!("launcher/anno1800.jpg")),
-    };
-    slot.get_or_init(|| Arc::new(Image::from_bytes(ImageFormat::Jpeg, bytes.to_vec())))
+    static ART: [OnceLock<Arc<Image>>; Game::ALL.len()] = [const { OnceLock::new() }; _];
+    let slot = Game::ALL
+        .iter()
+        .position(|&g| g == game)
+        .expect("a known game");
+    let bytes = crate::games::module(game).card_art();
+    ART[slot]
+        .get_or_init(|| Arc::new(Image::from_bytes(ImageFormat::Jpeg, bytes.to_vec())))
         .clone()
 }
 
 #[cfg(test)]
 mod tests {
     use super::{Choice, Settings};
-    use anno_formats::game::Game;
+    use crate::games::GameExt;
+    use anno_core::game::Game;
     use std::path::{Path, PathBuf};
 
     fn install(dir: &Path, game: Game) {
-        std::fs::create_dir_all(dir.join("Bin/Win64")).unwrap();
+        let exe = dir.join(game.profile().exe);
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
         std::fs::create_dir_all(dir.join("maindata")).unwrap();
-        let exe = match game {
-            Game::Anno117 => "Anno117.exe",
-            Game::Anno1800 => "Anno1800.exe",
-        };
-        std::fs::write(dir.join("Bin/Win64").join(exe), []).unwrap();
+        std::fs::write(exe, []).unwrap();
         let mut archive = anno_formats::rda::Packer::new(anno_formats::rda::PackOptions::default());
         archive.add("data/fixture.txt", b"fixture").unwrap();
-        archive.write(&dir.join("maindata/data0.rda")).unwrap();
+        std::fs::write(dir.join("maindata/data0.rda"), archive.encode().unwrap()).unwrap();
     }
 
     #[test]
@@ -906,9 +927,11 @@ mod tests {
         std::fs::create_dir(dir.path().join("maindata")).unwrap();
         let mut archive = anno_formats::rda::Packer::new(anno_formats::rda::PackOptions::default());
         archive.add("data/fixture.txt", b"fixture").unwrap();
-        archive
-            .write(&dir.path().join("maindata/data0.rda"))
-            .unwrap();
+        std::fs::write(
+            dir.path().join("maindata/data0.rda"),
+            archive.encode().unwrap(),
+        )
+        .unwrap();
         std::fs::write(dir.path().join("Bin/Win64/Anno1800.exe"), []).unwrap();
         let mut settings = Settings::default();
         for game in Game::ALL {
@@ -936,8 +959,11 @@ mod tests {
             settings.directories["916440"],
             PathBuf::from("/games/Anno 1800")
         );
+        let browse: Settings =
+            serde_json::from_str(r#"{"last_game":"2070","directories":{}}"#).unwrap();
+        assert_eq!(browse.last_game, Some(Game::Anno2070));
         assert!(
-            serde_json::from_str::<Settings>(r#"{"last_game":"2070","directories":{}}"#).is_err()
+            serde_json::from_str::<Settings>(r#"{"last_game":"2205","directories":{}}"#).is_err()
         );
     }
 }

@@ -81,6 +81,9 @@ struct GlobalParams {
     viewport_size: vec2<f32>,
     premultiplied_alpha: u32,
     pad: u32,
+    // The path intermediate's size: paths rasterize into slots of it and
+    // composite from them.
+    path_size: vec2<f32>,
 }
 
 struct GammaParams {
@@ -1113,6 +1116,8 @@ fn fs_path_rasterization(input: PathRasterizationVarying) -> @location(0) vec4<f
 
 struct PathSprite {
     bounds: Bounds,
+    // From the path's place in the frame to its slot in the intermediate.
+    offset: vec2<f32>,
 }
 
 
@@ -1129,7 +1134,7 @@ fn vs_path(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) insta
     let device_position = to_device_position(unit_vertex, sprite.bounds);
     // For screen-space intermediate texture, convert screen position to texture coordinates
     let screen_position = sprite.bounds.origin + unit_vertex * sprite.bounds.size;
-    let texture_coords = screen_position / globals.viewport_size;
+    let texture_coords = (screen_position + sprite.offset) / globals.path_size;
 
     var out = PathVarying();
     out.position = device_position;
